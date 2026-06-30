@@ -44,12 +44,9 @@ def download_audio():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/downloads/<filename>')
-def serve_audio(filename):
-    # Audio ဖိုင်ကို ပြန်ပေး
-    from flask import send_from_directory
-    return send_from_directory('downloads', filename)
+@app.route('/')
+def home():
+    return jsonify({'message': 'Video-to-Audio API is running!'})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
-    
