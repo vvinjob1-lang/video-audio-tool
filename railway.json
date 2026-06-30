@@ -1,0 +1,11 @@
+{
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "pip install -r requirements.txt && apt-get update && apt-get install -y ffmpeg"
+  },
+  "deploy": {
+    "startCommand": "gunicorn app:app",
+    "healthcheckPath": "/",
+    "restartPolicyType": "ON_FAILURE"
+  }
+}
