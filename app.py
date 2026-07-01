@@ -45,18 +45,31 @@ def download_audio():
             'no_check_certificate': True,
             'ignoreerrors': True,
             'geo_bypass': True,
-            'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'extractor_args': {
+                'youtube': {
+                    'skip': ['dash', 'hls'],
+                }
+            }
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.extract_info(url, download=True)
+            info = ydl.extract_info(url, download=True)
+            print(f"Downloaded: {info.get('title', 'Unknown')}")
 
+        # ဖိုင်ကိုရှာပါ
         audio_file = None
         for f in os.listdir('downloads'):
             if f.endswith('.mp3'):
                 audio_file = f
                 break
+
+        if not audio_file:
+            # တစ်ခါတလေ .webm ဖြစ်နေတယ်
+            for f in os.listdir('downloads'):
+                if f.endswith(('.webm', '.m4a')):
+                    audio_file = f
+                    break
 
         if not audio_file:
             return jsonify({'error': 'Audio ဖိုင် မတွေ့ဘူး'}), 500
@@ -68,6 +81,7 @@ def download_audio():
         })
 
     except Exception as e:
+        print(f"Error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/downloads/<filename>')
