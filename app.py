@@ -1,18 +1,37 @@
-import os
 import base64
+import os
 import re
-import uuid
 import subprocess
+import uuid
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
+import requests
+import yt_dlp
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 from werkzeug.utils import secure_filename
-import yt_dlp
 
 app = Flask(__name__)
-CORS(app)
+
+CORS(
+    app,
+    resources={
+        r"/*": {
+            "origins": [
+                r"https://.*\.lovable\.app",
+                r"https://.*\.lovableproject\.com",
+                r"https://.*\.lovable\.dev",
+                r"http://localhost:.*",
+                r"http://127\.0\.0\.1:.*",
+            ]
+        }
+    },
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    max_age=86400,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
@@ -27,12 +46,47 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 SRT_DIR.mkdir(exist_ok=True)
 AUDIO_DIR.mkdir(exist_ok=True)
 
-
 app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_MB", "250")) * 1024 * 1024
 
 ALLOWED_UPLOAD_EXTENSIONS = {
-    "mp4", "mov", "m4v", "mkv", "webm", "avi", "mp3", "m4a", "wav", "aac", "ogg", "flac"
+    "mp4",
+    "mov",
+    "m4v",
+    "mkv",
+    "webm",
+    "avi",
+    "mp3",
+    "m4a",
+    "wav",
+    "aac",
+    "ogg",
+    "flac",
 }
+
+OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+SRT_TIMESTAMP_RE = re.compile(
+    r"^\s*(?:\d{2}:)?\d{2}:\d{2}[,.]\d{3}\s*-->\s*(?:\d{2}:)?\d{2}:\d{2}[,.]\d{3}.*$"
+)
+END_PUNCT_RE = re.compile(r"[။.!?…]$")
+
+
+class YTDLPLogger:
+    def debug(self, msg):
+        # Railway logs get too noisy if every debug line is printed.
+        pass
+
+    def warning(self, msg):
+        print(f"yt-dlp warning: {msg}", flush=True)
+
+    def error(self, msg):
+        print(f"yt-dlp error: {msg}", flush=True)
+
+
+def json_error(message: str, status_code: int = 500, **extra):
+    payload = {"ok": False, "success": False, "error": message}
+    payload.update(extra)
+    return jsonify(payload), status_code
 
 
 def allowed_upload_filename(filename: str) -> bool:
@@ -64,17 +118,21 @@ def save_uploaded_media(file_storage) -> Path:
 
 def convert_media_file_to_mp3(input_path: Path) -> Path:
     output_path = AUDIO_DIR / f"{input_path.stem}_{uuid.uuid4().hex[:8]}.mp3"
-
     ffmpeg_binary = os.getenv("FFMPEG_BINARY", "ffmpeg")
     command = [
         ffmpeg_binary,
         "-y",
-        "-i", str(input_path),
+        "-i",
+        str(input_path),
         "-vn",
-        "-acodec", "libmp3lame",
-        "-ar", "44100",
-        "-ac", "2",
-        "-b:a", "192k",
+        "-acodec",
+        "libmp3lame",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        "-b:a",
+        "192k",
         str(output_path),
     ]
 
@@ -99,6 +157,7 @@ def create_srt_from_mp3(mp3_path: Path, language: str | None = None, base_name: 
     srt_path.write_text(srt_text, encoding="utf-8")
     return srt_text, srt_filename, whisper_meta
 
+
 YOUTUBE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -118,24 +177,16 @@ def normalize_youtube_url(url: str) -> str:
     parsed = urlparse(url)
     host = parsed.netloc.lower().replace("www.", "")
     path = parsed.path.strip("/")
-
     video_id = None
 
-    # https://youtube.com/shorts/<id>
     if host in {"youtube.com", "m.youtube.com", "music.youtube.com"} and path.startswith("shorts/"):
         video_id = path.split("/")[1]
-
-    # https://youtu.be/<id>
     elif host == "youtu.be" and path:
         video_id = path.split("/")[0]
-
-    # https://youtube.com/embed/<id> or /live/<id>
     elif host in {"youtube.com", "m.youtube.com", "music.youtube.com"} and (
         path.startswith("embed/") or path.startswith("live/")
     ):
         video_id = path.split("/")[1]
-
-    # https://youtube.com/watch?v=<id>
     elif host in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
         video_id = parse_qs(parsed.query).get("v", [None])[0]
 
@@ -148,27 +199,13 @@ def normalize_youtube_url(url: str) -> str:
     return url
 
 
-class YTDLPLogger:
-    def debug(self, msg):
-        # Railway logs get too noisy if every debug line is printed.
-        pass
-
-    def warning(self, msg):
-        print(f"yt-dlp warning: {msg}", flush=True)
-
-    def error(self, msg):
-        print(f"yt-dlp error: {msg}", flush=True)
-
-
 def get_cookie_file() -> Path | None:
-    """Return a usable cookies.txt path.
-
+    """
+    Return a usable cookies.txt path.
     Priority:
     1. YOUTUBE_COOKIES_B64 / YOUTUBE_COOKIES_BASE64 Railway variable
     2. YOUTUBE_COOKIES_TXT Railway variable
     3. Project-root cookies.txt file
-
-    This avoids committing private YouTube cookies to GitHub.
     """
     cookie_b64 = os.getenv("YOUTUBE_COOKIES_B64") or os.getenv("YOUTUBE_COOKIES_BASE64")
     cookie_text = os.getenv("YOUTUBE_COOKIES_TXT")
@@ -201,6 +238,7 @@ def friendly_youtube_error(error: Exception) -> tuple[str, int]:
     """Make yt-dlp/YouTube auth errors readable for the frontend."""
     message = str(error)
     lowered = message.lower()
+
     if "sign in to confirm" in lowered or "not a bot" in lowered or "use --cookies" in lowered:
         return (
             "YouTube is asking for browser cookies/authentication for this video. "
@@ -234,18 +272,13 @@ def build_ydl_opts(
     use_cookies: bool = False,
     format_selector: str | None = None,
 ) -> dict:
-    """yt-dlp config tuned for YouTube Shorts + normal videos.
-
-    Important:
-    Cookies can fix "sign in / not a bot" videos, but on some public YouTube videos
-    cookies can make yt-dlp see fewer playable formats. So download_audio_as_mp3()
-    now tries no-cookies first, then cookies only as a fallback.
+    """
+    yt-dlp config tuned for YouTube Shorts + normal videos.
+    Cookies can fix sign-in videos, but public videos often work best without cookies.
     """
     player_clients = ["default", "mweb", "ios", "tv"] if fallback else ["default"]
 
     opts = {
-        # Prefer audio-only, but fall back to any format with audio if YouTube does not
-        # expose normal audio-only formats from the selected client/cookie mode.
         "format": format_selector or "bestaudio[acodec!=none]/best[acodec!=none]/best",
         "outtmpl": str(output_base) + ".%(ext)s",
         "noplaylist": True,
@@ -261,7 +294,6 @@ def build_ydl_opts(
         "logger": YTDLPLogger(),
         "extractor_args": {
             "youtube": {
-                # Start with yt-dlp default behavior. On fallback attempts, try more clients.
                 "player_client": player_clients,
             }
         },
@@ -281,7 +313,6 @@ def build_ydl_opts(
         if cookie_path:
             opts["cookiefile"] = str(cookie_path)
 
-    # Some Railway images set ffmpeg in a custom path.
     ffmpeg_location = os.getenv("FFMPEG_LOCATION")
     if ffmpeg_location:
         opts["ffmpeg_location"] = ffmpeg_location
@@ -302,8 +333,6 @@ def download_audio_as_mp3(url: str) -> tuple[Path, dict]:
     elif cookies_mode in {"never", "false", "0", "no"}:
         cookie_modes = [False]
     else:
-        # Auto mode: public videos usually work best without cookies; restricted videos
-        # get a cookie fallback.
         cookie_modes = [False, True] if cookie_available else [False]
 
     attempt_profiles = []
@@ -325,7 +354,6 @@ def download_audio_as_mp3(url: str) -> tuple[Path, dict]:
                 )
 
     last_error = None
-
     for attempt_number, profile in enumerate(attempt_profiles, start=1):
         try:
             ydl_opts = build_ydl_opts(
@@ -357,7 +385,6 @@ def download_audio_as_mp3(url: str) -> tuple[Path, dict]:
                     "source_url": normalized_url,
                 }
 
-            # Very defensive fallback in case the postprocessor created a slightly different name.
             matches = list(DOWNLOAD_DIR.glob(f"{output_base.name}*.mp3"))
             if matches:
                 return matches[0], {
@@ -371,6 +398,7 @@ def download_audio_as_mp3(url: str) -> tuple[Path, dict]:
         except Exception as exc:
             last_error = exc
             print(f"download attempt failed profile={profile}: {exc}", flush=True)
+            continue
 
     raise RuntimeError(str(last_error) if last_error else "Download failed")
 
@@ -410,22 +438,11 @@ def normalize_whisper_language(language: str | None) -> str | None:
 
 
 def transcribe_mp3_to_srt(mp3_path: Path, language: str | None = None) -> tuple[str, dict]:
-    """Transcribe audio with faster-whisper and return SRT text + metadata.
-
-    Retry strategy:
-    - Try the requested language or auto-detect first.
-    - If no subtitles are produced, retry with VAD disabled.
-    - If language is auto, also retry common fallback languages from WHISPER_FALLBACK_LANGUAGES.
-
-    This helps uploaded files where tiny Whisper + auto-detect incorrectly decides that
-    the audio is silence/no-speech.
-    """
+    """Transcribe audio with faster-whisper and return SRT text + metadata."""
     try:
         from faster_whisper import WhisperModel
     except Exception as exc:
-        raise RuntimeError(
-            "faster-whisper is not installed. Check requirements.txt and Railway deployment logs."
-        ) from exc
+        raise RuntimeError("faster-whisper is not installed. Check requirements.txt and Railway deployment logs.") from exc
 
     model_name = os.getenv("WHISPER_MODEL", "tiny")
     device = os.getenv("WHISPER_DEVICE", "cpu")
@@ -442,7 +459,6 @@ def transcribe_mp3_to_srt(mp3_path: Path, language: str | None = None) -> tuple[
     language_attempts: list[str | None] = []
     if requested_language:
         language_attempts.append(requested_language)
-        # Also try auto-detect after the explicit language in case the user selected the wrong language.
         language_attempts.append(None)
     else:
         language_attempts.append(None)
@@ -472,6 +488,7 @@ def transcribe_mp3_to_srt(mp3_path: Path, language: str | None = None) -> tuple[
                     "vad_filter": vad_filter,
                     "beam_size": beam_size,
                 }
+
                 try:
                     print(f"Whisper attempt: {attempt_label}", flush=True)
                     segments_iter, info = model.transcribe(
@@ -492,7 +509,6 @@ def transcribe_mp3_to_srt(mp3_path: Path, language: str | None = None) -> tuple[
                         text = (segment.text or "").strip()
                         if not text:
                             continue
-
                         segment_number += 1
                         srt_blocks.append(
                             f"{segment_number}\n"
@@ -598,7 +614,6 @@ def parse_srt_blocks(srt_text: str) -> list[dict]:
 
         idx = None
         time_line = None
-        text_lines = []
 
         if lines and re.fullmatch(r"\d+", lines[0].strip()):
             idx = lines.pop(0).strip()
@@ -607,7 +622,6 @@ def parse_srt_blocks(srt_text: str) -> list[dict]:
             time_line = lines.pop(0).strip()
 
         text_lines = lines
-
         if time_line and text_lines:
             parsed_blocks.append(
                 {
@@ -637,9 +651,7 @@ def translate_texts_with_google(texts: list[str], source_language: str = "auto",
     try:
         from deep_translator import GoogleTranslator
     except Exception as exc:
-        raise RuntimeError(
-            "deep-translator is not installed. Check requirements.txt and Railway deployment logs."
-        ) from exc
+        raise RuntimeError("deep-translator is not installed. Check requirements.txt and Railway deployment logs.") from exc
 
     source = normalize_translate_language(source_language, default="auto")
     target = normalize_translate_language(target_language, default="my")
@@ -701,6 +713,145 @@ def translate_srt_text(srt_text: str, source_language: str = "auto", target_lang
     return translated_srt_text, meta
 
 
+def is_myanmar_language(language: str | None) -> bool:
+    value = (language or "").strip().lower()
+    return value in {"myanmar", "burmese", "my", "မြန်မာ", "ဗမာ"}
+
+
+def clean_srt_to_tts_script(text: str, language: str | None = None) -> str:
+    """
+    Local TTS-ready cleanup fallback.
+    This removes SRT/VTT metadata and produces a clean spoken script for TTS.
+    """
+    raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = raw.split("\n")
+
+    cleaned_lines = []
+    previous_key = None
+
+    for line in lines:
+        line = (line or "").strip()
+        if not line:
+            continue
+
+        upper_line = line.upper()
+
+        if upper_line in {"WEBVTT", "STYLE", "REGION"}:
+            continue
+        if upper_line.startswith(("NOTE", "KIND:", "LANGUAGE:")):
+            continue
+        if re.fullmatch(r"\d+", line):
+            continue
+        if SRT_TIMESTAMP_RE.match(line):
+            continue
+
+        line = re.sub(r"<[^>]+>", "", line)
+        line = re.sub(r"\{[^}]+\}", "", line)
+        line = re.sub(r"\s+", " ", line).strip()
+
+        if not line:
+            continue
+
+        key = line.casefold()
+        if key == previous_key:
+            continue
+
+        previous_key = key
+        cleaned_lines.append(line)
+
+    if not cleaned_lines:
+        return ""
+
+    myanmar = is_myanmar_language(language)
+    spoken_parts = []
+
+    for line in cleaned_lines:
+        part = line.strip()
+        if not part:
+            continue
+
+        if myanmar:
+            if not END_PUNCT_RE.search(part):
+                part += "။"
+        else:
+            if not END_PUNCT_RE.search(part):
+                part += "."
+
+        spoken_parts.append(part)
+
+    script = " ".join(spoken_parts)
+    script = re.sub(r"\s+", " ", script).strip()
+    script = re.sub(r"။\s*။+", "။", script)
+    return script
+
+
+def call_openrouter_rewrite(text: str, language: str = "Myanmar", style: str = "concise_natural_tts") -> str:
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    model = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set")
+
+    system_prompt = """
+You are a subtitle-to-TTS rewrite assistant.
+Your job is to rewrite subtitle text into a clean, concise, natural spoken script for TTS.
+
+Rules:
+- Output only the final rewritten script.
+- Do not include markdown.
+- Do not include explanations.
+- Remove timestamps, subtitle numbers, WEBVTT metadata, tags, and repeated lines.
+- Keep the original meaning.
+- Make it sound natural when spoken aloud.
+- Do not add new facts.
+- For Myanmar/Burmese, output natural Burmese/Myanmar only and use Myanmar punctuation naturally.
+""".strip()
+
+    user_prompt = f"""
+Language: {language}
+Style: {style}
+
+Rewrite this subtitle/script into a TTS-ready spoken script:
+
+{text}
+""".strip()
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": os.getenv("APP_PUBLIC_URL", "https://video-audio-tool-production.up.railway.app"),
+        "X-Title": os.getenv("APP_NAME", "Video2Audio Pro"),
+    }
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": int(os.getenv("OPENROUTER_MAX_TOKENS", "1800")),
+    }
+
+    response = requests.post(
+        OPENROUTER_CHAT_URL,
+        headers=headers,
+        json=payload,
+        timeout=int(os.getenv("OPENROUTER_TIMEOUT", "60")),
+    )
+
+    if not response.ok:
+        raise RuntimeError(f"OpenRouter error {response.status_code}: {response.text[:1200]}")
+
+    data = response.json()
+    result = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+    if not result:
+        raise RuntimeError("OpenRouter returned empty result")
+
+    return result
+
+
 @app.get("/")
 def index():
     return jsonify(
@@ -711,6 +862,7 @@ def index():
                 "POST /download",
                 "POST /extract-srt",
                 "POST /translate-srt",
+                "POST /rewrite",
                 "POST /upload",
                 "POST /extract-srt-upload",
                 "POST /process-upload",
@@ -723,7 +875,25 @@ def index():
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True})
+    return jsonify(
+        {
+            "ok": True,
+            "service": "video-audio-tool",
+            "endpoints": [
+                "POST /download",
+                "POST /extract-srt",
+                "POST /translate-srt",
+                "POST /rewrite",
+                "POST /upload",
+                "POST /extract-srt-upload",
+                "POST /process-upload",
+                "GET /audio/<filename>",
+                "GET /srt/<filename>",
+            ],
+            "openrouter_model": os.getenv("OPENROUTER_MODEL", "openrouter/free"),
+            "openrouter_configured": bool(os.getenv("OPENROUTER_API_KEY")),
+        }
+    )
 
 
 @app.post("/download")
@@ -733,7 +903,7 @@ def download():
         url = payload.get("url") or request.form.get("url") or request.values.get("url")
 
         if not url:
-            return jsonify({"success": False, "error": "Missing 'url'"}), 400
+            return json_error("Missing 'url'", 400)
 
         mp3_path, meta = download_audio_as_mp3(url)
         download_name = f"{meta.get('video_id') or mp3_path.stem}.mp3"
@@ -748,7 +918,7 @@ def download():
 
     except Exception as exc:
         error_message, status_code = friendly_youtube_error(exc)
-        return jsonify({"success": False, "error": error_message}), status_code
+        return json_error(error_message, status_code)
 
 
 @app.post("/extract-srt")
@@ -759,11 +929,10 @@ def extract_srt():
         language = payload.get("language") or request.form.get("language") or request.values.get("language") or "auto"
 
         if not url:
-            return jsonify({"success": False, "error": "Missing 'url'"}), 400
+            return json_error("Missing 'url'", 400)
 
         mp3_path, audio_meta = download_audio_as_mp3(url)
         srt_text, whisper_meta = transcribe_mp3_to_srt(mp3_path, language=language)
-
         srt_filename = f"{audio_meta.get('video_id') or mp3_path.stem}_{uuid.uuid4().hex[:8]}.srt"
         srt_path = SRT_DIR / srt_filename
         srt_path.write_text(srt_text, encoding="utf-8")
@@ -773,6 +942,7 @@ def extract_srt():
 
         return jsonify(
             {
+                "ok": True,
                 "success": True,
                 "srt_text": srt_text,
                 "srt_url": srt_url,
@@ -785,8 +955,7 @@ def extract_srt():
     except Exception as exc:
         print(f"extract-srt error: {exc}", flush=True)
         error_message, status_code = friendly_youtube_error(exc)
-        return jsonify({"success": False, "error": error_message}), status_code
-
+        return json_error(error_message, status_code)
 
 
 @app.post("/translate-srt")
@@ -798,16 +967,15 @@ def translate_srt():
         source_language = payload.get("source_language") or payload.get("source") or "auto"
         target_language = payload.get("target_language") or payload.get("target") or payload.get("language") or "my"
 
-        # Frontend should normally send srt_text directly. Filename fallback is useful for testing.
         if not srt_text and filename:
             safe_filename = Path(filename).name
             srt_path = SRT_DIR / safe_filename
             if not srt_path.exists():
-                return jsonify({"success": False, "error": "SRT filename not found"}), 404
+                return json_error("SRT filename not found", 404)
             srt_text = srt_path.read_text(encoding="utf-8")
 
         if not srt_text:
-            return jsonify({"success": False, "error": "Missing 'srt_text'"}), 400
+            return json_error("Missing 'srt_text'", 400)
 
         translated_srt_text, translation_meta = translate_srt_text(
             srt_text,
@@ -825,6 +993,7 @@ def translate_srt():
 
         return jsonify(
             {
+                "ok": True,
                 "success": True,
                 "translated_srt_text": translated_srt_text,
                 "translated_srt_url": translated_srt_url,
@@ -835,17 +1004,83 @@ def translate_srt():
 
     except Exception as exc:
         print(f"translate-srt error: {exc}", flush=True)
-        return jsonify({"success": False, "error": str(exc)}), 500
+        return json_error(str(exc), 500)
+
+
+@app.route("/rewrite", methods=["POST", "OPTIONS"])
+def rewrite_script():
+    if request.method == "OPTIONS":
+        return jsonify({"ok": True, "success": True}), 200
+
+    try:
+        payload = request.get_json(silent=True) or {}
+
+        text = (
+            payload.get("text")
+            or payload.get("srt_text")
+            or payload.get("translated_srt_text")
+            or request.form.get("text")
+            or ""
+        )
+
+        language = (
+            payload.get("language")
+            or payload.get("target_language")
+            or request.form.get("language")
+            or "Myanmar"
+        )
+
+        style = payload.get("style") or request.form.get("style") or "concise_natural_tts"
+
+        if not str(text).strip():
+            return jsonify({"ok": False, "success": False, "error": "Text is required"}), 400
+
+        cleaned_script = clean_srt_to_tts_script(str(text), language=language)
+        if not cleaned_script:
+            return json_error("No readable subtitle text found after cleanup", 400)
+
+        try:
+            rewritten_script = call_openrouter_rewrite(
+                cleaned_script,
+                language=language,
+                style=style,
+            )
+
+            return jsonify(
+                {
+                    "ok": True,
+                    "success": True,
+                    "rewrittenScript": rewritten_script,
+                    "script": rewritten_script,
+                    "language": language,
+                    "style": style,
+                    "source": "openrouter_free_ai",
+                }
+            )
+
+        except Exception as ai_error:
+            print(f"OpenRouter rewrite fallback: {ai_error}", flush=True)
+            return jsonify(
+                {
+                    "ok": True,
+                    "success": True,
+                    "rewrittenScript": cleaned_script,
+                    "script": cleaned_script,
+                    "language": language,
+                    "style": style,
+                    "source": "local_tts_cleanup",
+                    "aiError": str(ai_error),
+                }
+            )
+
+    except Exception as exc:
+        print(f"rewrite error: {exc}", flush=True)
+        return json_error(str(exc), 500)
 
 
 @app.post("/upload")
 def upload_to_mp3():
-    """Accept a multipart uploaded audio/video file and return binary MP3.
-
-    This is the stable fallback when YouTube blocks Railway/yt-dlp or marks
-    streams as DRM protected. It does not bypass DRM; it only processes files
-    the user directly uploads.
-    """
+    """Accept a multipart uploaded audio/video file and return binary MP3."""
     try:
         uploaded_file = request.files.get("file") or request.files.get("video") or request.files.get("audio")
         input_path = save_uploaded_media(uploaded_file)
@@ -861,7 +1096,7 @@ def upload_to_mp3():
 
     except Exception as exc:
         print(f"upload error: {exc}", flush=True)
-        return jsonify({"success": False, "error": str(exc)}), 500
+        return json_error(str(exc), 500)
 
 
 @app.post("/extract-srt-upload")
@@ -885,6 +1120,7 @@ def extract_srt_upload():
 
         return jsonify(
             {
+                "ok": True,
                 "success": True,
                 "srt_text": srt_text,
                 "srt_url": srt_url,
@@ -901,7 +1137,7 @@ def extract_srt_upload():
 
     except Exception as exc:
         print(f"extract-srt-upload error: {exc}", flush=True)
-        return jsonify({"success": False, "error": str(exc)}), 500
+        return json_error(str(exc), 500)
 
 
 @app.post("/process-upload")
@@ -923,6 +1159,7 @@ def process_upload():
 
         base_url = request.host_url.rstrip("/")
         response_payload = {
+            "ok": True,
             "success": True,
             "audio_url": f"{base_url}/audio/{mp3_path.name}",
             "audio_filename": mp3_path.name,
@@ -946,6 +1183,7 @@ def process_upload():
             translated_filename = f"translated_{target_code}_{uuid.uuid4().hex[:8]}.srt"
             translated_path = SRT_DIR / translated_filename
             translated_path.write_text(translated_srt_text, encoding="utf-8")
+
             response_payload.update(
                 {
                     "translated_srt_text": translated_srt_text,
@@ -959,7 +1197,7 @@ def process_upload():
 
     except Exception as exc:
         print(f"process-upload error: {exc}", flush=True)
-        return jsonify({"success": False, "error": str(exc)}), 500
+        return json_error(str(exc), 500)
 
 
 @app.get("/audio/<path:filename>")
@@ -986,6 +1224,29 @@ def serve_srt(filename):
         download_name=safe_filename,
         max_age=0,
     )
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_413(error):
+    return json_error("Uploaded file is too large", 413)
+
+
+@app.errorhandler(404)
+def handle_404(error):
+    return json_error("Not found", 404)
+
+
+@app.errorhandler(405)
+def handle_405(error):
+    return json_error("Method not allowed", 405)
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    if isinstance(error, HTTPException):
+        return json_error(error.description or error.name, error.code or 500)
+    print(f"unhandled error: {error}", flush=True)
+    return json_error(str(error), 500)
 
 
 if __name__ == "__main__":
