@@ -3,17 +3,8 @@ from flask_cors import CORS
 import yt_dlp
 import os
 import uuid
-import time
 import subprocess
 from werkzeug.utils import secure_filename
-
-# ===== Whisper, TTS, Translation =====
-import whisper
-import torch
-import scipy.io.wavfile
-from transformers import VitsModel, AutoTokenizer
-from googletrans import Translator
-import ollama
 
 app = Flask(__name__)
 CORS(app)
@@ -29,221 +20,183 @@ ALLOWED_EXTENSIONS = {'mp4', 'mov', 'avi', 'mp3', 'wav', 'm4a', 'webm', 'mkv'}
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# ==========================================
-# 1. DOWNLOAD VIDEO FROM URL
-# ==========================================
-def download_video(url):
-    try:
-        ydl_opts = {
-            'format': 'bestvideo[height<=480]+bestaudio/best[height<=480]',
-            'outtmpl': 'downloads/video.%(ext)s',
-            'quiet': True,
-            'no_check_certificate': True,
-            'ignoreerrors': True,
-            'geo_bypass': True,
-            'cookiefile': 'cookies.txt',
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            video_path = 'downloads/video.mp4'
-            return video_path
-    except Exception as e:
-        raise Exception(f"Video download failed: {str(e)}")
+# ===== LAZY LOADING (Model တွေကို လိုမှသာ Load လုပ်မယ်) =====
+_whisper_model = None
+_tts_model = None
+_tts_tokenizer = None
+
+def get_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        import whisper
+        print("🔄 Loading Whisper model...")
+        _whisper_model = whisper.load_model("base")
+        print("✅ Whisper model loaded!")
+    return _whisper_model
+
+def get_tts():
+    global _tts_model, _tts_tokenizer
+    if _tts_model is None:
+        import torch
+        from transformers import VitsModel, AutoTokenizer
+        print("🔄 Loading TTS model...")
+        _tts_model = VitsModel.from_pretrained("facebook/mms-tts-mya")
+        _tts_tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-mya")
+        print("✅ TTS model loaded!")
+    return _tts_model, _tts_tokenizer
 
 # ==========================================
-# 2. EXTRACT AUDIO FROM VIDEO
+# DOWNLOAD VIDEO FROM URL
+# ==========================================
+def download_video(url):
+    ydl_opts = {
+        'format': 'bestvideo[height<=480]+bestaudio/best[height<=480]',
+        'outtmpl': 'downloads/video.%(ext)s',
+        'quiet': True,
+        'no_check_certificate': True,
+        'ignoreerrors': True,
+        'geo_bypass': True,
+        'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.extract_info(url, download=True)
+    return 'downloads/video.mp4'
+
+# ==========================================
+# EXTRACT AUDIO
 # ==========================================
 def extract_audio(video_path):
     audio_path = 'downloads/audio.wav'
-    try:
-        cmd = [
-            'ffmpeg', '-i', video_path,
-            '-q:a', '0', '-map', 'a',
-            '-ac', '1', '-ar', '16000',
-            audio_path, '-y'
-        ]
-        subprocess.run(cmd, capture_output=True, check=True)
-        return audio_path
-    except Exception as e:
-        raise Exception(f"Audio extraction failed: {str(e)}")
+    cmd = [
+        'ffmpeg', '-i', video_path,
+        '-q:a', '0', '-map', 'a',
+        '-ac', '1', '-ar', '16000',
+        audio_path, '-y'
+    ]
+    subprocess.run(cmd, capture_output=True, check=True)
+    return audio_path
 
 # ==========================================
-# 3. VIDEO → SRT (Whisper)
+# VIDEO → SRT
 # ==========================================
 def video_to_srt(video_path):
-    try:
-        audio_path = extract_audio(video_path)
-        model = whisper.load_model("base")
-        result = model.transcribe(audio_path, task="translate", verbose=False)
-        
-        srt_path = 'srt/output.srt'
-        with open(srt_path, 'w', encoding='utf-8') as f:
-            for i, segment in enumerate(result['segments']):
-                start = segment['start']
-                end = segment['end']
-                text = segment['text'].strip()
-                
-                start_str = f"{int(start//3600):02d}:{int((start%3600)//60):02d}:{int(start%60):02d},{int((start%1)*1000):03d}"
-                end_str = f"{int(end//3600):02d}:{int((end%3600)//60):02d}:{int(end%60):02d},{int((end%1)*1000):03d}"
-                
-                f.write(f"{i+1}\n{start_str} --> {end_str}\n{text}\n\n")
-        
-        return srt_path
-    except Exception as e:
-        raise Exception(f"SRT extraction failed: {str(e)}")
+    audio_path = extract_audio(video_path)
+    model = get_whisper()
+    result = model.transcribe(audio_path, task="translate", verbose=False)
+    
+    srt_path = 'srt/output.srt'
+    with open(srt_path, 'w', encoding='utf-8') as f:
+        for i, seg in enumerate(result['segments']):
+            start = seg['start']
+            end = seg['end']
+            text = seg['text'].strip()
+            f.write(f"{i+1}\n")
+            f.write(f"{int(start//3600):02d}:{int((start%3600)//60):02d}:{int(start%60):02d},{int((start%1)*1000):03d} --> ")
+            f.write(f"{int(end//3600):02d}:{int((end%3600)//60):02d}:{int(end%60):02d},{int((end%1)*1000):03d}\n")
+            f.write(f"{text}\n\n")
+    return srt_path
 
 # ==========================================
-# 4. FALLBACK: Audio → Text (No timestamps)
+# FALLBACK: Audio → Text
 # ==========================================
 def audio_to_text(video_path):
-    try:
-        audio_path = extract_audio(video_path)
-        model = whisper.load_model("base")
-        result = model.transcribe(audio_path, task="translate", verbose=False)
-        text = result['text']
-        
-        text_path = 'srt/fallback_text.txt'
-        with open(text_path, 'w', encoding='utf-8') as f:
-            f.write(text)
-        
-        return text_path
-    except Exception as e:
-        raise Exception(f"Audio to text failed: {str(e)}")
+    audio_path = extract_audio(video_path)
+    model = get_whisper()
+    result = model.transcribe(audio_path, task="translate", verbose=False)
+    
+    text_path = 'srt/fallback_text.txt'
+    with open(text_path, 'w', encoding='utf-8') as f:
+        f.write(result['text'])
+    return text_path
 
 # ==========================================
-# 5. TRANSLATE SRT/TEXT
+# TRANSLATE
 # ==========================================
 def translate_content(file_path, target_lang):
-    try:
-        translator = Translator()
-        
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        translated = translator.translate(content, dest=target_lang).text
-        
-        ext = 'srt' if file_path.endswith('.srt') else 'txt'
-        translated_path = f'srt/translated.{ext}'
-        with open(translated_path, 'w', encoding='utf-8') as f:
-            f.write(translated)
-        
-        return translated_path
-    except Exception as e:
-        raise Exception(f"Translation failed: {str(e)}")
+    from googletrans import Translator
+    translator = Translator()
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    translated = translator.translate(content, dest=target_lang).text
+    ext = 'srt' if file_path.endswith('.srt') else 'txt'
+    translated_path = f'srt/translated.{ext}'
+    
+    with open(translated_path, 'w', encoding='utf-8') as f:
+        f.write(translated)
+    return translated_path
 
 # ==========================================
-# 6. REWRITE SCRIPT (Ollama)
+# REWRITE SCRIPT
 # ==========================================
 def rewrite_script(file_path):
+    with open(file_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    if file_path.endswith('.srt'):
+        lines = [line for line in content.split('\n') if line.strip() and not line[0].isdigit() and '-->' not in line]
+        content = ' '.join(lines)
+    
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        if file_path.endswith('.srt'):
-            lines = [line for line in content.split('\n') if line.strip() and not line[0].isdigit() and '-->' not in line]
-            content = ' '.join(lines)
-        
+        import ollama
         response = ollama.chat(model='llama3', messages=[{
             'role': 'user',
-            'content': f'Rewrite this text to be more concise, engaging, and natural sounding for a video narration: {content[:2000]}'
+            'content': f'Rewrite this text to be more concise and engaging: {content[:1500]}'
         }])
-        
         rewritten = response['message']['content']
-        
-        rewritten_path = 'srt/rewritten_script.txt'
-        with open(rewritten_path, 'w', encoding='utf-8') as f:
-            f.write(rewritten)
-        
-        return rewritten_path
-    except Exception as e:
-        raise Exception(f"Rewriting failed: {str(e)}")
+    except:
+        # Ollama မရှိရင် မူရင်းအတိုင်းထားမယ်
+        rewritten = content
+    
+    rewritten_path = 'srt/rewritten_script.txt'
+    with open(rewritten_path, 'w', encoding='utf-8') as f:
+        f.write(rewritten)
+    return rewritten_path
 
 # ==========================================
-# 7. TTS (Myanmar - Facebook MMS)
+# TTS (Myanmar)
 # ==========================================
-def generate_tts(text_file, target_lang):
-    try:
-        with open(text_file, 'r', encoding='utf-8') as f:
-            text = f.read()
-        
-        if len(text) > 200:
-            text = text[:200]
-        
-        model = VitsModel.from_pretrained("facebook/mms-tts-mya")
-        tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-mya")
-        
-        inputs = tokenizer(text, return_tensors="pt")
-        with torch.no_grad():
-            output = model(**inputs).waveform
-        
-        filename = f"tts_{uuid.uuid4().hex[:8]}.wav"
-        filepath = os.path.join('downloads', filename)
-        scipy.io.wavfile.write(filepath, rate=model.config.sampling_rate, data=output)
-        
-        return filepath, filename
-    except Exception as e:
-        raise Exception(f"TTS generation failed: {str(e)}")
+def generate_tts(text_file):
+    import torch
+    import scipy.io.wavfile
+    
+    with open(text_file, 'r', encoding='utf-8') as f:
+        text = f.read()
+    
+    if len(text) > 200:
+        text = text[:200]
+    
+    model, tokenizer = get_tts()
+    inputs = tokenizer(text, return_tensors="pt")
+    
+    with torch.no_grad():
+        output = model(**inputs).waveform
+    
+    filename = f"tts_{uuid.uuid4().hex[:8]}.wav"
+    filepath = os.path.join('downloads', filename)
+    scipy.io.wavfile.write(filepath, rate=model.config.sampling_rate, data=output)
+    
+    return filepath, filename
 
 # ==========================================
-# 8. MAIN PROCESSING ENDPOINT
+# ENDPOINTS
 # ==========================================
-@app.route('/process', methods=['POST'])
-def process_video():
-    try:
-        data = request.get_json()
-        url = data.get('url')
-        target_lang = data.get('target_language', 'my')
-        
-        if not url:
-            return jsonify({'error': 'URL မပါဘူး'}), 400
-        
-        print(f"Processing: {url} → Language: {target_lang}")
-        
-        video_path = download_video(url)
-        print("✅ Video downloaded")
-        
-        try:
-            srt_path = video_to_srt(video_path)
-            print("✅ SRT extracted")
-            content_path = srt_path
-            is_srt = True
-        except Exception as e:
-            print(f"⚠️ SRT failed: {e}")
-            print("🔄 Falling back to Audio → Text")
-            content_path = audio_to_text(video_path)
-            is_srt = False
-            print("✅ Audio → Text complete")
-        
-        translated_path = translate_content(content_path, target_lang)
-        print("✅ Translation complete")
-        
-        rewritten_path = rewrite_script(translated_path)
-        print("✅ Script rewritten")
-        
-        tts_path, tts_filename = generate_tts(rewritten_path, target_lang)
-        print("✅ TTS generated")
-        
-        return jsonify({
-            'success': True,
-            'audio_url': f'/downloads/{tts_filename}',
-            'srt_used': is_srt,
-            'message': 'Processing complete!'
-        })
-        
-    except Exception as e:
-        print(f"Error: {str(e)}")
-        return jsonify({'error': str(e)}), 500
 
-# ==========================================
-# 9. DOWNLOAD ENDPOINT (Simple)
-# ==========================================
+@app.route('/')
+def home():
+    return jsonify({'message': 'Video-to-Audio API is running!'})
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'healthy'})
+
 @app.route('/download', methods=['POST'])
 def download_audio():
     try:
         data = request.get_json()
         url = data.get('url')
-        
         if not url:
             return jsonify({'error': 'URL မပါဘူး'}), 400
         
@@ -255,19 +208,18 @@ def download_audio():
                 'preferredquality': '128',
             }],
             'outtmpl': 'downloads/audio.%(ext)s',
-            'quiet': False,
+            'quiet': True,
             'no_check_certificate': True,
             'ignoreerrors': True,
             'geo_bypass': True,
-            'cookiefile': 'cookies.txt',
+            'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
             'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'sleep_interval': 5,
             'max_sleep_interval': 10,
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            print(f"Video title: {info.get('title', 'Unknown')}")
+            ydl.extract_info(url, download=True)
         
         audio_file = None
         for f in os.listdir('downloads'):
@@ -285,12 +237,53 @@ def download_audio():
         })
         
     except Exception as e:
-        print(f"Error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-# ==========================================
-# 10. FILE UPLOAD ENDPOINT
-# ==========================================
+@app.route('/process', methods=['POST'])
+def process_video():
+    try:
+        data = request.get_json()
+        url = data.get('url')
+        target_lang = data.get('target_language', 'my')
+        
+        if not url:
+            return jsonify({'error': 'URL မပါဘူး'}), 400
+        
+        print(f"Processing: {url}")
+        
+        video_path = download_video(url)
+        print("✅ Video downloaded")
+        
+        try:
+            srt_path = video_to_srt(video_path)
+            content_path = srt_path
+            srt_used = True
+            print("✅ SRT extracted")
+        except Exception as e:
+            print(f"⚠️ SRT failed: {e}, using fallback")
+            content_path = audio_to_text(video_path)
+            srt_used = False
+            print("✅ Audio → Text complete")
+        
+        translated_path = translate_content(content_path, target_lang)
+        print("✅ Translation complete")
+        
+        rewritten_path = rewrite_script(translated_path)
+        print("✅ Script rewritten")
+        
+        tts_path, tts_filename = generate_tts(rewritten_path)
+        print("✅ TTS generated")
+        
+        return jsonify({
+            'success': True,
+            'audio_url': f'/downloads/{tts_filename}',
+            'srt_used': srt_used,
+            'message': 'Processing complete!'
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/upload', methods=['POST'])
 def upload_file():
     try:
@@ -316,22 +309,19 @@ def upload_file():
             try:
                 srt_path = video_to_srt(filepath)
                 content_path = srt_path
-                is_srt = True
             except:
                 content_path = audio_to_text(filepath)
-                is_srt = False
         else:
-            model = whisper.load_model("base")
+            model = get_whisper()
             result = model.transcribe(filepath, task="translate")
             text_path = 'srt/fallback_text.txt'
             with open(text_path, 'w', encoding='utf-8') as f:
                 f.write(result['text'])
             content_path = text_path
-            is_srt = False
         
         translated_path = translate_content(content_path, 'my')
         rewritten_path = rewrite_script(translated_path)
-        tts_path, tts_filename = generate_tts(rewritten_path, 'my')
+        tts_path, tts_filename = generate_tts(rewritten_path)
         
         return jsonify({
             'success': True,
@@ -342,9 +332,6 @@ def upload_file():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
-# ==========================================
-# 11. SERVE FILES
-# ==========================================
 @app.route('/downloads/<filename>')
 def serve_audio(filename):
     return send_from_directory('downloads', filename)
@@ -353,35 +340,5 @@ def serve_audio(filename):
 def serve_srt(filename):
     return send_from_directory('srt', filename)
 
-@app.route('/health')
-def health():
-    return jsonify({'status': 'healthy'})
-
-@app.route('/')
-def home():
-    return jsonify({'message': 'Video-to-Audio API is running!'})
-
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
-
-# ===== LAZY LOADING =====
-_whisper_model = None
-_tts_model = None
-_tts_tokenizer = None
-
-def get_whisper_model():
-    global _whisper_model
-    if _whisper_model is None:
-        print("Loading Whisper model...")
-        _whisper_model = whisper.load_model("base")
-        print("Whisper model loaded!")
-    return _whisper_model
-
-def get_tts_model():
-    global _tts_model, _tts_tokenizer
-    if _tts_model is None:
-        print("Loading TTS model...")
-        _tts_model = VitsModel.from_pretrained("facebook/mms-tts-mya")
-        _tts_tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-mya")
-        print("TTS model loaded!")
-    return _tts_model, _tts_tokenizer
