@@ -1,4 +1,5 @@
 import os
+import base64
 import re
 import uuid
 from pathlib import Path
@@ -16,6 +17,7 @@ DOWNLOAD_DIR = BASE_DIR / "downloads"
 UPLOAD_DIR = BASE_DIR / "uploads"
 SRT_DIR = BASE_DIR / "srt"
 COOKIE_FILE = BASE_DIR / "cookies.txt"
+GENERATED_COOKIE_FILE = Path(os.getenv("YOUTUBE_COOKIES_GENERATED_FILE", "/tmp/youtube_cookies.txt"))
 
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -82,6 +84,57 @@ class YTDLPLogger:
         print(f"yt-dlp error: {msg}", flush=True)
 
 
+def get_cookie_file() -> Path | None:
+    """Return a usable cookies.txt path.
+
+    Priority:
+    1. YOUTUBE_COOKIES_B64 / YOUTUBE_COOKIES_BASE64 Railway variable
+    2. YOUTUBE_COOKIES_TXT Railway variable
+    3. Project-root cookies.txt file
+
+    This avoids committing private YouTube cookies to GitHub.
+    """
+    cookie_b64 = os.getenv("YOUTUBE_COOKIES_B64") or os.getenv("YOUTUBE_COOKIES_BASE64")
+    cookie_text = os.getenv("YOUTUBE_COOKIES_TXT")
+
+    try:
+        if cookie_b64:
+            GENERATED_COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            decoded = base64.b64decode(cookie_b64).decode("utf-8", errors="replace")
+            GENERATED_COOKIE_FILE.write_text(decoded, encoding="utf-8")
+            GENERATED_COOKIE_FILE.chmod(0o600)
+            if GENERATED_COOKIE_FILE.stat().st_size > 0:
+                return GENERATED_COOKIE_FILE
+
+        if cookie_text:
+            GENERATED_COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            GENERATED_COOKIE_FILE.write_text(cookie_text, encoding="utf-8")
+            GENERATED_COOKIE_FILE.chmod(0o600)
+            if GENERATED_COOKIE_FILE.stat().st_size > 0:
+                return GENERATED_COOKIE_FILE
+    except Exception as exc:
+        print(f"cookie setup warning: {exc}", flush=True)
+
+    if COOKIE_FILE.exists() and COOKIE_FILE.stat().st_size > 0:
+        return COOKIE_FILE
+
+    return None
+
+
+def friendly_youtube_error(error: Exception) -> tuple[str, int]:
+    """Make yt-dlp/YouTube auth errors readable for the frontend."""
+    message = str(error)
+    lowered = message.lower()
+    if "sign in to confirm" in lowered or "not a bot" in lowered or "use --cookies" in lowered:
+        return (
+            "YouTube is asking for browser cookies/authentication for this video. "
+            "Refresh the Railway YOUTUBE_COOKIES_B64 variable with a new cookies.txt export, "
+            "then redeploy and try again.",
+            403,
+        )
+    return message, 500
+
+
 def build_ydl_opts(output_base: Path, fallback: bool = False) -> dict:
     """yt-dlp config tuned for YouTube Shorts + normal videos."""
     player_clients = ["default", "mweb", "ios", "tv"] if fallback else ["default", "mweb", "ios"]
@@ -117,8 +170,9 @@ def build_ydl_opts(output_base: Path, fallback: bool = False) -> dict:
         "prefer_ffmpeg": True,
     }
 
-    if COOKIE_FILE.exists() and COOKIE_FILE.stat().st_size > 0:
-        opts["cookiefile"] = str(COOKIE_FILE)
+    cookie_path = get_cookie_file()
+    if cookie_path:
+        opts["cookiefile"] = str(cookie_path)
 
     # Some Railway images set ffmpeg in a custom path.
     ffmpeg_location = os.getenv("FFMPEG_LOCATION")
@@ -458,7 +512,8 @@ def download():
         )
 
     except Exception as exc:
-        return jsonify({"success": False, "error": str(exc)}), 500
+        error_message, status_code = friendly_youtube_error(exc)
+        return jsonify({"success": False, "error": error_message}), status_code
 
 
 @app.post("/extract-srt")
@@ -494,7 +549,8 @@ def extract_srt():
 
     except Exception as exc:
         print(f"extract-srt error: {exc}", flush=True)
-        return jsonify({"success": False, "error": str(exc)}), 500
+        error_message, status_code = friendly_youtube_error(exc)
+        return jsonify({"success": False, "error": error_message}), status_code
 
 
 
