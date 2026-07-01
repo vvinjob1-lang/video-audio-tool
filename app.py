@@ -4,6 +4,7 @@ import yt_dlp
 import os
 import re
 import time
+import subprocess
 
 app = Flask(__name__)
 CORS(app)
@@ -32,14 +33,9 @@ def download_audio():
             url = f'https://www.youtube.com/watch?v={video_id}'
             print(f"Converted Shorts URL to: {url}")
 
-        # yt-dlp options
+        # yt-dlp options (MP4 အဖြစ် ဆွဲမယ်)
         ydl_opts = {
             'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '128',
-            }],
             'outtmpl': 'downloads/audio.%(ext)s',
             'quiet': True,
             'no_check_certificate': True,
@@ -59,23 +55,39 @@ def download_audio():
             info = ydl.extract_info(url, download=True)
             print(f"Downloaded: {info.get('title', 'Unknown')}")
 
-        # ဖိုင်ကိုရှာပါ (အချိန်အနည်းငယ်စောင့်ပါ)
+        # ဖိုင်ကိုရှာပါ
         time.sleep(1)
         audio_file = None
         for f in os.listdir('downloads'):
-            if f.endswith(('.mp3', '.webm', '.m4a', '.wav')):
+            if f.endswith(('.mp4', '.webm', '.m4a')):
                 audio_file = f
                 break
 
         if not audio_file:
-            # downloads folder ထဲက အကုန်ပြပါ
             files = os.listdir('downloads')
-            print(f"Files in downloads: {files}")
             return jsonify({'error': f'Audio ဖိုင် မတွေ့ဘူး။ Files: {files}'}), 500
+
+        # MP4 ကနေ MP3 ကို FFmpeg နဲ့ ပြောင်းပါ
+        input_path = os.path.join('downloads', audio_file)
+        output_filename = audio_file.rsplit('.', 1)[0] + '.mp3'
+        output_path = os.path.join('downloads', output_filename)
+
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-q:a', '0', '-map', 'a',
+            output_path, '-y'
+        ]
+        subprocess.run(cmd, capture_output=True, check=True)
+
+        # MP4 ဖိုင်ကို ဖျက်ပါ
+        try:
+            os.remove(input_path)
+        except:
+            pass
 
         return jsonify({
             'success': True,
-            'audio_url': f'/downloads/{audio_file}',
+            'audio_url': f'/downloads/{output_filename}',
             'message': 'Audio ဆွဲချပြီးပါပြီ'
         })
 
