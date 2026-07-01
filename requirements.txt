@@ -5,3 +5,4 @@ yt-dlp[default]>=2026.02.04
 faster-whisper>=1.0.0,<2.0.0
 Werkzeug>=3.0.0
 deep-translator>=1.11.4,<2.0.0
+requests>=2.31.0
