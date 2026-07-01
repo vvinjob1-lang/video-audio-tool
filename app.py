@@ -154,3 +154,47 @@ def home():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
+
+from transformers import VitsModel, AutoTokenizer
+import torch
+import scipy.io.wavfile
+import uuid
+import os
+
+# ===== TTS ENDPOINT (မြန်မာလို) =====
+@app.route('/tts', methods=['POST'])
+def generate_tts():
+    try:
+        data = request.get_json()
+        text = data.get('text', '')
+        
+        if not text:
+            return jsonify({'error': 'စာသား မပါဘူး'}), 400
+        
+        print(f"Generating TTS for: {text[:50]}...")
+        
+        # မော်ဒယ်ကို ခေါ်သုံးပါ (ပထမအကြိမ် Download လုပ်ဖို့ စက္ကန့် ၃၀ လောက်ကြာနိုင်တယ်)
+        model = VitsModel.from_pretrained("facebook/mms-tts-mya")
+        tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-mya")
+        
+        inputs = tokenizer(text, return_tensors="pt")
+        
+        with torch.no_grad():
+            output = model(**inputs).waveform
+        
+        # အသံဖိုင်ကို သိမ်းဆည်းပါ
+        filename = f"tts_{uuid.uuid4().hex[:8]}.wav"
+        filepath = os.path.join('downloads', filename)
+        
+        # WAV ဖိုင်အဖြစ် သိမ်းဆည်းပါ
+        scipy.io.wavfile.write(filepath, rate=model.config.sampling_rate, data=output)
+        
+        return jsonify({
+            'success': True,
+            'audio_url': f'/downloads/{filename}',
+            'message': 'TTS ထုတ်လုပ်ပြီးပါပြီ'
+        })
+        
+    except Exception as e:
+        print(f"TTS Error: {e}")
+        return jsonify({'error': str(e)}), 500
