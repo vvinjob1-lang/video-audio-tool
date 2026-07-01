@@ -3,3 +3,7 @@ flask-cors==4.0.0
 yt-dlp==2024.12.23
 gunicorn==21.2.0
 Werkzeug==2.3.7
+transformers==4.36.0
+torch==2.1.0
+scipy==1.11.4
+sentencepiece==0.1.99
