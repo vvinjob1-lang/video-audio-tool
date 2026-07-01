@@ -132,15 +132,45 @@ def friendly_youtube_error(error: Exception) -> tuple[str, int]:
             "then redeploy and try again.",
             403,
         )
+
+    if "requested format is not available" in lowered or "only images are available" in lowered:
+        return (
+            "YouTube did not expose a downloadable audio/video format for this request. "
+            "This can happen when cookies hide playable formats or when YouTube requires extra verification. "
+            "The backend has multiple no-cookie/cookie format fallbacks; if this still happens, try a different video "
+            "or refresh YOUTUBE_COOKIES_B64.",
+            502,
+        )
+
+    if "video unavailable" in lowered:
+        return (
+            "This YouTube video is unavailable from the backend. It may be deleted, private, region-restricted, "
+            "or blocked for Railway/datacenter traffic.",
+            404,
+        )
+
     return message, 500
 
 
-def build_ydl_opts(output_base: Path, fallback: bool = False) -> dict:
-    """yt-dlp config tuned for YouTube Shorts + normal videos."""
-    player_clients = ["default", "mweb", "ios", "tv"] if fallback else ["default", "mweb", "ios"]
+def build_ydl_opts(
+    output_base: Path,
+    fallback: bool = False,
+    use_cookies: bool = False,
+    format_selector: str | None = None,
+) -> dict:
+    """yt-dlp config tuned for YouTube Shorts + normal videos.
+
+    Important:
+    Cookies can fix "sign in / not a bot" videos, but on some public YouTube videos
+    cookies can make yt-dlp see fewer playable formats. So download_audio_as_mp3()
+    now tries no-cookies first, then cookies only as a fallback.
+    """
+    player_clients = ["default", "mweb", "ios", "tv"] if fallback else ["default"]
 
     opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        # Prefer audio-only, but fall back to any format with audio if YouTube does not
+        # expose normal audio-only formats from the selected client/cookie mode.
+        "format": format_selector or "bestaudio[acodec!=none]/best[acodec!=none]/best",
         "outtmpl": str(output_base) + ".%(ext)s",
         "noplaylist": True,
         "quiet": True,
@@ -155,8 +185,7 @@ def build_ydl_opts(output_base: Path, fallback: bool = False) -> dict:
         "logger": YTDLPLogger(),
         "extractor_args": {
             "youtube": {
-                # Shorts often fail on one YouTube client but work on another.
-                # default keeps yt-dlp's current best clients; mweb/ios/tv are fallbacks.
+                # Start with yt-dlp default behavior. On fallback attempts, try more clients.
                 "player_client": player_clients,
             }
         },
@@ -168,11 +197,13 @@ def build_ydl_opts(output_base: Path, fallback: bool = False) -> dict:
             }
         ],
         "prefer_ffmpeg": True,
+        "overwrites": True,
     }
 
-    cookie_path = get_cookie_file()
-    if cookie_path:
-        opts["cookiefile"] = str(cookie_path)
+    if use_cookies:
+        cookie_path = get_cookie_file()
+        if cookie_path:
+            opts["cookiefile"] = str(cookie_path)
 
     # Some Railway images set ffmpeg in a custom path.
     ffmpeg_location = os.getenv("FFMPEG_LOCATION")
@@ -187,10 +218,56 @@ def download_audio_as_mp3(url: str) -> tuple[Path, dict]:
     output_base = DOWNLOAD_DIR / uuid.uuid4().hex
     final_mp3 = Path(str(output_base) + ".mp3")
 
+    cookie_available = get_cookie_file() is not None
+    cookies_mode = (os.getenv("YTDLP_COOKIES_MODE", "auto") or "auto").strip().lower()
+
+    if cookies_mode in {"always", "true", "1", "yes"}:
+        cookie_modes = [True] if cookie_available else [False]
+    elif cookies_mode in {"never", "false", "0", "no"}:
+        cookie_modes = [False]
+    else:
+        # Auto mode: public videos usually work best without cookies; restricted videos
+        # get a cookie fallback.
+        cookie_modes = [False, True] if cookie_available else [False]
+
+    attempt_profiles = []
+    format_selectors = [
+        "bestaudio[ext=m4a]/bestaudio[acodec!=none]/best[acodec!=none]/best",
+        "bestaudio*/best[acodec!=none]/best",
+        "worstaudio[acodec!=none]/worst[acodec!=none]/worst",
+    ]
+
+    for use_cookies in cookie_modes:
+        for fallback in (False, True):
+            for fmt in format_selectors:
+                attempt_profiles.append(
+                    {
+                        "use_cookies": use_cookies,
+                        "fallback": fallback,
+                        "format_selector": fmt,
+                    }
+                )
+
     last_error = None
-    for fallback in (False, True):
+
+    for attempt_number, profile in enumerate(attempt_profiles, start=1):
         try:
-            ydl_opts = build_ydl_opts(output_base, fallback=fallback)
+            ydl_opts = build_ydl_opts(
+                output_base,
+                fallback=profile["fallback"],
+                use_cookies=profile["use_cookies"],
+                format_selector=profile["format_selector"],
+            )
+
+            print(
+                "yt-dlp attempt "
+                f"{attempt_number}/{len(attempt_profiles)} "
+                f"cookies={profile['use_cookies']} "
+                f"fallback_clients={profile['fallback']} "
+                f"format={profile['format_selector']}",
+                flush=True,
+            )
+
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(normalized_url, download=True)
 
@@ -217,7 +294,7 @@ def download_audio_as_mp3(url: str) -> tuple[Path, dict]:
 
         except Exception as exc:
             last_error = exc
-            print(f"download attempt failed fallback={fallback}: {exc}", flush=True)
+            print(f"download attempt failed profile={profile}: {exc}", flush=True)
 
     raise RuntimeError(str(last_error) if last_error else "Download failed")
 
