@@ -264,6 +264,158 @@ def transcribe_mp3_to_srt(mp3_path: Path, language: str | None = None) -> tuple[
     return srt_text, metadata
 
 
+
+def normalize_translate_language(language: str | None, default: str = "my") -> str:
+    """Return a Google Translate/deep-translator language code."""
+    if not language:
+        return default
+
+    language = language.strip().lower()
+    if language in {"auto", "detect", "auto-detect", "autodetect"}:
+        return "auto"
+
+    language_map = {
+        "myanmar": "my",
+        "burmese": "my",
+        "မြန်မာ": "my",
+        "my": "my",
+        "english": "en",
+        "en-us": "en",
+        "en-gb": "en",
+        "en": "en",
+        "thai": "th",
+        "th": "th",
+        "chinese": "zh-CN",
+        "simplified chinese": "zh-CN",
+        "traditional chinese": "zh-TW",
+        "japanese": "ja",
+        "korean": "ko",
+        "spanish": "es",
+        "french": "fr",
+        "german": "de",
+    }
+    return language_map.get(language, language)
+
+
+def parse_srt_blocks(srt_text: str) -> list[dict]:
+    """Parse SRT into blocks while preserving index and timestamp lines."""
+    text = (srt_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+
+    raw_blocks = re.split(r"\n\s*\n", text)
+    parsed_blocks = []
+
+    for raw_block in raw_blocks:
+        lines = [line.rstrip() for line in raw_block.split("\n") if line.strip()]
+        if not lines:
+            continue
+
+        idx = None
+        time_line = None
+        text_lines = []
+
+        if lines and re.fullmatch(r"\d+", lines[0].strip()):
+            idx = lines.pop(0).strip()
+
+        if lines and "-->" in lines[0]:
+            time_line = lines.pop(0).strip()
+
+        text_lines = lines
+
+        if time_line and text_lines:
+            parsed_blocks.append(
+                {
+                    "index": idx,
+                    "time": time_line,
+                    "text": " ".join(text_lines).strip(),
+                }
+            )
+
+    return parsed_blocks
+
+
+def build_srt_from_blocks(blocks: list[dict]) -> str:
+    """Build valid SRT text from parsed/translated blocks."""
+    output_blocks = []
+    for position, block in enumerate(blocks, start=1):
+        output_blocks.append(
+            f"{position}\n"
+            f"{block['time']}\n"
+            f"{(block.get('translated_text') or block.get('text') or '').strip()}\n"
+        )
+    return "\n".join(output_blocks).strip() + "\n" if output_blocks else ""
+
+
+def translate_texts_with_google(texts: list[str], source_language: str = "auto", target_language: str = "my") -> list[str]:
+    """Translate a list of subtitle texts using Google Translate via deep-translator."""
+    try:
+        from deep_translator import GoogleTranslator
+    except Exception as exc:
+        raise RuntimeError(
+            "deep-translator is not installed. Check requirements.txt and Railway deployment logs."
+        ) from exc
+
+    source = normalize_translate_language(source_language, default="auto")
+    target = normalize_translate_language(target_language, default="my")
+
+    if target == "auto":
+        raise ValueError("target_language cannot be auto")
+
+    if source == target:
+        return texts
+
+    translator = GoogleTranslator(source=source, target=target)
+    translated_texts = []
+    cache = {}
+
+    for text in texts:
+        clean_text = (text or "").strip()
+        if not clean_text:
+            translated_texts.append("")
+            continue
+
+        if clean_text in cache:
+            translated_texts.append(cache[clean_text])
+            continue
+
+        try:
+            translated = translator.translate(clean_text)
+        except Exception as exc:
+            raise RuntimeError(f"Google Translate failed: {exc}") from exc
+
+        translated = (translated or clean_text).strip()
+        cache[clean_text] = translated
+        translated_texts.append(translated)
+
+    return translated_texts
+
+
+def translate_srt_text(srt_text: str, source_language: str = "auto", target_language: str = "my") -> tuple[str, dict]:
+    blocks = parse_srt_blocks(srt_text)
+    if not blocks:
+        raise ValueError("Missing or invalid SRT text")
+
+    original_texts = [block["text"] for block in blocks]
+    translated_texts = translate_texts_with_google(
+        original_texts,
+        source_language=source_language,
+        target_language=target_language,
+    )
+
+    for block, translated_text in zip(blocks, translated_texts):
+        block["translated_text"] = translated_text
+
+    translated_srt_text = build_srt_from_blocks(blocks)
+    meta = {
+        "engine": "google_translate",
+        "source_language": normalize_translate_language(source_language, default="auto"),
+        "target_language": normalize_translate_language(target_language, default="my"),
+        "segments": len(blocks),
+    }
+    return translated_srt_text, meta
+
+
 @app.get("/")
 def index():
     return jsonify(
@@ -273,6 +425,7 @@ def index():
             "endpoints": [
                 "POST /download",
                 "POST /extract-srt",
+                "POST /translate-srt",
                 "GET /srt/<filename>",
             ],
         }
@@ -341,6 +494,56 @@ def extract_srt():
 
     except Exception as exc:
         print(f"extract-srt error: {exc}", flush=True)
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+
+@app.post("/translate-srt")
+def translate_srt():
+    try:
+        payload = request.get_json(silent=True) or {}
+        srt_text = payload.get("srt_text") or payload.get("srt") or ""
+        filename = payload.get("filename") or ""
+        source_language = payload.get("source_language") or payload.get("source") or "auto"
+        target_language = payload.get("target_language") or payload.get("target") or payload.get("language") or "my"
+
+        # Frontend should normally send srt_text directly. Filename fallback is useful for testing.
+        if not srt_text and filename:
+            safe_filename = Path(filename).name
+            srt_path = SRT_DIR / safe_filename
+            if not srt_path.exists():
+                return jsonify({"success": False, "error": "SRT filename not found"}), 404
+            srt_text = srt_path.read_text(encoding="utf-8")
+
+        if not srt_text:
+            return jsonify({"success": False, "error": "Missing 'srt_text'"}), 400
+
+        translated_srt_text, translation_meta = translate_srt_text(
+            srt_text,
+            source_language=source_language,
+            target_language=target_language,
+        )
+
+        target_code = translation_meta["target_language"].replace("-", "_")
+        translated_filename = f"translated_{target_code}_{uuid.uuid4().hex[:8]}.srt"
+        translated_path = SRT_DIR / translated_filename
+        translated_path.write_text(translated_srt_text, encoding="utf-8")
+
+        base_url = request.host_url.rstrip("/")
+        translated_srt_url = f"{base_url}/srt/{translated_filename}"
+
+        return jsonify(
+            {
+                "success": True,
+                "translated_srt_text": translated_srt_text,
+                "translated_srt_url": translated_srt_url,
+                "filename": translated_filename,
+                "translation": translation_meta,
+            }
+        )
+
+    except Exception as exc:
+        print(f"translate-srt error: {exc}", flush=True)
         return jsonify({"success": False, "error": str(exc)}), 500
 
 
