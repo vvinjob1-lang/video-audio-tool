@@ -25,13 +25,13 @@ def download_audio():
         if not url:
             return jsonify({'error': 'URL မပါဘူး'}), 400
 
-        # YouTube Shorts အတွက် URL ကို ပြောင်းပါ
+        # YouTube Shorts URL ကို ပြောင်းပါ
         if 'shorts/' in url:
-            # shorts/ ကို watch?v= နဲ့ အစားထိုးပါ
             video_id = url.split('shorts/')[1].split('?')[0]
             url = f'https://www.youtube.com/watch?v={video_id}'
             print(f"Converted Shorts URL to: {url}")
 
+        # yt-dlp options
         ydl_opts = {
             'format': 'bestaudio/best',
             'postprocessors': [{
@@ -48,10 +48,12 @@ def download_audio():
             'extractor_args': {
                 'youtube': {
                     'skip': ['dash', 'hls'],
+                    'player_client': ['android', 'web'],
                 }
             }
         }
 
+        # yt-dlp ကို Python ကနေ ခေါ်ပါ
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             print(f"Downloaded: {info.get('title', 'Unknown')}")
