@@ -410,7 +410,16 @@ def normalize_whisper_language(language: str | None) -> str | None:
 
 
 def transcribe_mp3_to_srt(mp3_path: Path, language: str | None = None) -> tuple[str, dict]:
-    """Transcribe audio with faster-whisper and return SRT text + metadata."""
+    """Transcribe audio with faster-whisper and return SRT text + metadata.
+
+    Retry strategy:
+    - Try the requested language or auto-detect first.
+    - If no subtitles are produced, retry with VAD disabled.
+    - If language is auto, also retry common fallback languages from WHISPER_FALLBACK_LANGUAGES.
+
+    This helps uploaded files where tiny Whisper + auto-detect incorrectly decides that
+    the audio is silence/no-speech.
+    """
     try:
         from faster_whisper import WhisperModel
     except Exception as exc:
@@ -421,55 +430,124 @@ def transcribe_mp3_to_srt(mp3_path: Path, language: str | None = None) -> tuple[
     model_name = os.getenv("WHISPER_MODEL", "tiny")
     device = os.getenv("WHISPER_DEVICE", "cpu")
     compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-    language_code = normalize_whisper_language(language)
+    requested_language = normalize_whisper_language(language)
+
+    fallback_languages_env = os.getenv("WHISPER_FALLBACK_LANGUAGES", "en,my")
+    fallback_languages = [
+        normalize_whisper_language(item)
+        for item in fallback_languages_env.split(",")
+        if normalize_whisper_language(item)
+    ]
+
+    language_attempts: list[str | None] = []
+    if requested_language:
+        language_attempts.append(requested_language)
+        # Also try auto-detect after the explicit language in case the user selected the wrong language.
+        language_attempts.append(None)
+    else:
+        language_attempts.append(None)
+
+    for fallback_language in fallback_languages:
+        if fallback_language not in language_attempts:
+            language_attempts.append(fallback_language)
+
+    vad_attempts = [True, False]
+    beam_sizes = [1, 5]
 
     print(
-        f"Loading Whisper model={model_name}, device={device}, compute_type={compute_type}, language={language_code or 'auto'}",
+        f"Loading Whisper model={model_name}, device={device}, compute_type={compute_type}, "
+        f"requested_language={requested_language or 'auto'}, language_attempts={language_attempts}",
         flush=True,
     )
 
     model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    attempt_logs = []
+    last_info = None
 
-    segments, info = model.transcribe(
-        str(mp3_path),
-        language=language_code,
-        beam_size=1,
-        vad_filter=True,
-        condition_on_previous_text=False,
+    for language_code in language_attempts:
+        for vad_filter in vad_attempts:
+            for beam_size in beam_sizes:
+                attempt_label = {
+                    "language": language_code or "auto",
+                    "vad_filter": vad_filter,
+                    "beam_size": beam_size,
+                }
+                try:
+                    print(f"Whisper attempt: {attempt_label}", flush=True)
+                    segments_iter, info = model.transcribe(
+                        str(mp3_path),
+                        language=language_code,
+                        beam_size=beam_size,
+                        vad_filter=vad_filter,
+                        condition_on_previous_text=False,
+                        no_speech_threshold=0.8,
+                        log_prob_threshold=-1.5,
+                    )
+
+                    last_info = info
+                    srt_blocks = []
+                    segment_number = 0
+
+                    for segment in segments_iter:
+                        text = (segment.text or "").strip()
+                        if not text:
+                            continue
+
+                        segment_number += 1
+                        srt_blocks.append(
+                            f"{segment_number}\n"
+                            f"{srt_timestamp(segment.start)} --> {srt_timestamp(segment.end)}\n"
+                            f"{text}\n"
+                        )
+
+                    detected_language = getattr(info, "language", None)
+                    language_probability = getattr(info, "language_probability", None)
+                    duration = getattr(info, "duration", None)
+
+                    attempt_logs.append(
+                        {
+                            **attempt_label,
+                            "detected_language": detected_language,
+                            "language_probability": language_probability,
+                            "duration": duration,
+                            "segments": len(srt_blocks),
+                        }
+                    )
+
+                    if srt_blocks:
+                        srt_text = "\n".join(srt_blocks).strip() + "\n"
+                        metadata = {
+                            "model": model_name,
+                            "device": device,
+                            "compute_type": compute_type,
+                            "requested_language": requested_language or "auto",
+                            "used_language": language_code or "auto",
+                            "detected_language": detected_language,
+                            "language_probability": language_probability,
+                            "duration": duration,
+                            "segments": len(srt_blocks),
+                            "vad_filter": vad_filter,
+                            "beam_size": beam_size,
+                            "attempts": attempt_logs,
+                        }
+                        return srt_text, metadata
+
+                except Exception as exc:
+                    print(f"Whisper attempt failed {attempt_label}: {exc}", flush=True)
+                    attempt_logs.append({**attempt_label, "error": str(exc)})
+                    continue
+
+    audio_size = mp3_path.stat().st_size if mp3_path.exists() else 0
+    duration = getattr(last_info, "duration", None) if last_info else None
+    detected_language = getattr(last_info, "language", None) if last_info else None
+    language_probability = getattr(last_info, "language_probability", None) if last_info else None
+
+    raise RuntimeError(
+        "Whisper finished but did not produce any subtitle text. "
+        "The uploaded file may be silent/music-only, speech may be too quiet, or the model may need WHISPER_MODEL=base. "
+        f"Audio bytes={audio_size}, duration={duration}, detected_language={detected_language}, "
+        f"language_probability={language_probability}, attempts={attempt_logs}"
     )
-
-    srt_blocks = []
-    segment_number = 0
-
-    for segment in segments:
-        text = (segment.text or "").strip()
-        if not text:
-            continue
-
-        segment_number += 1
-        srt_blocks.append(
-            f"{segment_number}\n"
-            f"{srt_timestamp(segment.start)} --> {srt_timestamp(segment.end)}\n"
-            f"{text}\n"
-        )
-
-    srt_text = "\n".join(srt_blocks).strip() + "\n" if srt_blocks else ""
-
-    metadata = {
-        "model": model_name,
-        "device": device,
-        "compute_type": compute_type,
-        "detected_language": getattr(info, "language", None),
-        "language_probability": getattr(info, "language_probability", None),
-        "duration": getattr(info, "duration", None),
-        "segments": len(srt_blocks),
-    }
-
-    if not srt_text.strip():
-        raise RuntimeError("Whisper finished but did not produce any subtitle text.")
-
-    return srt_text, metadata
-
 
 
 def normalize_translate_language(language: str | None, default: str = "my") -> str:
