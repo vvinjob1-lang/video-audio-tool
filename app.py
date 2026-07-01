@@ -3,6 +3,7 @@ from flask_cors import CORS
 import yt_dlp
 import os
 import re
+import time
 
 app = Flask(__name__)
 CORS(app)
@@ -58,15 +59,19 @@ def download_audio():
             info = ydl.extract_info(url, download=True)
             print(f"Downloaded: {info.get('title', 'Unknown')}")
 
-        # ဖိုင်ကိုရှာပါ
+        # ဖိုင်ကိုရှာပါ (အချိန်အနည်းငယ်စောင့်ပါ)
+        time.sleep(1)
         audio_file = None
         for f in os.listdir('downloads'):
-            if f.endswith(('.mp3', '.webm', '.m4a')):
+            if f.endswith(('.mp3', '.webm', '.m4a', '.wav')):
                 audio_file = f
                 break
 
         if not audio_file:
-            return jsonify({'error': 'Audio ဖိုင် မတွေ့ဘူး'}), 500
+            # downloads folder ထဲက အကုန်ပြပါ
+            files = os.listdir('downloads')
+            print(f"Files in downloads: {files}")
+            return jsonify({'error': f'Audio ဖိုင် မတွေ့ဘူး။ Files: {files}'}), 500
 
         return jsonify({
             'success': True,
