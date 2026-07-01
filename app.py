@@ -35,24 +35,21 @@ def allowed_file(filename):
 def download_video(url):
     try:
         ydl_opts = {
-    'format': 'bestaudio/best',
-    'postprocessors': [{
-        'key': 'FFmpegExtractAudio',
-        'preferredcodec': 'mp3',
-        'preferredquality': '128',
-    }],
-    'outtmpl': 'downloads/audio.%(ext)s',
-    'quiet': False,
-    'no_check_certificate': True,
-    'ignoreerrors': True,
-    'geo_bypass': True,
-    'extract_flat': False,
-    # ===== COOKIES ထည့်ပါ =====
-    'cookiefile': 'cookies.txt',  # ← ဒါကို သေချာထည့်ပါ
-    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'sleep_interval': 5,
-    'max_sleep_interval': 10,
-}
+            'format': 'bestvideo[height<=480]+bestaudio/best[height<=480]',
+            'outtmpl': 'downloads/video.%(ext)s',
+            'quiet': True,
+            'no_check_certificate': True,
+            'ignoreerrors': True,
+            'geo_bypass': True,
+            'cookiefile': 'cookies.txt',
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            video_path = 'downloads/video.mp4'
+            return video_path
+    except Exception as e:
+        raise Exception(f"Video download failed: {str(e)}")
 
 # ==========================================
 # 2. EXTRACT AUDIO FROM VIDEO
@@ -124,10 +121,8 @@ def translate_content(file_path, target_lang):
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        # Translate
         translated = translator.translate(content, dest=target_lang).text
         
-        # Save translated
         ext = 'srt' if file_path.endswith('.srt') else 'txt'
         translated_path = f'srt/translated.{ext}'
         with open(translated_path, 'w', encoding='utf-8') as f:
@@ -145,12 +140,10 @@ def rewrite_script(file_path):
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        # If SRT, remove timestamps
         if file_path.endswith('.srt'):
             lines = [line for line in content.split('\n') if line.strip() and not line[0].isdigit() and '-->' not in line]
             content = ' '.join(lines)
         
-        # Ollama
         response = ollama.chat(model='llama3', messages=[{
             'role': 'user',
             'content': f'Rewrite this text to be more concise, engaging, and natural sounding for a video narration: {content[:2000]}'
@@ -174,11 +167,9 @@ def generate_tts(text_file, target_lang):
         with open(text_file, 'r', encoding='utf-8') as f:
             text = f.read()
         
-        # If text is too long, take first 200 chars
         if len(text) > 200:
             text = text[:200]
         
-        # Load model
         model = VitsModel.from_pretrained("facebook/mms-tts-mya")
         tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-mya")
         
@@ -209,11 +200,9 @@ def process_video():
         
         print(f"Processing: {url} → Language: {target_lang}")
         
-        # Step 1: Download video
         video_path = download_video(url)
         print("✅ Video downloaded")
         
-        # Step 2: Try SRT first
         try:
             srt_path = video_to_srt(video_path)
             print("✅ SRT extracted")
@@ -226,15 +215,12 @@ def process_video():
             is_srt = False
             print("✅ Audio → Text complete")
         
-        # Step 3: Translate
         translated_path = translate_content(content_path, target_lang)
         print("✅ Translation complete")
         
-        # Step 4: Rewrite script
         rewritten_path = rewrite_script(translated_path)
         print("✅ Script rewritten")
         
-        # Step 5: TTS
         tts_path, tts_filename = generate_tts(rewritten_path, target_lang)
         print("✅ TTS generated")
         
@@ -250,7 +236,60 @@ def process_video():
         return jsonify({'error': str(e)}), 500
 
 # ==========================================
-# 9. FILE UPLOAD ENDPOINT
+# 9. DOWNLOAD ENDPOINT (Simple)
+# ==========================================
+@app.route('/download', methods=['POST'])
+def download_audio():
+    try:
+        data = request.get_json()
+        url = data.get('url')
+        
+        if not url:
+            return jsonify({'error': 'URL မပါဘူး'}), 400
+        
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '128',
+            }],
+            'outtmpl': 'downloads/audio.%(ext)s',
+            'quiet': False,
+            'no_check_certificate': True,
+            'ignoreerrors': True,
+            'geo_bypass': True,
+            'cookiefile': 'cookies.txt',
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'sleep_interval': 5,
+            'max_sleep_interval': 10,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            print(f"Video title: {info.get('title', 'Unknown')}")
+        
+        audio_file = None
+        for f in os.listdir('downloads'):
+            if f.endswith('.mp3'):
+                audio_file = f
+                break
+        
+        if not audio_file:
+            return jsonify({'error': 'Audio ဖိုင် မတွေ့ဘူး'}), 500
+        
+        return jsonify({
+            'success': True,
+            'audio_url': f'/downloads/{audio_file}',
+            'message': 'Audio ဆွဲချပြီးပါပြီ'
+        })
+        
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+# ==========================================
+# 10. FILE UPLOAD ENDPOINT
 # ==========================================
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -265,28 +304,23 @@ def upload_file():
         if not allowed_file(file.filename):
             return jsonify({'success': False, 'error': 'ဒီ File အမျိုးအစားကို မထောက်ပံ့ပါဘူး'}), 400
         
-        # Save uploaded file
         original_filename = secure_filename(file.filename)
         unique_id = uuid.uuid4().hex[:8]
         saved_filename = f"{unique_id}_{original_filename}"
         filepath = os.path.join('uploads', saved_filename)
         file.save(filepath)
         
-        # Check if video or audio
         ext = original_filename.rsplit('.', 1)[1].lower()
         
         if ext in ['mp4', 'mov', 'avi', 'mkv', 'webm']:
-            # Video → SRT
             try:
                 srt_path = video_to_srt(filepath)
                 content_path = srt_path
                 is_srt = True
             except:
-                # Fallback: Audio → Text
                 content_path = audio_to_text(filepath)
                 is_srt = False
         else:
-            # Audio only → transcribe
             model = whisper.load_model("base")
             result = model.transcribe(filepath, task="translate")
             text_path = 'srt/fallback_text.txt'
@@ -295,13 +329,8 @@ def upload_file():
             content_path = text_path
             is_srt = False
         
-        # Translate
         translated_path = translate_content(content_path, 'my')
-        
-        # Rewrite
         rewritten_path = rewrite_script(translated_path)
-        
-        # TTS
         tts_path, tts_filename = generate_tts(rewritten_path, 'my')
         
         return jsonify({
@@ -314,7 +343,7 @@ def upload_file():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 # ==========================================
-# 10. SERVE FILES
+# 11. SERVE FILES
 # ==========================================
 @app.route('/downloads/<filename>')
 def serve_audio(filename):
@@ -323,6 +352,10 @@ def serve_audio(filename):
 @app.route('/srt/<filename>')
 def serve_srt(filename):
     return send_from_directory('srt', filename)
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'healthy'})
 
 @app.route('/')
 def home():
