@@ -2,20 +2,12 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import yt_dlp
 import os
-import uuid
-import subprocess
-from werkzeug.utils import secure_filename
+import re
 
 app = Flask(__name__)
 CORS(app)
 
 os.makedirs('downloads', exist_ok=True)
-os.makedirs('uploads', exist_ok=True)
-
-ALLOWED_EXTENSIONS = {'mp4', 'mov', 'avi', 'mp3', 'wav', 'm4a', 'webm', 'mkv'}
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 @app.route('/')
 def home():
@@ -32,6 +24,13 @@ def download_audio():
         url = data.get('url')
         if not url:
             return jsonify({'error': 'URL မပါဘူး'}), 400
+
+        # YouTube Shorts အတွက် URL ကို ပြောင်းပါ
+        if 'shorts/' in url:
+            # shorts/ ကို watch?v= နဲ့ အစားထိုးပါ
+            video_id = url.split('shorts/')[1].split('?')[0]
+            url = f'https://www.youtube.com/watch?v={video_id}'
+            print(f"Converted Shorts URL to: {url}")
 
         ydl_opts = {
             'format': 'bestaudio/best',
@@ -60,16 +59,9 @@ def download_audio():
         # ဖိုင်ကိုရှာပါ
         audio_file = None
         for f in os.listdir('downloads'):
-            if f.endswith('.mp3'):
+            if f.endswith(('.mp3', '.webm', '.m4a')):
                 audio_file = f
                 break
-
-        if not audio_file:
-            # တစ်ခါတလေ .webm ဖြစ်နေတယ်
-            for f in os.listdir('downloads'):
-                if f.endswith(('.webm', '.m4a')):
-                    audio_file = f
-                    break
 
         if not audio_file:
             return jsonify({'error': 'Audio ဖိုင် မတွေ့ဘူး'}), 500
