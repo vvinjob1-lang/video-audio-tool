@@ -35,19 +35,24 @@ def allowed_file(filename):
 def download_video(url):
     try:
         ydl_opts = {
-            'format': 'bestvideo[height<=480]+bestaudio/best[height<=480]',
-            'outtmpl': 'downloads/video.%(ext)s',
-            'quiet': True,
-            'no_check_certificate': True,
-            'ignoreerrors': True,
-            'geo_bypass': True,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            video_path = 'downloads/video.mp4'
-            return video_path
-    except Exception as e:
-        raise Exception(f"Video download failed: {str(e)}")
+    'format': 'bestaudio/best',
+    'postprocessors': [{
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': 'mp3',
+        'preferredquality': '128',
+    }],
+    'outtmpl': 'downloads/audio.%(ext)s',
+    'quiet': False,
+    'no_check_certificate': True,
+    'ignoreerrors': True,
+    'geo_bypass': True,
+    'extract_flat': False,
+    # ===== COOKIES ထည့်ပါ =====
+    'cookiefile': 'cookies.txt',  # ← ဒါကို သေချာထည့်ပါ
+    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'sleep_interval': 5,
+    'max_sleep_interval': 10,
+}
 
 # ==========================================
 # 2. EXTRACT AUDIO FROM VIDEO
