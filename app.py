@@ -363,3 +363,25 @@ def home():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
+
+# ===== LAZY LOADING =====
+_whisper_model = None
+_tts_model = None
+_tts_tokenizer = None
+
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        print("Loading Whisper model...")
+        _whisper_model = whisper.load_model("base")
+        print("Whisper model loaded!")
+    return _whisper_model
+
+def get_tts_model():
+    global _tts_model, _tts_tokenizer
+    if _tts_model is None:
+        print("Loading TTS model...")
+        _tts_model = VitsModel.from_pretrained("facebook/mms-tts-mya")
+        _tts_tokenizer = AutoTokenizer.from_pretrained("facebook/mms-tts-mya")
+        print("TTS model loaded!")
+    return _tts_model, _tts_tokenizer
