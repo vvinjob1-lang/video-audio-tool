@@ -4,7 +4,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 import yt_dlp
 
@@ -14,10 +14,12 @@ CORS(app)
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 UPLOAD_DIR = BASE_DIR / "uploads"
+SRT_DIR = BASE_DIR / "srt"
 COOKIE_FILE = BASE_DIR / "cookies.txt"
 
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
+SRT_DIR.mkdir(exist_ok=True)
 
 YOUTUBE_HEADERS = {
     "User-Agent": (
@@ -166,9 +168,115 @@ def download_audio_as_mp3(url: str) -> tuple[Path, dict]:
     raise RuntimeError(str(last_error) if last_error else "Download failed")
 
 
+def srt_timestamp(seconds: float) -> str:
+    """Convert seconds to SRT timestamp format: HH:MM:SS,mmm."""
+    if seconds is None:
+        seconds = 0
+    milliseconds = int(round(float(seconds) * 1000))
+    hours = milliseconds // 3_600_000
+    milliseconds %= 3_600_000
+    minutes = milliseconds // 60_000
+    milliseconds %= 60_000
+    secs = milliseconds // 1000
+    millis = milliseconds % 1000
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def normalize_whisper_language(language: str | None) -> str | None:
+    """Return faster-whisper language code or None for auto-detect."""
+    if not language:
+        return None
+
+    language = language.strip().lower()
+    if language in {"auto", "detect", "auto-detect", "autodetect"}:
+        return None
+
+    language_map = {
+        "myanmar": "my",
+        "burmese": "my",
+        "မြန်မာ": "my",
+        "english": "en",
+        "en-us": "en",
+        "en-gb": "en",
+    }
+    return language_map.get(language, language)
+
+
+def transcribe_mp3_to_srt(mp3_path: Path, language: str | None = None) -> tuple[str, dict]:
+    """Transcribe audio with faster-whisper and return SRT text + metadata."""
+    try:
+        from faster_whisper import WhisperModel
+    except Exception as exc:
+        raise RuntimeError(
+            "faster-whisper is not installed. Check requirements.txt and Railway deployment logs."
+        ) from exc
+
+    model_name = os.getenv("WHISPER_MODEL", "tiny")
+    device = os.getenv("WHISPER_DEVICE", "cpu")
+    compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+    language_code = normalize_whisper_language(language)
+
+    print(
+        f"Loading Whisper model={model_name}, device={device}, compute_type={compute_type}, language={language_code or 'auto'}",
+        flush=True,
+    )
+
+    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+
+    segments, info = model.transcribe(
+        str(mp3_path),
+        language=language_code,
+        beam_size=1,
+        vad_filter=True,
+        condition_on_previous_text=False,
+    )
+
+    srt_blocks = []
+    segment_number = 0
+
+    for segment in segments:
+        text = (segment.text or "").strip()
+        if not text:
+            continue
+
+        segment_number += 1
+        srt_blocks.append(
+            f"{segment_number}\n"
+            f"{srt_timestamp(segment.start)} --> {srt_timestamp(segment.end)}\n"
+            f"{text}\n"
+        )
+
+    srt_text = "\n".join(srt_blocks).strip() + "\n" if srt_blocks else ""
+
+    metadata = {
+        "model": model_name,
+        "device": device,
+        "compute_type": compute_type,
+        "detected_language": getattr(info, "language", None),
+        "language_probability": getattr(info, "language_probability", None),
+        "duration": getattr(info, "duration", None),
+        "segments": len(srt_blocks),
+    }
+
+    if not srt_text.strip():
+        raise RuntimeError("Whisper finished but did not produce any subtitle text.")
+
+    return srt_text, metadata
+
+
 @app.get("/")
 def index():
-    return jsonify({"ok": True, "service": "video-audio-tool", "endpoint": "POST /download"})
+    return jsonify(
+        {
+            "ok": True,
+            "service": "video-audio-tool",
+            "endpoints": [
+                "POST /download",
+                "POST /extract-srt",
+                "GET /srt/<filename>",
+            ],
+        }
+    )
 
 
 @app.get("/health")
@@ -198,6 +306,55 @@ def download():
 
     except Exception as exc:
         return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@app.post("/extract-srt")
+def extract_srt():
+    try:
+        payload = request.get_json(silent=True) or {}
+        url = payload.get("url") or request.form.get("url") or request.values.get("url")
+        language = payload.get("language") or request.form.get("language") or request.values.get("language") or "auto"
+
+        if not url:
+            return jsonify({"success": False, "error": "Missing 'url'"}), 400
+
+        mp3_path, audio_meta = download_audio_as_mp3(url)
+        srt_text, whisper_meta = transcribe_mp3_to_srt(mp3_path, language=language)
+
+        srt_filename = f"{audio_meta.get('video_id') or mp3_path.stem}_{uuid.uuid4().hex[:8]}.srt"
+        srt_path = SRT_DIR / srt_filename
+        srt_path.write_text(srt_text, encoding="utf-8")
+
+        base_url = request.host_url.rstrip("/")
+        srt_url = f"{base_url}/srt/{srt_filename}"
+
+        return jsonify(
+            {
+                "success": True,
+                "srt_text": srt_text,
+                "srt_url": srt_url,
+                "filename": srt_filename,
+                "audio": audio_meta,
+                "whisper": whisper_meta,
+            }
+        )
+
+    except Exception as exc:
+        print(f"extract-srt error: {exc}", flush=True)
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@app.get("/srt/<path:filename>")
+def serve_srt(filename):
+    safe_filename = Path(filename).name
+    return send_from_directory(
+        SRT_DIR,
+        safe_filename,
+        mimetype="text/plain; charset=utf-8",
+        as_attachment=True,
+        download_name=safe_filename,
+        max_age=0,
+    )
 
 
 if __name__ == "__main__":
