@@ -1,5 +1,4 @@
-Flask
-flask-cors
-yt-dlp
-gunicorn
-Werkzeug
+Flask>=3.0.0
+flask-cors>=4.0.0
+gunicorn>=22.0.0
+yt-dlp[default]>=2026.02.04
