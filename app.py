@@ -2,11 +2,13 @@ import os
 import base64
 import re
 import uuid
+import subprocess
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
 from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
+from werkzeug.utils import secure_filename
 import yt_dlp
 
 app = Flask(__name__)
@@ -16,12 +18,86 @@ BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 UPLOAD_DIR = BASE_DIR / "uploads"
 SRT_DIR = BASE_DIR / "srt"
+AUDIO_DIR = BASE_DIR / "audio"
 COOKIE_FILE = BASE_DIR / "cookies.txt"
 GENERATED_COOKIE_FILE = Path(os.getenv("YOUTUBE_COOKIES_GENERATED_FILE", "/tmp/youtube_cookies.txt"))
 
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
 SRT_DIR.mkdir(exist_ok=True)
+AUDIO_DIR.mkdir(exist_ok=True)
+
+
+app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_MB", "250")) * 1024 * 1024
+
+ALLOWED_UPLOAD_EXTENSIONS = {
+    "mp4", "mov", "m4v", "mkv", "webm", "avi", "mp3", "m4a", "wav", "aac", "ogg", "flac"
+}
+
+
+def allowed_upload_filename(filename: str) -> bool:
+    if not filename or "." not in filename:
+        return False
+    ext = filename.rsplit(".", 1)[1].lower()
+    return ext in ALLOWED_UPLOAD_EXTENSIONS
+
+
+def save_uploaded_media(file_storage) -> Path:
+    if not file_storage or not getattr(file_storage, "filename", ""):
+        raise ValueError("Missing uploaded file")
+
+    filename = secure_filename(file_storage.filename)
+    if not allowed_upload_filename(filename):
+        raise ValueError(
+            "Unsupported file type. Upload MP4, MOV, MKV, WEBM, MP3, M4A, WAV, AAC, OGG, or FLAC."
+        )
+
+    ext = filename.rsplit(".", 1)[1].lower()
+    upload_path = UPLOAD_DIR / f"{Path(filename).stem}_{uuid.uuid4().hex[:8]}.{ext}"
+    file_storage.save(upload_path)
+
+    if not upload_path.exists() or upload_path.stat().st_size == 0:
+        raise RuntimeError("Uploaded file was empty or could not be saved")
+
+    return upload_path
+
+
+def convert_media_file_to_mp3(input_path: Path) -> Path:
+    output_path = AUDIO_DIR / f"{input_path.stem}_{uuid.uuid4().hex[:8]}.mp3"
+
+    ffmpeg_binary = os.getenv("FFMPEG_BINARY", "ffmpeg")
+    command = [
+        ffmpeg_binary,
+        "-y",
+        "-i", str(input_path),
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-ar", "44100",
+        "-ac", "2",
+        "-b:a", "192k",
+        str(output_path),
+    ]
+
+    print("Running ffmpeg upload conversion:", " ".join(command), flush=True)
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    if result.returncode != 0:
+        print("ffmpeg upload conversion failed:", result.stderr[-3000:], flush=True)
+        raise RuntimeError("FFmpeg could not convert the uploaded media file to MP3")
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError("MP3 file was not created from uploaded media")
+
+    return output_path
+
+
+def create_srt_from_mp3(mp3_path: Path, language: str | None = None, base_name: str | None = None) -> tuple[str, str, dict]:
+    srt_text, whisper_meta = transcribe_mp3_to_srt(mp3_path, language=language)
+    safe_base = secure_filename(base_name or mp3_path.stem) or "uploaded_media"
+    srt_filename = f"{Path(safe_base).stem}_{uuid.uuid4().hex[:8]}.srt"
+    srt_path = SRT_DIR / srt_filename
+    srt_path.write_text(srt_text, encoding="utf-8")
+    return srt_text, srt_filename, whisper_meta
 
 YOUTUBE_HEADERS = {
     "User-Agent": (
@@ -557,6 +633,10 @@ def index():
                 "POST /download",
                 "POST /extract-srt",
                 "POST /translate-srt",
+                "POST /upload",
+                "POST /extract-srt-upload",
+                "POST /process-upload",
+                "GET /audio/<filename>",
                 "GET /srt/<filename>",
             ],
         }
@@ -678,6 +758,143 @@ def translate_srt():
     except Exception as exc:
         print(f"translate-srt error: {exc}", flush=True)
         return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@app.post("/upload")
+def upload_to_mp3():
+    """Accept a multipart uploaded audio/video file and return binary MP3.
+
+    This is the stable fallback when YouTube blocks Railway/yt-dlp or marks
+    streams as DRM protected. It does not bypass DRM; it only processes files
+    the user directly uploads.
+    """
+    try:
+        uploaded_file = request.files.get("file") or request.files.get("video") or request.files.get("audio")
+        input_path = save_uploaded_media(uploaded_file)
+        mp3_path = convert_media_file_to_mp3(input_path)
+
+        return send_file(
+            mp3_path,
+            mimetype="audio/mpeg",
+            as_attachment=True,
+            download_name=f"{input_path.stem}.mp3",
+            max_age=0,
+        )
+
+    except Exception as exc:
+        print(f"upload error: {exc}", flush=True)
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@app.post("/extract-srt-upload")
+def extract_srt_upload():
+    """Accept uploaded media, convert to MP3, transcribe with Whisper, return SRT JSON."""
+    try:
+        uploaded_file = request.files.get("file") or request.files.get("video") or request.files.get("audio")
+        language = request.form.get("language") or request.values.get("language") or "auto"
+
+        input_path = save_uploaded_media(uploaded_file)
+        mp3_path = convert_media_file_to_mp3(input_path)
+        srt_text, srt_filename, whisper_meta = create_srt_from_mp3(
+            mp3_path,
+            language=language,
+            base_name=input_path.stem,
+        )
+
+        base_url = request.host_url.rstrip("/")
+        srt_url = f"{base_url}/srt/{srt_filename}"
+        audio_url = f"{base_url}/audio/{mp3_path.name}"
+
+        return jsonify(
+            {
+                "success": True,
+                "srt_text": srt_text,
+                "srt_url": srt_url,
+                "filename": srt_filename,
+                "audio_url": audio_url,
+                "audio_filename": mp3_path.name,
+                "source": {
+                    "type": "upload",
+                    "filename": input_path.name,
+                },
+                "whisper": whisper_meta,
+            }
+        )
+
+    except Exception as exc:
+        print(f"extract-srt-upload error: {exc}", flush=True)
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@app.post("/process-upload")
+def process_upload():
+    """One-shot upload pipeline: MP3 URL + SRT + optional translated SRT."""
+    try:
+        uploaded_file = request.files.get("file") or request.files.get("video") or request.files.get("audio")
+        language = request.form.get("language") or request.values.get("language") or "auto"
+        target_language = request.form.get("target_language") or request.values.get("target_language") or ""
+        source_language = request.form.get("source_language") or request.values.get("source_language") or "auto"
+
+        input_path = save_uploaded_media(uploaded_file)
+        mp3_path = convert_media_file_to_mp3(input_path)
+        srt_text, srt_filename, whisper_meta = create_srt_from_mp3(
+            mp3_path,
+            language=language,
+            base_name=input_path.stem,
+        )
+
+        base_url = request.host_url.rstrip("/")
+        response_payload = {
+            "success": True,
+            "audio_url": f"{base_url}/audio/{mp3_path.name}",
+            "audio_filename": mp3_path.name,
+            "srt_text": srt_text,
+            "srt_url": f"{base_url}/srt/{srt_filename}",
+            "filename": srt_filename,
+            "source": {
+                "type": "upload",
+                "filename": input_path.name,
+            },
+            "whisper": whisper_meta,
+        }
+
+        if target_language:
+            translated_srt_text, translation_meta = translate_srt_text(
+                srt_text,
+                source_language=source_language,
+                target_language=target_language,
+            )
+            target_code = translation_meta["target_language"].replace("-", "_")
+            translated_filename = f"translated_{target_code}_{uuid.uuid4().hex[:8]}.srt"
+            translated_path = SRT_DIR / translated_filename
+            translated_path.write_text(translated_srt_text, encoding="utf-8")
+            response_payload.update(
+                {
+                    "translated_srt_text": translated_srt_text,
+                    "translated_srt_url": f"{base_url}/srt/{translated_filename}",
+                    "translated_filename": translated_filename,
+                    "translation": translation_meta,
+                }
+            )
+
+        return jsonify(response_payload)
+
+    except Exception as exc:
+        print(f"process-upload error: {exc}", flush=True)
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@app.get("/audio/<path:filename>")
+def serve_audio(filename):
+    safe_filename = Path(filename).name
+    return send_from_directory(
+        AUDIO_DIR,
+        safe_filename,
+        mimetype="audio/mpeg",
+        as_attachment=True,
+        download_name=safe_filename,
+        max_age=0,
+    )
 
 
 @app.get("/srt/<path:filename>")
