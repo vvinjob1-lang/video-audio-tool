@@ -438,16 +438,29 @@ def normalize_whisper_language(language: str | None) -> str | None:
 
 
 def transcribe_mp3_to_srt(mp3_path: Path, language: str | None = None) -> tuple[str, dict]:
-    """Transcribe audio with faster-whisper and return SRT text + metadata."""
+    """
+    Transcribe audio with faster-whisper and return SRT text + metadata.
+
+    Patch v5 quality goals:
+    - Better for English songs/short clips than tiny+first-attempt output.
+    - Optional WHISPER_FORCE_LANGUAGE=en for English source videos.
+    - Try multiple decoding settings and choose the best candidate.
+    """
     try:
         from faster_whisper import WhisperModel
     except Exception as exc:
         raise RuntimeError("faster-whisper is not installed. Check requirements.txt and Railway deployment logs.") from exc
 
-    model_name = os.getenv("WHISPER_MODEL", "tiny")
+    # "tiny" is fast but often inaccurate for songs. "base" is a safer default.
+    model_name = os.getenv("WHISPER_MODEL", "base")
     device = os.getenv("WHISPER_DEVICE", "cpu")
     compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+
     requested_language = normalize_whisper_language(language)
+
+    # Use this in Railway for English source videos/songs:
+    # WHISPER_FORCE_LANGUAGE=en
+    forced_language = normalize_whisper_language(os.getenv("WHISPER_FORCE_LANGUAGE"))
 
     fallback_languages_env = os.getenv("WHISPER_FALLBACK_LANGUAGES", "en,my")
     fallback_languages = [
@@ -457,27 +470,86 @@ def transcribe_mp3_to_srt(mp3_path: Path, language: str | None = None) -> tuple[
     ]
 
     language_attempts: list[str | None] = []
-    if requested_language:
+    if forced_language:
+        language_attempts.append(forced_language)
+    if requested_language and requested_language not in language_attempts:
         language_attempts.append(requested_language)
-        language_attempts.append(None)
-    else:
+
+    # If no forced/requested language, still try auto, but do not accept the first rough result blindly.
+    if not forced_language and None not in language_attempts:
         language_attempts.append(None)
 
     for fallback_language in fallback_languages:
         if fallback_language not in language_attempts:
             language_attempts.append(fallback_language)
 
-    vad_attempts = [True, False]
-    beam_sizes = [1, 5]
+    if not language_attempts:
+        language_attempts = [None]
+
+    # Singing/music often gets chopped by VAD, so try no-VAD first.
+    vad_attempts = [False, True]
+
+    # Stronger decoding than beam_size=1.
+    beam_sizes = [5, 3]
+
+    initial_prompt = os.getenv(
+        "WHISPER_INITIAL_PROMPT",
+        "This is clear English song lyrics or spoken narration. Transcribe the exact English words. "
+        "Do not invent Burmese text. Keep repeated lyric words only when actually sung."
+    )
 
     print(
         f"Loading Whisper model={model_name}, device={device}, compute_type={compute_type}, "
-        f"requested_language={requested_language or 'auto'}, language_attempts={language_attempts}",
+        f"requested_language={requested_language or 'auto'}, forced_language={forced_language or 'none'}, "
+        f"language_attempts={language_attempts}",
         flush=True,
     )
 
     model = WhisperModel(model_name, device=device, compute_type=compute_type)
+
+    def repeated_word_penalty(text: str) -> float:
+        words = re.findall(r"[A-Za-z']+|[\u1000-\u109F]+", (text or "").lower())
+        if len(words) < 6:
+            return 0.0
+        penalty = 0.0
+        run_word = None
+        run_count = 0
+        for word in words:
+            if word == run_word:
+                run_count += 1
+            else:
+                if run_count >= 4:
+                    penalty += (run_count - 3) * 1.5
+                run_word = word
+                run_count = 1
+        if run_count >= 4:
+            penalty += (run_count - 3) * 1.5
+        return penalty
+
+    def score_candidate(srt_text: str, plain_text: str, info, segment_count: int, language_code: str | None, vad_filter: bool, beam_size: int) -> float:
+        detected_language = getattr(info, "language", None)
+        language_probability = getattr(info, "language_probability", None) or 0.0
+        char_count = len(plain_text.strip())
+        word_count = len(re.findall(r"\S+", plain_text))
+        score = 0.0
+        score += min(char_count / 20.0, 30.0)
+        score += min(word_count / 3.0, 25.0)
+        score += min(segment_count * 2.0, 20.0)
+        score += float(language_probability) * 10.0
+        if (forced_language == "en" or requested_language == "en" or language_code == "en") and detected_language == "en":
+            score += 15.0
+        if forced_language == "en" and detected_language not in {None, "en"}:
+            score -= 20.0
+        if vad_filter:
+            score -= 2.0
+        score += beam_size * 0.3
+        score -= repeated_word_penalty(plain_text)
+        if "-->" in plain_text or "WEBVTT" in plain_text.upper():
+            score -= 30.0
+        return score
+
     attempt_logs = []
+    candidates = []
     last_info = None
 
     for language_code in language_attempts:
@@ -488,21 +560,25 @@ def transcribe_mp3_to_srt(mp3_path: Path, language: str | None = None) -> tuple[
                     "vad_filter": vad_filter,
                     "beam_size": beam_size,
                 }
-
                 try:
                     print(f"Whisper attempt: {attempt_label}", flush=True)
                     segments_iter, info = model.transcribe(
                         str(mp3_path),
                         language=language_code,
                         beam_size=beam_size,
+                        best_of=5,
                         vad_filter=vad_filter,
                         condition_on_previous_text=False,
-                        no_speech_threshold=0.8,
-                        log_prob_threshold=-1.5,
+                        temperature=0.0,
+                        compression_ratio_threshold=2.4,
+                        no_speech_threshold=0.6,
+                        log_prob_threshold=-1.0,
+                        initial_prompt=initial_prompt,
                     )
 
                     last_info = info
                     srt_blocks = []
+                    plain_parts = []
                     segment_number = 0
 
                     for segment in segments_iter:
@@ -510,6 +586,7 @@ def transcribe_mp3_to_srt(mp3_path: Path, language: str | None = None) -> tuple[
                         if not text:
                             continue
                         segment_number += 1
+                        plain_parts.append(text)
                         srt_blocks.append(
                             f"{segment_number}\n"
                             f"{srt_timestamp(segment.start)} --> {srt_timestamp(segment.end)}\n"
@@ -520,47 +597,80 @@ def transcribe_mp3_to_srt(mp3_path: Path, language: str | None = None) -> tuple[
                     language_probability = getattr(info, "language_probability", None)
                     duration = getattr(info, "duration", None)
 
-                    attempt_logs.append(
-                        {
-                            **attempt_label,
-                            "detected_language": detected_language,
-                            "language_probability": language_probability,
-                            "duration": duration,
-                            "segments": len(srt_blocks),
-                        }
+                    plain_text = " ".join(plain_parts).strip()
+                    srt_text = "\n".join(srt_blocks).strip() + "\n" if srt_blocks else ""
+
+                    candidate_score = score_candidate(
+                        srt_text=srt_text,
+                        plain_text=plain_text,
+                        info=info,
+                        segment_count=len(srt_blocks),
+                        language_code=language_code,
+                        vad_filter=vad_filter,
+                        beam_size=beam_size,
                     )
 
+                    log_entry = {
+                        **attempt_label,
+                        "detected_language": detected_language,
+                        "language_probability": language_probability,
+                        "duration": duration,
+                        "segments": len(srt_blocks),
+                        "chars": len(plain_text),
+                        "score": candidate_score,
+                    }
+                    attempt_logs.append(log_entry)
+
                     if srt_blocks:
-                        srt_text = "\n".join(srt_blocks).strip() + "\n"
-                        metadata = {
-                            "model": model_name,
-                            "device": device,
-                            "compute_type": compute_type,
-                            "requested_language": requested_language or "auto",
-                            "used_language": language_code or "auto",
-                            "detected_language": detected_language,
-                            "language_probability": language_probability,
-                            "duration": duration,
-                            "segments": len(srt_blocks),
-                            "vad_filter": vad_filter,
-                            "beam_size": beam_size,
-                            "attempts": attempt_logs,
-                        }
-                        return srt_text, metadata
+                        candidates.append(
+                            {
+                                "srt_text": srt_text,
+                                "plain_text": plain_text,
+                                "info": info,
+                                "score": candidate_score,
+                                "language_code": language_code,
+                                "vad_filter": vad_filter,
+                                "beam_size": beam_size,
+                                "segments": len(srt_blocks),
+                                "log_entry": log_entry,
+                            }
+                        )
 
                 except Exception as exc:
                     print(f"Whisper attempt failed {attempt_label}: {exc}", flush=True)
                     attempt_logs.append({**attempt_label, "error": str(exc)})
                     continue
 
+    if candidates:
+        best = max(candidates, key=lambda item: item["score"])
+        info = best["info"]
+        metadata = {
+            "model": model_name,
+            "device": device,
+            "compute_type": compute_type,
+            "requested_language": requested_language or "auto",
+            "forced_language": forced_language or None,
+            "used_language": best["language_code"] or "auto",
+            "detected_language": getattr(info, "language", None),
+            "language_probability": getattr(info, "language_probability", None),
+            "duration": getattr(info, "duration", None),
+            "segments": best["segments"],
+            "vad_filter": best["vad_filter"],
+            "beam_size": best["beam_size"],
+            "score": best["score"],
+            "attempts": attempt_logs,
+            "quality_patch": "v5_whisper_srt_accuracy",
+        }
+        print(f"Selected Whisper candidate: {metadata}", flush=True)
+        return best["srt_text"], metadata
+
     audio_size = mp3_path.stat().st_size if mp3_path.exists() else 0
     duration = getattr(last_info, "duration", None) if last_info else None
     detected_language = getattr(last_info, "language", None) if last_info else None
     language_probability = getattr(last_info, "language_probability", None) if last_info else None
-
     raise RuntimeError(
         "Whisper finished but did not produce any subtitle text. "
-        "The uploaded file may be silent/music-only, speech may be too quiet, or the model may need WHISPER_MODEL=base. "
+        "The uploaded file may be silent/music-only, speech may be too quiet, or the model may need WHISPER_MODEL=small. "
         f"Audio bytes={audio_size}, duration={duration}, detected_language={detected_language}, "
         f"language_probability={language_probability}, attempts={attempt_logs}"
     )
