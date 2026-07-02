@@ -1,3 +1,4 @@
+import html
 import base64
 import os
 import re
@@ -1205,6 +1206,329 @@ Do not return safety classifications such as User Safety: safe.
         + " | ".join(errors[-5:])
     )
 
+# === Caption-first SRT extraction v6 START ===
+
+def is_youtube_url_for_captions(url: str) -> bool:
+    """Return True when the URL looks like a YouTube URL."""
+    try:
+        parsed = urlparse((url or "").strip())
+        host = (parsed.netloc or "").lower().replace("www.", "")
+        return host in {
+            "youtube.com",
+            "m.youtube.com",
+            "music.youtube.com",
+            "youtu.be",
+            "youtube-nocookie.com",
+        }
+    except Exception:
+        return False
+
+
+def _caption_first_enabled() -> bool:
+    return (os.getenv("YOUTUBE_CAPTION_FIRST", "true") or "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _caption_lang_candidates(requested_language: str | None = None) -> list[str]:
+    """
+    YouTube caption language priority.
+
+    The frontend's language dropdown is often the target language (Myanmar), not the
+    original spoken language. For URL videos we usually want the original English
+    caption first, so defaults always include English before the requested value.
+    """
+    env_value = os.getenv(
+        "YOUTUBE_CAPTION_LANGUAGES",
+        "en,en-US,en-GB,en.*,my,und,*",
+    )
+    candidates: list[str] = []
+    for item in env_value.split(","):
+        value = (item or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    normalized = normalize_whisper_language(requested_language)
+    if normalized and normalized not in {"auto", "detect"} and normalized not in candidates:
+        candidates.append(normalized)
+
+    if "*" not in candidates:
+        candidates.append("*")
+    return candidates
+
+
+def _caption_key_matches(key: str, candidate: str) -> bool:
+    key_low = (key or "").lower()
+    candidate_low = (candidate or "").lower()
+    if not key_low or not candidate_low:
+        return False
+    if candidate_low == "*":
+        return True
+    if candidate_low.endswith(".*"):
+        base = candidate_low[:-2]
+        return key_low == base or key_low.startswith(base + "-")
+    return key_low == candidate_low
+
+
+def _pick_caption_key(caption_map: dict, candidates: list[str]) -> str | None:
+    if not caption_map:
+        return None
+
+    keys = list(caption_map.keys())
+    for candidate in candidates:
+        for key in keys:
+            if _caption_key_matches(key, candidate):
+                return key
+
+    # Last-resort: prefer any English-ish key before taking the first caption.
+    for key in keys:
+        if (key or "").lower().startswith("en"):
+            return key
+
+    return keys[0] if keys else None
+
+
+def _pick_caption_format(formats: list[dict]) -> dict | None:
+    if not formats:
+        return None
+
+    preferred_exts = ["srt", "vtt"]
+    for ext in preferred_exts:
+        for item in formats:
+            if (item.get("ext") or "").lower() == ext and item.get("url"):
+                return item
+
+    # Some YouTube tracks label VTT-like files using names instead of ext.
+    for item in formats:
+        url = item.get("url") or ""
+        if item.get("url") and (".vtt" in url.lower() or "fmt=vtt" in url.lower()):
+            return item
+
+    return None
+
+
+def _caption_ts_to_srt(ts: str) -> str:
+    ts = (ts or "").strip().replace(",", ".")
+    parts = ts.split(":")
+    try:
+        if len(parts) == 2:
+            hours = 0
+            minutes = int(parts[0])
+            seconds_float = float(parts[1])
+        elif len(parts) == 3:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds_float = float(parts[2])
+        else:
+            return "00:00:00,000"
+
+        seconds = int(seconds_float)
+        millis = int(round((seconds_float - seconds) * 1000))
+        if millis >= 1000:
+            seconds += 1
+            millis -= 1000
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+    except Exception:
+        return "00:00:00,000"
+
+
+def _clean_caption_text_line(line: str) -> str:
+    line = html.unescape((line or "").strip())
+    # Remove VTT cue time tags and normal HTML/caption styling tags.
+    line = re.sub(r"<\d{1,2}:\d{2}:\d{2}[.,]\d{3}>", "", line)
+    line = re.sub(r"<[^>]+>", "", line)
+    line = re.sub(r"\{[^}]*\}", "", line)
+    line = line.replace("&nbsp;", " ")
+    line = re.sub(r"\s+", " ", line).strip()
+    return line
+
+
+def vtt_to_srt_text(vtt_text: str) -> str:
+    """
+    Convert WebVTT text to SRT.
+
+    This parser is intentionally simple and tolerant because YouTube caption VTT
+    files can contain NOTE/STYLE/REGION blocks, cue identifiers, and cue settings.
+    """
+    text = (vtt_text or "").replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    if not text.strip():
+        return ""
+
+    lines = text.split("\n")
+    blocks: list[str] = []
+    i = 0
+    cue_number = 1
+    time_re = re.compile(
+        r"((?:\d{1,2}:)?\d{2}:\d{2}[.,]\d{3})\s*-->\s*((?:\d{1,2}:)?\d{2}:\d{2}[.,]\d{3})"
+    )
+
+    while i < len(lines):
+        line = (lines[i] or "").strip()
+        upper = line.upper()
+
+        if not line or upper == "WEBVTT":
+            i += 1
+            continue
+
+        if upper.startswith(("NOTE", "STYLE", "REGION")):
+            i += 1
+            while i < len(lines) and (lines[i] or "").strip():
+                i += 1
+            continue
+
+        match = time_re.search(line)
+
+        # Cue identifier line can appear before the timestamp.
+        if not match and i + 1 < len(lines):
+            next_line = (lines[i + 1] or "").strip()
+            match = time_re.search(next_line)
+            if match:
+                i += 1
+                line = next_line
+
+        if not match:
+            i += 1
+            continue
+
+        start = _caption_ts_to_srt(match.group(1))
+        end = _caption_ts_to_srt(match.group(2))
+        i += 1
+
+        text_lines: list[str] = []
+        seen_lines: set[str] = set()
+        while i < len(lines) and (lines[i] or "").strip():
+            cleaned = _clean_caption_text_line(lines[i])
+            if cleaned:
+                key = cleaned.casefold()
+                if key not in seen_lines:
+                    seen_lines.add(key)
+                    text_lines.append(cleaned)
+            i += 1
+
+        cue_text = " ".join(text_lines).strip()
+        cue_text = re.sub(r"\s+", " ", cue_text).strip()
+        if cue_text:
+            blocks.append(f"{cue_number}\n{start} --> {end}\n{cue_text}\n")
+            cue_number += 1
+
+    return "\n".join(blocks).strip() + "\n" if blocks else ""
+
+
+def normalize_caption_to_srt(caption_text: str, ext: str | None = None) -> str:
+    ext_low = (ext or "").lower()
+    raw = (caption_text or "").strip()
+    if not raw:
+        return ""
+
+    # YouTube commonly provides WebVTT even when a format field is vague.
+    if ext_low == "vtt" or raw.lstrip("\ufeff").upper().startswith("WEBVTT"):
+        return vtt_to_srt_text(raw)
+
+    # Already-SRT text. Normalize just enough for the existing frontend/parser.
+    if "-->" in raw:
+        return raw.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
+
+    return ""
+
+
+def get_youtube_caption_srt(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    """
+    DownSub-style caption-first extraction.
+
+    Returns (srt_text, metadata) or None when no usable caption exists.
+    Manual/creator subtitles are tried before auto captions.
+    """
+    if not is_youtube_url_for_captions(url):
+        return None
+
+    normalized_url = normalize_youtube_url(url)
+    cookie_path = get_cookie_file()
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": False,
+        "skip_download": True,
+        "noplaylist": True,
+        "nocheckcertificate": True,
+        "geo_bypass": True,
+        "http_headers": YOUTUBE_HEADERS,
+        "logger": YTDLPLogger(),
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["default", "mweb", "ios", "tv"],
+            }
+        },
+    }
+    if cookie_path:
+        ydl_opts["cookiefile"] = str(cookie_path)
+
+    print("Caption-first: checking YouTube subtitles/captions", flush=True)
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(normalized_url, download=False)
+
+    if not isinstance(info, dict):
+        return None
+
+    candidates = _caption_lang_candidates(requested_language)
+    subtitle_maps = [
+        ("youtube_manual_subtitle", info.get("subtitles") or {}),
+        ("youtube_auto_caption", info.get("automatic_captions") or {}),
+    ]
+
+    errors: list[str] = []
+    for source_name, caption_map in subtitle_maps:
+        caption_key = _pick_caption_key(caption_map, candidates)
+        if not caption_key:
+            continue
+
+        fmt = _pick_caption_format(caption_map.get(caption_key) or [])
+        if not fmt:
+            errors.append(f"{source_name}:{caption_key}: no vtt/srt caption URL")
+            continue
+
+        caption_url = fmt.get("url")
+        ext = (fmt.get("ext") or "").lower()
+        try:
+            response = requests.get(
+                caption_url,
+                headers=YOUTUBE_HEADERS,
+                timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")),
+            )
+            response.raise_for_status()
+            srt_text = normalize_caption_to_srt(response.text, ext=ext)
+            if not srt_text.strip():
+                errors.append(f"{source_name}:{caption_key}: caption was empty after conversion")
+                continue
+
+            metadata = {
+                "source": source_name,
+                "subtitle_source": source_name,
+                "language": caption_key,
+                "format": ext or "unknown",
+                "title": info.get("title") or "",
+                "video_id": info.get("id") or "",
+                "source_url": normalized_url,
+                "manual_languages": sorted((info.get("subtitles") or {}).keys()),
+                "auto_languages": sorted((info.get("automatic_captions") or {}).keys()),
+                "errors": errors[-5:],
+            }
+            print(
+                f"Caption-first: using {source_name} language={caption_key} format={ext}",
+                flush=True,
+            )
+            return srt_text, metadata
+        except Exception as exc:
+            errors.append(f"{source_name}:{caption_key}: {exc}")
+            print(f"Caption-first attempt failed: {errors[-1]}", flush=True)
+            continue
+
+    print("Caption-first: no usable caption found; falling back to Whisper. Errors: " + " | ".join(errors[-5:]), flush=True)
+    return None
+
+# === Caption-first SRT extraction v6 END ===
+
 @app.get("/")
 def index():
     return jsonify(
@@ -1274,23 +1598,66 @@ def download():
         return json_error(error_message, status_code)
 
 
+
 @app.post("/extract-srt")
 def extract_srt():
     try:
         payload = request.get_json(silent=True) or {}
         url = payload.get("url") or request.form.get("url") or request.values.get("url")
-        language = payload.get("language") or request.form.get("language") or request.values.get("language") or "auto"
+        language = (
+            payload.get("language")
+            or request.form.get("language")
+            or request.values.get("language")
+            or "auto"
+        )
 
         if not url:
             return json_error("Missing 'url'", 400)
 
+        base_url = request.host_url.rstrip("/")
+
+        # DownSub-style path: existing YouTube captions first.
+        # This avoids bad Whisper transcripts when the video already has captions.
+        caption_result = None
+        if _caption_first_enabled():
+            try:
+                caption_result = get_youtube_caption_srt(url, requested_language=language)
+            except Exception as caption_exc:
+                print(f"caption-first extraction failed; falling back to Whisper: {caption_exc}", flush=True)
+
+        if caption_result:
+            srt_text, caption_meta = caption_result
+            safe_video_id = secure_filename(caption_meta.get("video_id") or "youtube_caption") or "youtube_caption"
+            srt_filename = f"{safe_video_id}_{caption_meta.get('source', 'caption')}_{uuid.uuid4().hex[:8]}.srt"
+            srt_path = SRT_DIR / srt_filename
+            srt_path.write_text(srt_text, encoding="utf-8")
+            srt_url = f"{base_url}/srt/{srt_filename}"
+
+            return jsonify(
+                {
+                    "ok": True,
+                    "success": True,
+                    "srt_text": srt_text,
+                    "srt_url": srt_url,
+                    "filename": srt_filename,
+                    "subtitle_source": caption_meta.get("subtitle_source") or caption_meta.get("source"),
+                    "source": caption_meta,
+                    "caption": caption_meta,
+                    "audio": {
+                        "title": caption_meta.get("title") or "YouTube captions",
+                        "video_id": caption_meta.get("video_id"),
+                        "source_url": caption_meta.get("source_url"),
+                    },
+                    "whisper": None,
+                }
+            )
+
+        # Fallback path: no caption available, so use the previous Whisper flow.
         mp3_path, audio_meta = download_audio_as_mp3(url)
         srt_text, whisper_meta = transcribe_mp3_to_srt(mp3_path, language=language)
         srt_filename = f"{audio_meta.get('video_id') or mp3_path.stem}_{uuid.uuid4().hex[:8]}.srt"
         srt_path = SRT_DIR / srt_filename
         srt_path.write_text(srt_text, encoding="utf-8")
-
-        base_url = request.host_url.rstrip("/")
         srt_url = f"{base_url}/srt/{srt_filename}"
 
         return jsonify(
@@ -1301,15 +1668,18 @@ def extract_srt():
                 "srt_url": srt_url,
                 "filename": srt_filename,
                 "audio": audio_meta,
+                "subtitle_source": "whisper",
+                "source": {
+                    "type": "whisper",
+                    "reason": "No usable YouTube manual/auto caption was available",
+                },
                 "whisper": whisper_meta,
             }
         )
-
     except Exception as exc:
         print(f"extract-srt error: {exc}", flush=True)
         error_message, status_code = friendly_youtube_error(exc)
         return json_error(error_message, status_code)
-
 
 @app.post("/translate-srt")
 def translate_srt():
