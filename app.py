@@ -19,25 +19,47 @@ from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
+# Lovable previews may run on http://id-preview--*.lovable.app (browser shows "Not secure")
+# as well as https://*.lovable.app.  The previous CORS list allowed only HTTPS
+# Lovable origins, so browser fetches to /rewrite-options could fail even while curl
+# worked from Railway. Keep this permissive for app/API endpoints only.
 CORS(
     app,
-    resources={
-        r"/*": {
-            "origins": [
-                r"https://.*\.lovable\.app",
-                r"https://.*\.lovableproject\.com",
-                r"https://.*\.lovable\.dev",
-                r"http://localhost:.*",
-                r"http://127\.0\.0\.1:.*",
-            ]
-        }
-    },
+    resources={r"/*": {"origins": "*"}},
     methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
     expose_headers=["Content-Type", "Content-Disposition"],
     supports_credentials=False,
     max_age=86400,
 )
+
+_ALLOWED_ORIGIN_RE = re.compile(
+    r"^https?://("
+    r"localhost(:\d+)?|127\.0\.0\.1(:\d+)?|"
+    r".*\.lovable\.app|.*\.lovableproject\.com|.*\.lovable\.dev"
+    r")$",
+    re.IGNORECASE,
+)
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get("Origin", "")
+    if origin and _ALLOWED_ORIGIN_RE.match(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+    elif not origin:
+        response.headers.setdefault("Access-Control-Allow-Origin", "*")
+    response.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    response.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+    response.headers.setdefault("Access-Control-Expose-Headers", "Content-Type, Content-Disposition")
+    response.headers.setdefault("Access-Control-Max-Age", "86400")
+    return response
+
+@app.before_request
+def handle_preflight_requests():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
@@ -1357,7 +1379,7 @@ def get_innertube_caption_tracks(url: str, requested_language: str | None = None
     bootstrap = _fetch_youtube_watch_bootstrap(normalized_url)
     errors: list[str] = []
     debug = {
-        "version": "v9-rewrite-chunking-validation",
+        "version": "v10-rewrite-cors-lovable-fix",
         "bootstrap_ok": bool(bootstrap.get("ok")),
         "dynamic_innertube_api_key_found": bool(bootstrap.get("dynamic_innertube_api_key_found")),
         "dynamic_web_client_version_found": bool(bootstrap.get("dynamic_web_client_version_found")),
@@ -2619,7 +2641,7 @@ def index():
         "ok": True,
         "service": "video-audio-tool",
         "caption_first": True,
-        "version": "v9-rewrite-chunking-validation",
+        "version": "v10-rewrite-cors-lovable-fix",
         "endpoints": [
             "POST /download", "POST /extract-srt", "POST /extract-srt mode=downsub", "POST /extract-srt mode=subdown", "POST /debug-youtube-captions", "POST /translate-srt", "POST /process-upload",
             "POST /upload", "POST /extract-srt-upload", "POST /rewrite", "POST /rewrite-options", "POST /tts", "POST /final-srt",
