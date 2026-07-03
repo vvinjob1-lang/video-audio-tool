@@ -1357,7 +1357,7 @@ def get_innertube_caption_tracks(url: str, requested_language: str | None = None
     bootstrap = _fetch_youtube_watch_bootstrap(normalized_url)
     errors: list[str] = []
     debug = {
-        "version": "v8-ai-rewrite-options-tts-polish",
+        "version": "v9-rewrite-chunking-validation",
         "bootstrap_ok": bool(bootstrap.get("ok")),
         "dynamic_innertube_api_key_found": bool(bootstrap.get("dynamic_innertube_api_key_found")),
         "dynamic_web_client_version_found": bool(bootstrap.get("dynamic_web_client_version_found")),
@@ -2318,44 +2318,205 @@ def normalize_rewrite_style(style: str | None) -> str:
     return aliases.get(value, "natural_accurate")
 
 
-def build_rewrite_prompt(text: str, language: str = "my", style: str = "natural_accurate") -> str:
+def build_rewrite_prompt(
+    text: str,
+    language: str = "my",
+    style: str = "natural_accurate",
+    chunk_index: int | None = None,
+    chunk_total: int | None = None,
+) -> str:
+    """Prompt for real semantic rewrite, not SRT cleanup."""
     style_norm = normalize_rewrite_style(style)
-    base_rules = (
-        "You are a professional Myanmar scriptwriter and voice-over editor.\n"
-        "Rewrite the provided translated subtitle text into a fluent Myanmar narration script.\n"
-        "The input may be a literal machine translation. Do not merely clean timestamps.\n"
-        "Make it sound like a human Myanmar narrator wrote it.\n"
-        "Keep the original story facts, names, order, and meaning.\n"
-        "Remove subtitle numbers, timestamps, arrows, duplicated lines, and awkward literal translation.\n"
-        "Use natural Myanmar prose with clear sentence breaks.\n"
-        "Do not add explanations, markdown, headings, bullet points, or labels.\n"
-        "Return only the rewritten script.\n"
-    )
+    input_len = len(text or "")
+    chunk_note = ""
+    if chunk_index is not None and chunk_total is not None and chunk_total > 1:
+        chunk_note = (
+            f"\nThis is segment {chunk_index} of {chunk_total}. Rewrite ONLY this segment. "
+            "Do not add an introduction, ending, title, summary, or recap of the whole story."
+        )
+
+    base_rules = f"""
+You are a senior Myanmar voice-over scriptwriter, not a subtitle cleaner.
+Your job is to transform machine-translated subtitle text into natural Myanmar spoken narration.
+
+CRITICAL RULES:
+- Do NOT simply remove timestamps and join subtitle lines.
+- Do NOT summarize the whole input into one or two sentences.
+- Do NOT drop important events, names, objects, places, motivations, or story order.
+- Preserve proper names such as Eternia, Eternos, Castle Grayskull, Sword of Power, and character names.
+- Fix literal Google Translate style into smooth Myanmar prose.
+- Keep the meaning, but rewrite the wording so it sounds written by a human narrator.
+- Use normal Myanmar paragraphs and spoken sentence rhythm.
+- Remove SRT numbers, timestamps, arrows, WEBVTT headers, duplicates, and broken subtitle fragments.
+- Return ONLY the final Myanmar script. No markdown, no title, no explanation.
+- Input length is about {input_len} characters. The output must be substantial, not a tiny summary.{chunk_note}
+""".strip()
+
     if style_norm == "emotional_tts":
-        style_rules = (
-            "Style: Emotional TTS / storytelling.\n"
-            "Make the narration vivid, suspenseful, and pleasant to listen to.\n"
-            "Use natural pauses, emotional phrasing, and short spoken sentences.\n"
-            "Avoid robotic Google-Translate wording.\n"
-        )
+        style_rules = """
+STYLE: Emotional TTS / dramatic storytelling
+- Make it vivid, cinematic, and suspenseful.
+- Use short spoken sentences with natural pauses.
+- Add emotional flow with words like ဒါပေမယ့်, ထိုအချိန်မှာ, နောက်ဆုံးမှာ, အဲဒီအခါ only when they help the narration.
+- Make it pleasant to listen to as a Myanmar voice-over.
+- Do not over-act; keep it clear and story-focused.
+""".strip()
     elif style_norm == "movie_recap":
-        style_rules = (
-            "Style: Movie recap narration.\n"
-            "Make it concise, engaging, and easy to follow for a recap video.\n"
-            "Use active voice and natural transitions between events.\n"
-        )
+        style_rules = """
+STYLE: Movie Recap narration
+- Make it concise, engaging, and easy to follow.
+- Use active voice and clear transitions between events.
+- Keep the core plot details and cause/effect relationship.
+""".strip()
     else:
-        style_rules = (
-            "Style: Natural Accurate.\n"
-            "Stay close to the original meaning while making the Myanmar wording smooth, concise, and natural.\n"
-        )
-    return f"{base_rules}\n{style_rules}\nLanguage: {language}\n\nInput text:\n{text}"
+        style_rules = """
+STYLE: Natural Accurate narration
+- Stay close to the original meaning.
+- Make the Myanmar wording fluent, concise, and natural.
+- Remove awkward literal translation while keeping the facts.
+- Prefer clear spoken prose over subtitle fragments.
+""".strip()
+
+    return f"{base_rules}\n\n{style_rules}\n\nTarget language: Myanmar (my)\n\nInput subtitle text:\n{text}"
+
+
+def get_openrouter_model_candidates() -> list[str]:
+    primary = os.getenv("OPENROUTER_MODEL", "").strip()
+    configured = os.getenv("OPENROUTER_MODELS", "").strip()
+    values: list[str] = []
+    if configured:
+        values.extend([x.strip() for x in configured.split(",") if x.strip()])
+    if primary:
+        values.insert(0, primary)
+    # Free fallback candidates. Availability changes, so failures are handled gracefully.
+    values.extend([
+        "qwen/qwen3.6-plus:free",
+        "qwen/qwen3-coder:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "openrouter/free",
+    ])
+    return _unique_ordered(values)
+
+
+def split_text_for_ai_rewrite(text: str, max_chars: int | None = None) -> list[str]:
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    if not text:
+        return []
+    max_chars = max_chars or int(os.getenv("OPENROUTER_REWRITE_CHUNK_CHARS", "4500"))
+    if len(text) <= max_chars:
+        return [text]
+    pieces = re.split(r"(?<=[။.!?])\s+", text)
+    chunks: list[str] = []
+    current = ""
+    for piece in pieces:
+        piece = piece.strip()
+        if not piece:
+            continue
+        if len(piece) > max_chars:
+            # Hard split very long machine-translated lines.
+            if current:
+                chunks.append(current.strip())
+                current = ""
+            for i in range(0, len(piece), max_chars):
+                chunks.append(piece[i:i + max_chars].strip())
+            continue
+        if current and len(current) + 1 + len(piece) > max_chars:
+            chunks.append(current.strip())
+            current = piece
+        else:
+            current = f"{current} {piece}".strip()
+    if current:
+        chunks.append(current.strip())
+    return chunks or [text]
+
+
+def strip_ai_artifacts(text: str) -> str:
+    value = (text or "").strip()
+    value = re.sub(r"^```(?:\w+)?\s*|\s*```$", "", value).strip()
+    value = re.sub(r"<think>.*?</think>", "", value, flags=re.IGNORECASE | re.DOTALL).strip()
+    value = re.sub(r"^(?:Final Script|Rewritten Script|Output|Myanmar Script)\s*[:：]\s*", "", value, flags=re.IGNORECASE).strip()
+    # Remove accidental markdown headings/bullets but keep Myanmar prose.
+    cleaned_lines = []
+    for line in value.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^[-*#>\s]+", "", line).strip()
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
+def ai_rewrite_min_chars(input_text: str, style: str = "natural_accurate") -> int:
+    input_len = len(input_text or "")
+    style_norm = normalize_rewrite_style(style)
+    if input_len < 500:
+        return max(80, int(input_len * 0.35))
+    ratio = 0.30 if style_norm == "emotional_tts" else 0.35
+    if style_norm == "movie_recap":
+        ratio = 0.22
+    return max(450, min(4000, int(input_len * ratio)))
+
+
+def validate_ai_rewrite(rewritten: str, input_text: str, style: str = "natural_accurate") -> tuple[bool, str]:
+    rewritten_clean = clean_srt_to_text(rewritten) or strip_ai_artifacts(rewritten)
+    if not rewritten_clean.strip():
+        return False, "empty_ai_output"
+    min_chars = ai_rewrite_min_chars(input_text, style)
+    if len(rewritten_clean) < min_chars:
+        return False, f"too_short:{len(rewritten_clean)}<{min_chars}"
+    # If output is basically one tiny fragment for a long input, reject it.
+    if len(input_text or "") > 3000 and len(re.split(r"[။.!?]\s+|\n+", rewritten_clean)) < 6:
+        return False, "too_few_sentences_for_long_input"
+    return True, "ok"
+
+
+def call_openrouter_rewrite(model: str, prompt: str, style: str) -> tuple[str, dict]:
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    max_tokens = int(os.getenv("OPENROUTER_MAX_TOKENS", "5000"))
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a Myanmar narration scriptwriter. "
+                    "Always return the rewritten Myanmar script only. "
+                    "Never summarize a long input into a tiny answer."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": float(os.getenv("OPENROUTER_TEMPERATURE", "0.72" if normalize_rewrite_style(style) == "emotional_tts" else "0.55")),
+        "top_p": float(os.getenv("OPENROUTER_TOP_P", "0.9")),
+        "max_tokens": max_tokens,
+    }
+    resp = requests.post(
+        OPENROUTER_CHAT_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://video-audio-tool-production.up.railway.app"),
+            "X-Title": os.getenv("OPENROUTER_APP_TITLE", "Video2Audio Pro"),
+        },
+        json=payload,
+        timeout=int(os.getenv("OPENROUTER_TIMEOUT", "120")),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+    return strip_ai_artifacts(content), {
+        "model": model,
+        "usage": data.get("usage") or {},
+        "finish_reason": ((data.get("choices") or [{}])[0].get("finish_reason")),
+    }
 
 
 def rewrite_with_openrouter(text: str, language: str = "my", style: str = "natural_accurate") -> tuple[str, str, dict]:
     cleaned = clean_srt_to_text(text) or re.sub(r"\s+", " ", (text or "")).strip()
     if not cleaned:
         return "", "empty", {"ai_rewrite_configured": False, "rewrite_quality": "empty"}
+
     api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not api_key:
         return local_rewrite_for_tts(cleaned, language, style), "local_tts_cleanup", {
@@ -2363,52 +2524,64 @@ def rewrite_with_openrouter(text: str, language: str = "my", style: str = "natur
             "rewrite_quality": "cleanup_only",
             "message": "OPENROUTER_API_KEY is not configured, so this is cleanup only, not a true rewrite.",
         }
-    model = os.getenv("OPENROUTER_MODEL", "openrouter/cypher-alpha:free")
-    prompt = build_rewrite_prompt(cleaned, language=language, style=style)
-    try:
-        resp = requests.post(
-            OPENROUTER_CHAT_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://video-audio-tool-production.up.railway.app"),
-                "X-Title": os.getenv("OPENROUTER_APP_TITLE", "Video2Audio Pro"),
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": "You rewrite translated subtitles into natural Myanmar narration scripts for TTS."},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": float(os.getenv("OPENROUTER_TEMPERATURE", "0.55")),
-                "max_tokens": int(os.getenv("OPENROUTER_MAX_TOKENS", "3500")),
-            },
-            timeout=int(os.getenv("OPENROUTER_TIMEOUT", "90")),
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        rewritten = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
-        rewritten = re.sub(r"^```(?:\w+)?\s*|\s*```$", "", rewritten).strip()
-        rewritten = clean_srt_to_text(rewritten) or rewritten
-        if rewritten:
-            return rewritten, "openrouter_free_ai", {
-                "ai_rewrite_configured": True,
-                "rewrite_quality": "ai_rewrite",
-                "model": model,
-                "style": normalize_rewrite_style(style),
-            }
-    except Exception as exc:
-        print(f"OpenRouter rewrite failed, falling back locally: {exc}", flush=True)
-        return local_rewrite_for_tts(cleaned, language, style), "local_tts_cleanup", {
-            "ai_rewrite_configured": True,
-            "rewrite_quality": "cleanup_only_after_ai_error",
-            "model": model,
-            "error": str(exc),
-        }
-    return local_rewrite_for_tts(cleaned, language, style), "local_tts_cleanup", {
+
+    style_norm = normalize_rewrite_style(style)
+    models = get_openrouter_model_candidates()
+    chunks = split_text_for_ai_rewrite(cleaned)
+    attempts: list[dict] = []
+    fallback_text = local_rewrite_for_tts(cleaned, language, style)
+
+    # For long scripts, chunking avoids one-sentence summaries and output truncation.
+    for model in models:
+        try:
+            rewritten_chunks: list[str] = []
+            model_attempt = {"model": model, "chunks": len(chunks), "chunk_results": []}
+            for idx, chunk in enumerate(chunks, start=1):
+                prompt = build_rewrite_prompt(chunk, language=language, style=style_norm, chunk_index=idx, chunk_total=len(chunks))
+                rewritten_chunk, call_meta = call_openrouter_rewrite(model, prompt, style_norm)
+                ok, reason = validate_ai_rewrite(rewritten_chunk, chunk, style_norm)
+                model_attempt["chunk_results"].append({
+                    "chunk": idx,
+                    "input_chars": len(chunk),
+                    "output_chars": len(rewritten_chunk),
+                    "ok": ok,
+                    "reason": reason,
+                    "finish_reason": call_meta.get("finish_reason"),
+                })
+                if not ok:
+                    raise RuntimeError(f"AI rewrite chunk {idx} unusable: {reason}")
+                rewritten_chunks.append(rewritten_chunk)
+            rewritten = "\n\n".join(x.strip() for x in rewritten_chunks if x.strip()).strip()
+            ok, reason = validate_ai_rewrite(rewritten, cleaned, style_norm)
+            model_attempt.update({"final_output_chars": len(rewritten), "final_ok": ok, "final_reason": reason})
+            attempts.append(model_attempt)
+            if ok:
+                return rewritten, "openrouter_free_ai", {
+                    "ai_rewrite_configured": True,
+                    "rewrite_quality": "ai_rewrite",
+                    "model": model,
+                    "models_tried": [a.get("model") for a in attempts],
+                    "style": style_norm,
+                    "input_chars": len(cleaned),
+                    "output_chars": len(rewritten),
+                    "chunks": len(chunks),
+                    "attempts": attempts[-3:],
+                }
+        except Exception as exc:
+            attempts.append({"model": model, "error": str(exc), "chunks": len(chunks)})
+            print(f"OpenRouter rewrite failed model={model} style={style_norm}: {exc}", flush=True)
+            continue
+
+    return fallback_text, "local_tts_cleanup", {
         "ai_rewrite_configured": True,
-        "rewrite_quality": "cleanup_only_empty_ai_response",
-        "model": model,
+        "rewrite_quality": "cleanup_only_after_ai_unusable",
+        "model": models[0] if models else os.getenv("OPENROUTER_MODEL", ""),
+        "models_tried": models[:5],
+        "style": style_norm,
+        "input_chars": len(cleaned),
+        "output_chars": len(fallback_text),
+        "attempts": attempts[-5:],
+        "message": "AI rewrite was unavailable, too short, or failed validation; returned cleanup only.",
     }
 
 def save_srt_response(srt_text: str, base_name: str = "captions") -> tuple[str, str]:
@@ -2446,7 +2619,7 @@ def index():
         "ok": True,
         "service": "video-audio-tool",
         "caption_first": True,
-        "version": "v8-ai-rewrite-options-tts-polish",
+        "version": "v9-rewrite-chunking-validation",
         "endpoints": [
             "POST /download", "POST /extract-srt", "POST /extract-srt mode=downsub", "POST /extract-srt mode=subdown", "POST /debug-youtube-captions", "POST /translate-srt", "POST /process-upload",
             "POST /upload", "POST /extract-srt-upload", "POST /rewrite", "POST /rewrite-options", "POST /tts", "POST /final-srt",
