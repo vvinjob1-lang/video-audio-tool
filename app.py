@@ -1192,7 +1192,7 @@ def endpoint_list() -> list[str]:
 
 @app.get("/")
 def index():
-    return jsonify({"ok": True, "success": True, "service": "video-audio-tool", "version": "drm-safe-v7", "endpoints": endpoint_list()})
+    return jsonify({"ok": True, "success": True, "service": "video-audio-tool", "version": "drm-safe-v7.1", "endpoints": endpoint_list()})
 
 
 @app.get("/health")
@@ -1202,7 +1202,7 @@ def health():
         "ok": True,
         "success": True,
         "service": "video-audio-tool",
-        "version": "drm-safe-v7",
+        "version": "drm-safe-v7.1",
         "endpoints": endpoint_list(),
         "youtube_caption_first": caption_first_enabled(),
         "youtube_direct_timedtext": (os.getenv("YOUTUBE_DIRECT_TIMEDTEXT", "true") or "true"),
@@ -1284,7 +1284,6 @@ def extract_srt():
                 status_code,
                 **extra,
                 caption_errors=caption_errors,
-                fallback_options=["Upload video/audio", "Upload .srt/.vtt", "Try a YouTube video with captions"],
             )
         srt_filename = f"{audio_meta.get('video_id') or mp3_path.stem}_{uuid.uuid4().hex[:8]}.srt"
         (SRT_DIR / srt_filename).write_text(srt_text, encoding="utf-8")
@@ -1366,7 +1365,6 @@ def process_url():
                     status_code,
                     **extra,
                     caption_errors=caption_errors,
-                    fallback_options=["Upload video/audio", "Upload .srt/.vtt", "Try a YouTube video with captions"],
                 )
             srt_filename = f"{audio_meta.get('video_id') or mp3_path.stem}_{uuid.uuid4().hex[:8]}.srt"
             (SRT_DIR / srt_filename).write_text(srt_text, encoding="utf-8")
