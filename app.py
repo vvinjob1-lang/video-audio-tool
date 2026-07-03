@@ -1113,6 +1113,406 @@ def should_whisper_fallback_for_url() -> bool:
     return (os.getenv("URL_WHISPER_FALLBACK", "true") or "true").strip().lower() not in {"0", "false", "no", "off"}
 
 
+
+
+# ---------------- V5 dynamic Innertube / Downsub-style overrides ----------------
+# These definitions intentionally appear after the V4 helpers so they override the older
+# static Innertube behavior. The key change is using the current watch-page ytcfg
+# INNERTUBE_API_KEY, clientVersion, visitorData, and multiple player clients.
+YOUTUBE_CAPTION_DEBUG_LAST: dict = {}
+
+
+def _extract_ytcfg_from_html(html_text: str) -> dict:
+    """Extract YouTube ytcfg.set({...}) data from a watch page."""
+    if not html_text:
+        return {}
+    cfg = _extract_json_after_marker(html_text, "ytcfg.set")
+    if isinstance(cfg, dict):
+        return cfg
+    # Fallback regex for minified variants.
+    for pattern in [
+        r"ytcfg\.set\s*\(\s*({.+?})\s*\)\s*;",
+        r"window\[\"ytcfg\"\]\.set\s*\(\s*({.+?})\s*\)\s*;",
+    ]:
+        m = re.search(pattern, html_text, flags=re.DOTALL)
+        if not m:
+            continue
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            continue
+    return {}
+
+
+def _extract_player_response_from_html(html_text: str) -> dict:
+    if not html_text:
+        return {}
+    player_response = _extract_json_after_marker(html_text, "ytInitialPlayerResponse")
+    if isinstance(player_response, dict):
+        return player_response
+    for pattern in [
+        r"ytInitialPlayerResponse\s*=\s*({.+?})\s*;",
+        r"window\[\"ytInitialPlayerResponse\"\]\s*=\s*({.+?})\s*;",
+    ]:
+        m = re.search(pattern, html_text, flags=re.DOTALL)
+        if not m:
+            continue
+        try:
+            return json.loads(m.group(1))
+        except Exception:
+            continue
+    return {}
+
+
+def _fetch_youtube_watch_bootstrap(url: str) -> dict:
+    """Fetch the current YouTube watch page and extract dynamic Innertube config."""
+    video_id = get_youtube_video_id(url)
+    normalized_url = normalize_youtube_url(url)
+    watch_urls = [
+        f"https://www.youtube.com/watch?v={video_id}&hl=en&persist_hl=1&bpctr=9999999999&has_verified=1",
+        f"https://m.youtube.com/watch?v={video_id}&hl=en&persist_hl=1&bpctr=9999999999&has_verified=1",
+    ]
+    errors = []
+    for watch_url in watch_urls:
+        try:
+            resp = requests.get(
+                watch_url,
+                headers=build_youtube_request_headers(),
+                timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")),
+            )
+            html_text = resp.text or ""
+            info = {
+                "watch_url": watch_url,
+                "status_code": resp.status_code,
+                "html_chars": len(html_text),
+                "consent_page": "consent.youtube" in html_text.lower() or "before you continue" in html_text.lower(),
+                "signin_page": "sign in to confirm" in html_text.lower() or "not a bot" in html_text.lower(),
+            }
+            if resp.status_code >= 400 or not html_text.strip():
+                errors.append({**info, "error": f"watch page HTTP {resp.status_code}"})
+                continue
+            ytcfg = _extract_ytcfg_from_html(html_text)
+            player_response = _extract_player_response_from_html(html_text)
+            cfg_client = ((ytcfg.get("INNERTUBE_CONTEXT") or {}).get("client") or {}) if isinstance(ytcfg, dict) else {}
+            api_key = (ytcfg.get("INNERTUBE_API_KEY") if isinstance(ytcfg, dict) else None) or os.getenv("YOUTUBE_INNERTUBE_API_KEY") or YOUTUBE_INNERTUBE_DEFAULT_API_KEY
+            client_version = (
+                cfg_client.get("clientVersion")
+                or (ytcfg.get("INNERTUBE_CLIENT_VERSION") if isinstance(ytcfg, dict) else None)
+                or os.getenv("YOUTUBE_WEB_CLIENT_VERSION")
+                or "2.20240726.00.00"
+            )
+            visitor_data = (
+                cfg_client.get("visitorData")
+                or (ytcfg.get("VISITOR_DATA") if isinstance(ytcfg, dict) else None)
+                or ""
+            )
+            return {
+                "ok": True,
+                "normalized_url": normalized_url,
+                "video_id": video_id,
+                "watch": info,
+                "ytcfg": ytcfg if isinstance(ytcfg, dict) else {},
+                "player_response": player_response if isinstance(player_response, dict) else {},
+                "innertube_api_key": api_key,
+                "web_client_version": client_version,
+                "visitor_data": visitor_data,
+                "dynamic_innertube_api_key_found": bool(isinstance(ytcfg, dict) and ytcfg.get("INNERTUBE_API_KEY")),
+                "dynamic_web_client_version_found": bool(client_version),
+                "visitor_data_found": bool(visitor_data),
+                "errors": errors[-4:],
+            }
+        except Exception as exc:
+            errors.append({"watch_url": watch_url, "error": str(exc)})
+    return {"ok": False, "normalized_url": normalized_url, "video_id": video_id, "errors": errors[-6:]}
+
+
+def _v5_innertube_client_profiles(bootstrap: dict, video_id: str) -> list[dict]:
+    web_version = bootstrap.get("web_client_version") or os.getenv("YOUTUBE_WEB_CLIENT_VERSION") or "2.20240726.00.00"
+    embedded_version = os.getenv("YOUTUBE_WEB_EMBEDDED_CLIENT_VERSION", "1.20240723.01.00")
+    # Headers use numeric client IDs; context uses string client names.
+    return [
+        {
+            "label": "WEB_DYNAMIC",
+            "clientName": "WEB",
+            "clientNameHeader": "1",
+            "clientVersion": web_version,
+            "hl": "en",
+            "gl": "US",
+        },
+        {
+            "label": "MWEB_DYNAMIC",
+            "clientName": "MWEB",
+            "clientNameHeader": "2",
+            "clientVersion": web_version,
+            "hl": "en",
+            "gl": "US",
+        },
+        {
+            "label": "WEB_EMBEDDED_PLAYER",
+            "clientName": "WEB_EMBEDDED_PLAYER",
+            "clientNameHeader": "56",
+            "clientVersion": embedded_version,
+            "hl": "en",
+            "gl": "US",
+            "thirdParty": {"embedUrl": f"https://www.youtube.com/embed/{video_id}"},
+        },
+        {
+            "label": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+            "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+            "clientNameHeader": "85",
+            "clientVersion": os.getenv("YOUTUBE_TVHTML5_CLIENT_VERSION", "2.0"),
+            "hl": "en",
+            "gl": "US",
+            "thirdParty": {"embedUrl": f"https://www.youtube.com/embed/{video_id}"},
+        },
+        {
+            "label": "ANDROID",
+            "clientName": "ANDROID",
+            "clientNameHeader": "3",
+            "clientVersion": os.getenv("YOUTUBE_ANDROID_CLIENT_VERSION", "19.09.37"),
+            "androidSdkVersion": 30,
+            "hl": "en",
+            "gl": "US",
+            "userAgent": os.getenv("YOUTUBE_ANDROID_UA", "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip"),
+        },
+        {
+            "label": "IOS",
+            "clientName": "IOS",
+            "clientNameHeader": "5",
+            "clientVersion": os.getenv("YOUTUBE_IOS_CLIENT_VERSION", "19.09.3"),
+            "deviceMake": "Apple",
+            "deviceModel": "iPhone16,2",
+            "hl": "en",
+            "gl": "US",
+            "userAgent": os.getenv("YOUTUBE_IOS_UA", "com.google.ios.youtube/19.09.3 (iPhone16,2; U; CPU iOS 17_2 like Mac OS X;)"),
+        },
+    ]
+
+
+def _v5_innertube_context(client: dict, bootstrap: dict) -> dict:
+    client_context = {
+        "clientName": client.get("clientName") or "WEB",
+        "clientVersion": client.get("clientVersion") or bootstrap.get("web_client_version") or "2.20240726.00.00",
+        "hl": client.get("hl") or "en",
+        "gl": client.get("gl") or "US",
+    }
+    for optional_key in ["androidSdkVersion", "deviceMake", "deviceModel", "userAgent"]:
+        if client.get(optional_key) is not None:
+            client_context[optional_key] = client[optional_key]
+    if bootstrap.get("visitor_data"):
+        client_context["visitorData"] = bootstrap["visitor_data"]
+    if client.get("thirdParty"):
+        client_context["thirdParty"] = client["thirdParty"]
+    return {"client": client_context}
+
+
+def _v5_innertube_headers(client: dict, bootstrap: dict) -> dict:
+    headers = build_youtube_request_headers(json_payload=True)
+    headers["X-Youtube-Client-Name"] = str(client.get("clientNameHeader") or client.get("clientName") or "1")
+    headers["X-Youtube-Client-Version"] = str(client.get("clientVersion") or bootstrap.get("web_client_version") or "")
+    if bootstrap.get("visitor_data"):
+        headers["X-Goog-Visitor-Id"] = bootstrap["visitor_data"]
+    if client.get("userAgent"):
+        headers["User-Agent"] = client["userAgent"]
+    return headers
+
+
+def _try_player_response_caption_tracks(player_response: dict, requested_language: str | None, meta_base: dict) -> tuple[str, dict] | None:
+    tracks, manual_languages, auto_languages = _extract_caption_tracks_from_player_response(player_response or {})
+    if not tracks:
+        return None
+    selected = _pick_track(tracks, requested_language)
+    if not selected:
+        return None
+    source_name, track = selected
+    base_url = track.get("baseUrl") or ""
+    srt_text, used_fmt, fetch_errors = _fetch_caption_track_as_srt(base_url)
+    if not srt_text.strip():
+        return None
+    subtitle_source = source_name if track.get("kind") != "asr" else "youtube_auto_caption"
+    return srt_text, {
+        **meta_base,
+        "source": meta_base.get("source") or "youtube_player_response_caption_tracks",
+        "subtitle_source": subtitle_source,
+        "language": track.get("languageCode") or "",
+        "format": used_fmt,
+        "manual_languages": manual_languages,
+        "auto_languages": auto_languages,
+        "caption_track_count": len(tracks),
+        "no_media_download": True,
+        "caption_first": True,
+        "errors": fetch_errors[-5:],
+    }
+
+
+def get_innertube_caption_tracks(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    """V5: dynamic Downsub-style captionTracks extraction using current ytcfg + multiple clients."""
+    global YOUTUBE_CAPTION_DEBUG_LAST
+    if not is_youtube_url(url):
+        return None
+    video_id = get_youtube_video_id(url)
+    if not video_id:
+        return None
+    normalized_url = normalize_youtube_url(url)
+    bootstrap = _fetch_youtube_watch_bootstrap(normalized_url)
+    errors: list[str] = []
+    debug = {
+        "version": "v5-dynamic-innertube-captions",
+        "bootstrap_ok": bool(bootstrap.get("ok")),
+        "dynamic_innertube_api_key_found": bool(bootstrap.get("dynamic_innertube_api_key_found")),
+        "dynamic_web_client_version_found": bool(bootstrap.get("dynamic_web_client_version_found")),
+        "visitor_data_found": bool(bootstrap.get("visitor_data_found")),
+        "watch": bootstrap.get("watch") or {},
+        "bootstrap_errors": bootstrap.get("errors") or [],
+        "attempts": [],
+    }
+
+    # First use captionTracks already embedded in the watch-page player response.
+    try:
+        watch_player_result = _try_player_response_caption_tracks(
+            bootstrap.get("player_response") or {},
+            requested_language,
+            {
+                "source": "youtube_watchpage_player_response",
+                "title": ((bootstrap.get("player_response") or {}).get("videoDetails") or {}).get("title") or "YouTube captions",
+                "video_id": video_id,
+                "source_url": normalized_url,
+                "innertube_client": "watch_page_ytInitialPlayerResponse",
+            },
+        )
+        debug["attempts"].append({"client": "watch_page_ytInitialPlayerResponse", "success": bool(watch_player_result)})
+        if watch_player_result:
+            YOUTUBE_CAPTION_DEBUG_LAST = debug
+            return watch_player_result
+    except Exception as exc:
+        errors.append(f"watch_player_response: {exc}")
+        debug["attempts"].append({"client": "watch_page_ytInitialPlayerResponse", "success": False, "error": str(exc)})
+
+    api_keys = _unique_ordered([
+        bootstrap.get("innertube_api_key"),
+        os.getenv("YOUTUBE_INNERTUBE_API_KEY"),
+        YOUTUBE_INNERTUBE_DEFAULT_API_KEY,
+    ])
+    if not api_keys:
+        debug["errors"] = ["no innertube api key"]
+        YOUTUBE_CAPTION_DEBUG_LAST = debug
+        return None
+
+    for api_key in api_keys:
+        for client in _v5_innertube_client_profiles(bootstrap, video_id):
+            label = client.get("label") or client.get("clientName") or "WEB"
+            attempt = {"client": label, "success": False, "api_key_source": "dynamic" if api_key == bootstrap.get("innertube_api_key") else "fallback"}
+            try:
+                payload = {
+                    "context": _v5_innertube_context(client, bootstrap),
+                    "videoId": video_id,
+                    "contentCheckOk": True,
+                    "racyCheckOk": True,
+                    "playbackContext": {"contentPlaybackContext": {"html5Preference": "HTML5_PREF_WANTS"}},
+                }
+                player_url = f"https://www.youtube.com/youtubei/v1/player?key={api_key}&prettyPrint=false"
+                resp = requests.post(
+                    player_url,
+                    headers=_v5_innertube_headers(client, bootstrap),
+                    data=json.dumps(payload),
+                    timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")),
+                )
+                attempt["http_status"] = resp.status_code
+                if resp.status_code >= 400:
+                    attempt["error"] = f"player http {resp.status_code}"
+                    errors.append(f"{label}: player http {resp.status_code}")
+                    debug["attempts"].append(attempt)
+                    continue
+                try:
+                    player_response = resp.json()
+                except Exception as exc:
+                    attempt["error"] = f"invalid json {exc}"
+                    errors.append(f"{label}: invalid json {exc}")
+                    debug["attempts"].append(attempt)
+                    continue
+                playability = (player_response.get("playabilityStatus") or {})
+                attempt["playability_status"] = playability.get("status")
+                attempt["playability_reason"] = (playability.get("reason") or "")[:140]
+                tracks, manual_languages, auto_languages = _extract_caption_tracks_from_player_response(player_response)
+                attempt["caption_track_count"] = len(tracks)
+                attempt["manual_languages"] = manual_languages
+                attempt["auto_languages"] = auto_languages
+                if not tracks:
+                    errors.append(f"{label}: no captionTracks status={attempt.get('playability_status')} reason={attempt.get('playability_reason')}")
+                    debug["attempts"].append(attempt)
+                    continue
+                selected = _pick_track(tracks, requested_language)
+                if not selected:
+                    attempt["error"] = "no selected track"
+                    errors.append(f"{label}: no selected track")
+                    debug["attempts"].append(attempt)
+                    continue
+                source_name, track = selected
+                base_url = track.get("baseUrl") or ""
+                srt_text, used_fmt, fetch_errors = _fetch_caption_track_as_srt(base_url)
+                attempt["selected_language"] = track.get("languageCode") or ""
+                attempt["selected_kind"] = track.get("kind") or "manual"
+                attempt["caption_fetch_errors"] = fetch_errors[-4:]
+                if srt_text.strip():
+                    attempt["success"] = True
+                    attempt["format"] = used_fmt
+                    debug["attempts"].append(attempt)
+                    YOUTUBE_CAPTION_DEBUG_LAST = debug
+                    subtitle_source = source_name if track.get("kind") != "asr" else "youtube_auto_caption"
+                    return srt_text, {
+                        "source": "youtube_innertube_caption_tracks_v5",
+                        "subtitle_source": subtitle_source,
+                        "language": track.get("languageCode") or "",
+                        "format": used_fmt,
+                        "title": ((player_response.get("videoDetails") or {}).get("title") or "YouTube captions"),
+                        "video_id": video_id,
+                        "source_url": normalized_url,
+                        "manual_languages": manual_languages,
+                        "auto_languages": auto_languages,
+                        "caption_track_count": len(tracks),
+                        "innertube_client": label,
+                        "no_media_download": True,
+                        "caption_first": True,
+                        "dynamic_innertube_api_key_found": bool(bootstrap.get("dynamic_innertube_api_key_found")),
+                        "visitor_data_found": bool(bootstrap.get("visitor_data_found")),
+                        "errors": errors[-8:] + fetch_errors[-4:],
+                    }
+                attempt["error"] = "caption track found but no text returned"
+                debug["attempts"].append(attempt)
+                errors.extend([f"{label}: {e}" for e in fetch_errors[-3:]])
+            except Exception as exc:
+                attempt["error"] = str(exc)
+                debug["attempts"].append(attempt)
+                errors.append(f"{label}: {exc}")
+                print(f"V5 innertube captionTracks failed client={label}: {exc}", flush=True)
+    debug["errors"] = errors[-12:]
+    YOUTUBE_CAPTION_DEBUG_LAST = debug
+    print(f"V5 innertube captionTracks no result: {errors[-12:]}", flush=True)
+    return None
+
+
+def get_youtube_caption_srt(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    """V5 method order: dynamic Innertube first, then older caption-first fallbacks."""
+    if not is_youtube_url(url):
+        return None
+    methods = [
+        ("dynamic_innertube_caption_tracks_v5", get_innertube_caption_tracks),
+        ("watch_page_caption_tracks", get_watch_page_caption_tracks),
+        ("direct_timedtext", get_direct_timedtext_caption_srt),
+        ("ytdlp_metadata", get_ytdlp_caption_srt),
+    ]
+    for name, fn in methods:
+        if name == "direct_timedtext" and (os.getenv("YOUTUBE_DIRECT_TIMEDTEXT", "true") or "true").strip().lower() in {"0", "false", "no", "off"}:
+            continue
+        try:
+            result = fn(url, requested_language=requested_language)
+            if result and result[0].strip():
+                return result
+        except Exception as exc:
+            print(f"caption method failed {name}: {exc}", flush=True)
+    return None
+
+
 # ---------------- Audio, Whisper, SRT, translation ----------------
 
 def convert_media_file_to_mp3(input_path: Path) -> Path:
@@ -1463,7 +1863,7 @@ def index():
         "ok": True,
         "service": "video-audio-tool",
         "caption_first": True,
-        "version": "v4-cookie-backed-caption-requests",
+        "version": "v5-dynamic-innertube-captions",
         "endpoints": [
             "POST /download", "POST /extract-srt", "POST /debug-youtube-captions", "POST /translate-srt", "POST /process-upload",
             "POST /upload", "POST /extract-srt-upload", "POST /rewrite", "POST /tts", "POST /final-srt",
@@ -1519,6 +1919,7 @@ def debug_youtube_captions():
             "youtube_cookie_header_applied": bool(get_youtube_cookie_header()),
             "youtube_cookie_header_bytes": len(get_youtube_cookie_header() or ""),
             "methods": [],
+            "v5_dynamic_innertube_debug": YOUTUBE_CAPTION_DEBUG_LAST,
         }
 
         methods = [
