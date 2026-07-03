@@ -1379,7 +1379,7 @@ def get_innertube_caption_tracks(url: str, requested_language: str | None = None
     bootstrap = _fetch_youtube_watch_bootstrap(normalized_url)
     errors: list[str] = []
     debug = {
-        "version": "v10-rewrite-cors-lovable-fix",
+        "version": "v11-rewrite-options-compat-flat",
         "bootstrap_ok": bool(bootstrap.get("ok")),
         "dynamic_innertube_api_key_found": bool(bootstrap.get("dynamic_innertube_api_key_found")),
         "dynamic_web_client_version_found": bool(bootstrap.get("dynamic_web_client_version_found")),
@@ -2641,7 +2641,7 @@ def index():
         "ok": True,
         "service": "video-audio-tool",
         "caption_first": True,
-        "version": "v10-rewrite-cors-lovable-fix",
+        "version": "v11-rewrite-options-compat-flat",
         "endpoints": [
             "POST /download", "POST /extract-srt", "POST /extract-srt mode=downsub", "POST /extract-srt mode=subdown", "POST /debug-youtube-captions", "POST /translate-srt", "POST /process-upload",
             "POST /upload", "POST /extract-srt-upload", "POST /rewrite", "POST /rewrite-options", "POST /tts", "POST /final-srt",
@@ -3047,15 +3047,40 @@ def rewrite_options():
         emotional, emotional_source, emotional_meta = rewrite_with_openrouter(cleaned, language=language, style="emotional_tts")
         if not natural.strip() and not emotional.strip():
             return json_error("Rewrite returned no text", 502)
-        return jsonify({
+        # V11 compatibility: keep the correct structured `options` response,
+        # but also expose flat aliases because some frontend builds still look
+        # for top-level script/text fields and incorrectly show “no usable script”.
+        natural_script = (natural or emotional or "").strip()
+        emotional_script = (emotional or natural or "").strip()
+        primary_script = natural_script or emotional_script
+        response_payload = {
             "ok": True,
             "success": True,
             "cleaned_text": cleaned,
+            "script": primary_script,
+            "text": primary_script,
+            "result": primary_script,
+            "output": primary_script,
+            "message": primary_script,
+            "rewrittenScript": primary_script,
+            "rewritten_script": primary_script,
+            "rewrittenText": primary_script,
+            "rewritten_text": primary_script,
+            "naturalScript": natural_script,
+            "natural_script": natural_script,
+            "emotionalScript": emotional_script,
+            "emotional_script": emotional_script,
+            "source": natural_source or emotional_source,
+            "quality": natural_meta.get("rewrite_quality") or emotional_meta.get("rewrite_quality"),
+            "rewrite_quality": natural_meta.get("rewrite_quality") or emotional_meta.get("rewrite_quality"),
+            "rewrite": natural_meta or emotional_meta,
             "options": [
                 {
                     "id": "natural_accurate",
                     "title": "Natural Accurate",
-                    "script": natural,
+                    "script": natural_script,
+                    "text": natural_script,
+                    "result": natural_script,
                     "source": natural_source,
                     "rewrite": natural_meta,
                     "quality": natural_meta.get("rewrite_quality"),
@@ -3063,14 +3088,22 @@ def rewrite_options():
                 {
                     "id": "emotional_tts",
                     "title": "Emotional TTS",
-                    "script": emotional or natural,
+                    "script": emotional_script,
+                    "text": emotional_script,
+                    "result": emotional_script,
                     "source": emotional_source,
                     "rewrite": emotional_meta,
                     "quality": emotional_meta.get("rewrite_quality"),
                 },
             ],
+            "rewrites": {
+                "natural_accurate": natural_script,
+                "emotional_tts": emotional_script,
+            },
             "ai_rewrite_configured": bool(natural_meta.get("ai_rewrite_configured") or emotional_meta.get("ai_rewrite_configured")),
-        })
+            "compatibility": "v11-flat-aliases-for-lovable",
+        }
+        return jsonify(response_payload)
     except Exception as exc:
         print(f"rewrite-options error: {exc}", flush=True)
         return json_error(str(exc), 500)
