@@ -1357,7 +1357,7 @@ def get_innertube_caption_tracks(url: str, requested_language: str | None = None
     bootstrap = _fetch_youtube_watch_bootstrap(normalized_url)
     errors: list[str] = []
     debug = {
-        "version": "v6-transcript-api-and-proxy-fallback",
+        "version": "v8-ai-rewrite-options-tts-polish",
         "bootstrap_ok": bool(bootstrap.get("ok")),
         "dynamic_innertube_api_key_found": bool(bootstrap.get("dynamic_innertube_api_key_found")),
         "dynamic_web_client_version_found": bool(bootstrap.get("dynamic_web_client_version_found")),
@@ -1703,8 +1703,293 @@ def get_external_caption_proxy_srt(url: str, requested_language: str | None = No
     return None
 
 
+
+SUPPORTED_EXTRACT_MODES = {"auto", "caption_first", "captions", "default", "youtube", "whisper", "downsub", "subdown"}
+
+
+def normalize_extract_mode(mode: str | None) -> str:
+    value = (mode or "caption_first").strip().lower().replace("-", "_")
+    aliases = {
+        "": "caption_first",
+        "normal": "caption_first",
+        "standard": "caption_first",
+        "captionfirst": "caption_first",
+        "caption_first": "caption_first",
+        "captions_first": "caption_first",
+        "sub_down": "subdown",
+        "subsdown": "subdown",
+        "subdown_org": "subdown",
+        "down_sub": "downsub",
+        "downsub_com": "downsub",
+    }
+    value = aliases.get(value, value)
+    return value if value in SUPPORTED_EXTRACT_MODES else value
+
+
+def _mode_open_url(provider: str, url: str) -> str:
+    provider = (provider or "downsub").strip().lower()
+    encoded = urlencode({"url": url})
+    if provider == "subdown":
+        # SubDown.org supports a normal URL form; keep this configurable in case it changes.
+        base = (os.getenv("SUBDOWN_OPEN_URL") or "https://subdown.org/en/").strip()
+    else:
+        base = (os.getenv("DOWNSUB_OPEN_URL") or "https://downsub.com/").strip()
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}{encoded}"
+
+
+def _provider_api_urls(provider: str) -> list[str]:
+    provider = (provider or "downsub").strip().lower()
+    env_names = [
+        f"{provider.upper()}_API_URL",
+        f"{provider.upper()}_ENDPOINT_URL",
+        f"{provider.upper()}_EXTRACT_URL",
+    ]
+    if provider == "downsub":
+        env_names += ["DOWNSUB_URL", "DOWNSUB_FALLBACK_URL"]
+    if provider == "subdown":
+        env_names += ["SUBDOWN_URL", "SUBDOWN_FALLBACK_URL"]
+    # Generic override that can be shared by both modes.
+    env_names += ["SILENT_SUBTITLE_API_URL"]
+    urls = []
+    seen = set()
+    for name in env_names:
+        value = (os.getenv(name) or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            urls.append(value)
+    return urls
+
+
+def _provider_api_headers(provider: str) -> dict:
+    provider = (provider or "downsub").strip().lower()
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "Content-Type": "application/json",
+        "User-Agent": YOUTUBE_HEADERS.get("User-Agent", "Mozilla/5.0"),
+    }
+    key = (
+        os.getenv(f"{provider.upper()}_API_KEY")
+        or os.getenv(f"{provider.upper()}_TOKEN")
+        or os.getenv("SILENT_SUBTITLE_API_KEY")
+        or ""
+    ).strip()
+    if key:
+        auth_mode = (os.getenv(f"{provider.upper()}_AUTH_MODE") or "bearer").strip().lower()
+        if auth_mode == "x-api-key":
+            headers["X-API-Key"] = key
+        elif auth_mode == "query":
+            # Query auth is handled inside _with_provider_query_auth.
+            pass
+        else:
+            headers["Authorization"] = f"Bearer {key}"
+            headers["X-API-Key"] = key
+    return headers
+
+
+def _with_provider_query_auth(api_url: str, provider: str) -> str:
+    provider = (provider or "downsub").strip().lower()
+    key = (
+        os.getenv(f"{provider.upper()}_API_KEY")
+        or os.getenv(f"{provider.upper()}_TOKEN")
+        or os.getenv("SILENT_SUBTITLE_API_KEY")
+        or ""
+    ).strip()
+    auth_mode = (os.getenv(f"{provider.upper()}_AUTH_MODE") or "bearer").strip().lower()
+    if not key or auth_mode != "query":
+        return api_url
+    key_param = os.getenv(f"{provider.upper()}_API_KEY_PARAM") or "api_key"
+    parsed = urlparse(api_url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query[key_param] = key
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def _maybe_fetch_caption_url(value: str, provider: str, language: str | None = None) -> tuple[str, dict] | None:
+    value = (value or "").strip()
+    if not value.startswith(("http://", "https://")):
+        return None
+    try:
+        resp = requests.get(value, headers=_provider_api_headers(provider), timeout=int(os.getenv("SILENT_SUBTITLE_TIMEOUT", "45")))
+        text = resp.text or ""
+        if not resp.ok or not text.strip():
+            return None
+        content_type = (resp.headers.get("content-type") or "").lower()
+        ext = "vtt" if "vtt" in content_type or value.lower().endswith(".vtt") else "srt"
+        srt_text = normalize_caption_to_srt(text, ext=ext) or normalize_caption_to_srt(text, ext="vtt") or normalize_caption_to_srt(text, ext="json3")
+        if srt_text.strip():
+            return srt_text, {"provider_download_url": value, "format": ext, "language": language or "auto"}
+    except Exception as exc:
+        print(f"{provider} caption URL fetch failed: {exc}", flush=True)
+    return None
+
+
+def _extract_srt_from_provider_json(data, provider: str, language: str | None = None) -> tuple[str, dict] | None:
+    if not isinstance(data, dict):
+        return None
+    text_keys = [
+        "srt_text", "srt", "subtitle", "subtitle_text", "caption", "caption_text",
+        "content", "text", "body", "transcript", "vtt_text", "vtt",
+    ]
+    url_keys = [
+        "srt_url", "download_url", "subtitle_url", "caption_url", "file_url", "url", "vtt_url",
+    ]
+    containers = [data]
+    for key in ("data", "result", "response", "payload", "subtitle", "caption"):
+        if isinstance(data.get(key), dict):
+            containers.append(data[key])
+    for container in containers:
+        for key in text_keys:
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                ext = "vtt" if key.startswith("vtt") or value.lstrip("\ufeff").upper().startswith("WEBVTT") else "srt"
+                srt_text = normalize_caption_to_srt(value, ext=ext) or text_to_basic_srt(value)
+                if srt_text.strip():
+                    return srt_text, {"provider_field": key, "format": ext, "language": container.get("language") or language or "auto"}
+        for key in url_keys:
+            value = container.get(key)
+            if isinstance(value, str):
+                fetched = _maybe_fetch_caption_url(value, provider, language=container.get("language") or language)
+                if fetched:
+                    srt_text, meta = fetched
+                    meta["provider_field"] = key
+                    return srt_text, meta
+    # Some APIs return a list of subtitle options.
+    for list_key in ("subtitles", "captions", "files", "items", "tracks"):
+        items = data.get(list_key)
+        if not isinstance(items, list):
+            continue
+        candidates = []
+        for item in items:
+            if isinstance(item, dict):
+                lang = str(item.get("language") or item.get("lang") or item.get("languageCode") or "")
+                fmt = str(item.get("format") or item.get("ext") or "")
+                score = 0
+                if language and _caption_key_matches(lang, language):
+                    score += 50
+                if lang.startswith("en"):
+                    score += 10
+                if fmt.lower() == "srt":
+                    score += 5
+                candidates.append((score, item))
+        for _, item in sorted(candidates, key=lambda x: x[0], reverse=True):
+            result = _extract_srt_from_provider_json(item, provider, language=language)
+            if result:
+                return result
+    return None
+
+
+def get_downsub_subdown_mode_srt(url: str, requested_language: str | None = None, provider: str = "downsub") -> tuple[str, dict] | None:
+    """Accept mode=downsub/subdown without scraping those websites by default.
+
+    If an official or user-controlled API endpoint is configured via environment variables
+    (DOWNSUB_API_URL, SUBDOWN_API_URL, or SILENT_SUBTITLE_API_URL), this calls it and
+    normalizes the result to SRT. Without a configured API, it returns None and /extract-srt
+    will return a structured manual-upload fallback response instead of a DRM/media error.
+    """
+    provider = "subdown" if (provider or "").strip().lower() == "subdown" else "downsub"
+    api_urls = _provider_api_urls(provider)
+    if not api_urls:
+        return None
+    timeout = int(os.getenv("SILENT_SUBTITLE_TIMEOUT", "45"))
+    errors = []
+    for raw_api_url in api_urls:
+        api_url = _with_provider_query_auth(raw_api_url, provider)
+        # Support templates such as https://example.com/extract?url={url}&lang={language}
+        if "{url}" in api_url or "{language}" in api_url:
+            api_url = api_url.replace("{url}", requests.utils.quote(url, safe=""))
+            api_url = api_url.replace("{language}", requests.utils.quote(requested_language or "auto", safe=""))
+        payload = {"url": url, "language": requested_language or "auto", "format": "srt", "mode": provider}
+        headers = _provider_api_headers(provider)
+        for method in ("POST", "GET"):
+            try:
+                if method == "POST":
+                    resp = requests.post(api_url, headers=headers, json=payload, timeout=timeout)
+                else:
+                    resp = requests.get(api_url, headers=headers, params=payload, timeout=timeout)
+                content_type = (resp.headers.get("content-type") or "").lower()
+                text = resp.text or ""
+                if not resp.ok:
+                    errors.append(f"{method} {api_url}: HTTP {resp.status_code} {text[:160]}")
+                    continue
+                if "application/json" in content_type:
+                    data = resp.json()
+                    result = _extract_srt_from_provider_json(data, provider, language=requested_language)
+                    if result:
+                        srt_text, meta = result
+                        meta.update({
+                            "source": f"{provider}_api",
+                            "subtitle_source": f"{provider}_api",
+                            "provider": provider,
+                            "api_url": raw_api_url,
+                            "no_media_download": True,
+                            "caption_first": True,
+                            "errors": errors[-5:],
+                        })
+                        return srt_text, meta
+                    errors.append(f"{method} {api_url}: JSON returned no subtitle text")
+                else:
+                    srt_text = normalize_caption_to_srt(text, ext="srt") or normalize_caption_to_srt(text, ext="vtt") or text_to_basic_srt(text)
+                    if srt_text.strip():
+                        return srt_text, {
+                            "source": f"{provider}_api",
+                            "subtitle_source": f"{provider}_api",
+                            "provider": provider,
+                            "api_url": raw_api_url,
+                            "format": "srt",
+                            "language": requested_language or "auto",
+                            "no_media_download": True,
+                            "caption_first": True,
+                            "errors": errors[-5:],
+                        }
+                    errors.append(f"{method} {api_url}: non-JSON response returned no subtitle text")
+            except Exception as exc:
+                errors.append(f"{method} {api_url}: {exc}")
+                print(f"{provider} API attempt failed: {exc}", flush=True)
+    return None
+
+
+def make_srt_success_response(srt_text: str, meta: dict, base_name: str = "captions"):
+    srt_filename, srt_url = save_srt_response(srt_text, meta.get("video_id") or base_name)
+    return jsonify({
+        "ok": True,
+        "success": True,
+        "srt_text": srt_text,
+        "srt_url": srt_url,
+        "filename": srt_filename,
+        "subtitle_source": meta.get("subtitle_source") or meta.get("source") or "youtube_caption_tracks",
+        "source": meta.get("source") or meta.get("subtitle_source") or "youtube_caption_tracks",
+        "mode": meta.get("mode") or meta.get("provider") or "caption_first",
+        "no_media_download": True if meta.get("no_media_download", True) else False,
+        "caption_first": True,
+        "manual_languages": meta.get("manual_languages") or [],
+        "auto_languages": meta.get("auto_languages") or [],
+        "caption": meta,
+    })
+
+
+def downsub_subdown_manual_fallback_response(url: str, provider: str, status_code: int = 404, errors: list[str] | None = None):
+    provider = "subdown" if (provider or "").strip().lower() == "subdown" else "downsub"
+    return json_error(
+        f"Silent {provider} fallback mode is accepted, but no configured {provider} API returned SRT text.",
+        status_code,
+        mode=provider,
+        accepted_mode=True,
+        caption_first=True,
+        no_media_download=True,
+        needs_upload=True,
+        needs_manual_srt_upload=True,
+        fallback_message="Open Downsub/SubDown, download SRT/VTT, then upload the file to continue.",
+        fallback_options=["Upload .srt/.vtt", "Open Downsub", "Open SubDown"],
+        open_downsub_url=_mode_open_url("downsub", url),
+        open_subdown_url=_mode_open_url("subdown", url),
+        configured_api_urls=_provider_api_urls(provider),
+        caption_errors=(errors or [])[-8:],
+    )
+
+
 def get_youtube_caption_srt(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
-    """V6 method order: all public-caption methods, then optional external proxy."""
+    """V7 method order: all public-caption methods, then optional external proxy."""
     if not is_youtube_url(url):
         return None
     methods = [
@@ -1991,30 +2276,95 @@ def clean_srt_to_text(srt_text: str) -> str:
     return re.sub(r"\s+", " ", " ".join(lines)).strip()
 
 
-def local_rewrite_for_tts(text: str, language: str = "my") -> str:
+def local_rewrite_for_tts(text: str, language: str = "my", style: str = "natural_accurate") -> str:
+    """Honest non-AI cleanup. This is not a true semantic rewrite."""
     cleaned = clean_srt_to_text(text)
     if not cleaned:
         cleaned = re.sub(r"\s+", " ", (text or "")).strip()
     if not cleaned:
         return ""
-    # Light cleanup only; no fake AI rewrite.
+    cleaned = html.unescape(cleaned)
     cleaned = re.sub(r"\s+([၊။,.!?])", r"\1", cleaned)
     cleaned = re.sub(r"([။.!?])\s*", r"\1\n", cleaned)
-    paragraphs = [p.strip() for p in cleaned.splitlines() if p.strip()]
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    paragraphs = []
+    seen = set()
+    for p in cleaned.splitlines():
+        p = p.strip(" \t-–—")
+        if not p:
+            continue
+        key = p.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        paragraphs.append(p)
     return "\n".join(paragraphs).strip()
 
 
-def rewrite_with_openrouter(text: str, language: str = "my", style: str = "concise_natural_tts") -> tuple[str, str]:
+def normalize_rewrite_style(style: str | None) -> str:
+    value = (style or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "natural": "natural_accurate",
+        "accurate": "natural_accurate",
+        "natural_accurate": "natural_accurate",
+        "concise_natural_tts": "natural_accurate",
+        "movie_recap": "movie_recap",
+        "recap": "movie_recap",
+        "emotional": "emotional_tts",
+        "emotional_tts": "emotional_tts",
+        "storytelling": "emotional_tts",
+        "dramatic": "emotional_tts",
+    }
+    return aliases.get(value, "natural_accurate")
+
+
+def build_rewrite_prompt(text: str, language: str = "my", style: str = "natural_accurate") -> str:
+    style_norm = normalize_rewrite_style(style)
+    base_rules = (
+        "You are a professional Myanmar scriptwriter and voice-over editor.\n"
+        "Rewrite the provided translated subtitle text into a fluent Myanmar narration script.\n"
+        "The input may be a literal machine translation. Do not merely clean timestamps.\n"
+        "Make it sound like a human Myanmar narrator wrote it.\n"
+        "Keep the original story facts, names, order, and meaning.\n"
+        "Remove subtitle numbers, timestamps, arrows, duplicated lines, and awkward literal translation.\n"
+        "Use natural Myanmar prose with clear sentence breaks.\n"
+        "Do not add explanations, markdown, headings, bullet points, or labels.\n"
+        "Return only the rewritten script.\n"
+    )
+    if style_norm == "emotional_tts":
+        style_rules = (
+            "Style: Emotional TTS / storytelling.\n"
+            "Make the narration vivid, suspenseful, and pleasant to listen to.\n"
+            "Use natural pauses, emotional phrasing, and short spoken sentences.\n"
+            "Avoid robotic Google-Translate wording.\n"
+        )
+    elif style_norm == "movie_recap":
+        style_rules = (
+            "Style: Movie recap narration.\n"
+            "Make it concise, engaging, and easy to follow for a recap video.\n"
+            "Use active voice and natural transitions between events.\n"
+        )
+    else:
+        style_rules = (
+            "Style: Natural Accurate.\n"
+            "Stay close to the original meaning while making the Myanmar wording smooth, concise, and natural.\n"
+        )
+    return f"{base_rules}\n{style_rules}\nLanguage: {language}\n\nInput text:\n{text}"
+
+
+def rewrite_with_openrouter(text: str, language: str = "my", style: str = "natural_accurate") -> tuple[str, str, dict]:
+    cleaned = clean_srt_to_text(text) or re.sub(r"\s+", " ", (text or "")).strip()
+    if not cleaned:
+        return "", "empty", {"ai_rewrite_configured": False, "rewrite_quality": "empty"}
     api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not api_key:
-        return local_rewrite_for_tts(text, language), "local_tts_cleanup"
+        return local_rewrite_for_tts(cleaned, language, style), "local_tts_cleanup", {
+            "ai_rewrite_configured": False,
+            "rewrite_quality": "cleanup_only",
+            "message": "OPENROUTER_API_KEY is not configured, so this is cleanup only, not a true rewrite.",
+        }
     model = os.getenv("OPENROUTER_MODEL", "openrouter/cypher-alpha:free")
-    prompt = (
-        "Rewrite the following subtitle text into a clean, concise, natural script for TTS narration. "
-        "Remove timestamps, subtitle numbers, duplicates, and overly literal phrasing. "
-        "Keep the meaning. Return only the final script.\n\n"
-        f"Language: {language}\nStyle: {style}\n\nText:\n{text}"
-    )
+    prompt = build_rewrite_prompt(cleaned, language=language, style=style)
     try:
         resp = requests.post(
             OPENROUTER_CHAT_URL,
@@ -2026,21 +2376,40 @@ def rewrite_with_openrouter(text: str, language: str = "my", style: str = "conci
             },
             json={
                 "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.4,
-                "max_tokens": int(os.getenv("OPENROUTER_MAX_TOKENS", "2000")),
+                "messages": [
+                    {"role": "system", "content": "You rewrite translated subtitles into natural Myanmar narration scripts for TTS."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": float(os.getenv("OPENROUTER_TEMPERATURE", "0.55")),
+                "max_tokens": int(os.getenv("OPENROUTER_MAX_TOKENS", "3500")),
             },
-            timeout=int(os.getenv("OPENROUTER_TIMEOUT", "60")),
+            timeout=int(os.getenv("OPENROUTER_TIMEOUT", "90")),
         )
         resp.raise_for_status()
         data = resp.json()
         rewritten = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+        rewritten = re.sub(r"^```(?:\w+)?\s*|\s*```$", "", rewritten).strip()
+        rewritten = clean_srt_to_text(rewritten) or rewritten
         if rewritten:
-            return rewritten, "openrouter_free_ai"
+            return rewritten, "openrouter_free_ai", {
+                "ai_rewrite_configured": True,
+                "rewrite_quality": "ai_rewrite",
+                "model": model,
+                "style": normalize_rewrite_style(style),
+            }
     except Exception as exc:
         print(f"OpenRouter rewrite failed, falling back locally: {exc}", flush=True)
-    return local_rewrite_for_tts(text, language), "local_tts_cleanup"
-
+        return local_rewrite_for_tts(cleaned, language, style), "local_tts_cleanup", {
+            "ai_rewrite_configured": True,
+            "rewrite_quality": "cleanup_only_after_ai_error",
+            "model": model,
+            "error": str(exc),
+        }
+    return local_rewrite_for_tts(cleaned, language, style), "local_tts_cleanup", {
+        "ai_rewrite_configured": True,
+        "rewrite_quality": "cleanup_only_empty_ai_response",
+        "model": model,
+    }
 
 def save_srt_response(srt_text: str, base_name: str = "captions") -> tuple[str, str]:
     safe_base = secure_filename(base_name) or "captions"
@@ -2077,10 +2446,10 @@ def index():
         "ok": True,
         "service": "video-audio-tool",
         "caption_first": True,
-        "version": "v6-transcript-api-and-proxy-fallback",
+        "version": "v8-ai-rewrite-options-tts-polish",
         "endpoints": [
-            "POST /download", "POST /extract-srt", "POST /debug-youtube-captions", "POST /translate-srt", "POST /process-upload",
-            "POST /upload", "POST /extract-srt-upload", "POST /rewrite", "POST /tts", "POST /final-srt",
+            "POST /download", "POST /extract-srt", "POST /extract-srt mode=downsub", "POST /extract-srt mode=subdown", "POST /debug-youtube-captions", "POST /translate-srt", "POST /process-upload",
+            "POST /upload", "POST /extract-srt-upload", "POST /rewrite", "POST /rewrite-options", "POST /tts", "POST /final-srt",
             "GET /audio/<filename>", "GET /srt/<filename>", "GET /tts/<filename>",
         ],
     })
@@ -2167,6 +2536,11 @@ def debug_youtube_captions():
         # Refresh this after method execution so the response includes detailed Innertube attempts.
         debug["v5_dynamic_innertube_debug"] = YOUTUBE_CAPTION_DEBUG_LAST
         debug["caption_proxy_configured"] = bool((os.getenv("CAPTION_PROXY_URL") or "").strip())
+        debug["accepted_modes"] = sorted(SUPPORTED_EXTRACT_MODES)
+        debug["downsub_api_configured"] = bool(_provider_api_urls("downsub"))
+        debug["subdown_api_configured"] = bool(_provider_api_urls("subdown"))
+        debug["downsub_open_url"] = _mode_open_url("downsub", url)
+        debug["subdown_open_url"] = _mode_open_url("subdown", url)
         return jsonify(debug)
     except Exception as exc:
         print(f"debug-youtube-captions error: {exc}", flush=True)
@@ -2179,8 +2553,49 @@ def extract_srt():
         payload = request.get_json(silent=True) or {}
         url = payload.get("url") or request.form.get("url") or request.values.get("url")
         language = payload.get("language") or request.form.get("language") or request.values.get("language") or "auto"
+        mode = normalize_extract_mode(
+            payload.get("mode") or request.form.get("mode") or request.values.get("mode") or "caption_first"
+        )
         if not url:
             return json_error("Missing 'url'", 400)
+
+        if mode not in SUPPORTED_EXTRACT_MODES:
+            return json_error(
+                f"Unsupported extract mode: {mode}",
+                400,
+                accepted_modes=sorted(SUPPORTED_EXTRACT_MODES),
+                caption_first=True,
+                no_media_download=True,
+            )
+
+        # Silent Downsub/SubDown mode: accept the frontend fallback request without
+        # attempting video/audio download or Whisper. If an official/user-controlled
+        # API URL is configured, normalize its output to the same /extract-srt JSON.
+        if mode in {"downsub", "subdown"}:
+            try:
+                provider_result = get_downsub_subdown_mode_srt(url, requested_language=language, provider=mode)
+                if provider_result:
+                    srt_text, meta = provider_result
+                    meta["mode"] = mode
+                    return make_srt_success_response(srt_text, meta, base_name=f"{mode}_captions")
+            except Exception as exc:
+                print(f"{mode} provider mode failed: {exc}", flush=True)
+                return downsub_subdown_manual_fallback_response(url, mode, status_code=502, errors=[str(exc)])
+
+            # Optional safety net: allow the same public-caption methods under provider mode
+            # when explicitly enabled. Default is false because the frontend usually calls
+            # mode=downsub/subdown only after caption_first already failed.
+            if (os.getenv("SILENT_PROVIDER_MODE_TRY_INTERNAL", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}:
+                try:
+                    caption_result = get_youtube_caption_srt(url, requested_language=language)
+                    if caption_result:
+                        srt_text, meta = caption_result
+                        meta["mode"] = mode
+                        return make_srt_success_response(srt_text, meta, base_name=f"{mode}_captions")
+                except Exception as exc:
+                    return downsub_subdown_manual_fallback_response(url, mode, status_code=502, errors=[str(exc)])
+
+            return downsub_subdown_manual_fallback_response(url, mode, status_code=404)
 
         caption_errors = []
         if is_youtube_url(url) and caption_first_enabled():
@@ -2188,21 +2603,8 @@ def extract_srt():
                 caption_result = get_youtube_caption_srt(url, requested_language=language)
                 if caption_result:
                     srt_text, meta = caption_result
-                    srt_filename, srt_url = save_srt_response(srt_text, meta.get("video_id") or "youtube_captions")
-                    return jsonify({
-                        "ok": True,
-                        "success": True,
-                        "srt_text": srt_text,
-                        "srt_url": srt_url,
-                        "filename": srt_filename,
-                        "subtitle_source": meta.get("subtitle_source") or meta.get("source") or "youtube_caption_tracks",
-                        "source": meta.get("source") or meta.get("subtitle_source") or "youtube_caption_tracks",
-                        "no_media_download": True,
-                        "caption_first": True,
-                        "manual_languages": meta.get("manual_languages") or [],
-                        "auto_languages": meta.get("auto_languages") or [],
-                        "caption": meta,
-                    })
+                    meta["mode"] = mode
+                    return make_srt_success_response(srt_text, meta, base_name=meta.get("video_id") or "youtube_captions")
             except Exception as exc:
                 caption_errors.append(str(exc))
                 print(f"caption-first extraction error: {exc}", flush=True)
@@ -2215,6 +2617,10 @@ def extract_srt():
                 needs_upload=True,
                 caption_first=True,
                 no_media_download=True,
+                mode=mode,
+                accepted_modes=sorted(SUPPORTED_EXTRACT_MODES),
+                open_downsub_url=_mode_open_url("downsub", url),
+                open_subdown_url=_mode_open_url("subdown", url),
                 caption_errors=caption_errors[-5:],
             )
         try:
@@ -2230,6 +2636,7 @@ def extract_srt():
                 "subtitle_source": "whisper_fallback",
                 "caption_first": True,
                 "no_media_download": False,
+                "mode": mode,
                 "audio": audio_meta,
                 "whisper": whisper_meta,
                 "caption_errors": caption_errors[-5:],
@@ -2241,6 +2648,10 @@ def extract_srt():
                 "caption_first": True,
                 "no_media_download": True,
                 "needs_upload": True,
+                "mode": mode,
+                "accepted_modes": sorted(SUPPORTED_EXTRACT_MODES),
+                "open_downsub_url": _mode_open_url("downsub", url),
+                "open_subdown_url": _mode_open_url("subdown", url),
                 "caption_errors": caption_errors[-5:],
                 "media_download_error": error_message,
             })
@@ -2402,13 +2813,13 @@ def rewrite():
         payload = request.get_json(silent=True) or {}
         text = payload.get("text") or payload.get("srt_text") or payload.get("translated_srt_text") or ""
         language = payload.get("language") or "my"
-        style = payload.get("style") or "concise_natural_tts"
+        style = payload.get("style") or "natural_accurate"
         if not text.strip():
             return json_error("Missing text to rewrite", 400)
         cleaned = clean_srt_to_text(text) or text
-        rewritten, source = rewrite_with_openrouter(cleaned, language=language, style=style)
+        rewritten, source, rewrite_meta = rewrite_with_openrouter(cleaned, language=language, style=style)
         if not rewritten.strip():
-            return json_error("Rewrite returned no text", 502, source=source)
+            return json_error("Rewrite returned no text", 502, source=source, rewrite=rewrite_meta)
         return jsonify({
             "ok": True,
             "success": True,
@@ -2418,15 +2829,72 @@ def rewrite():
             "rewritten_text": rewritten,
             "source": source,
             "cleaned_text": cleaned,
+            "rewrite": rewrite_meta,
+            "ai_rewrite_configured": bool(rewrite_meta.get("ai_rewrite_configured")),
+            "rewrite_quality": rewrite_meta.get("rewrite_quality"),
+            "style": normalize_rewrite_style(style),
         })
     except Exception as exc:
         print(f"rewrite error: {exc}", flush=True)
         return json_error(str(exc), 500)
 
 
-async def _edge_tts_generate(text: str, voice: str, output_path: Path):
+@app.post("/rewrite-options")
+def rewrite_options():
+    try:
+        payload = request.get_json(silent=True) or {}
+        text = payload.get("text") or payload.get("srt_text") or payload.get("translated_srt_text") or ""
+        language = payload.get("language") or "my"
+        if not text.strip():
+            return json_error("Missing text to rewrite", 400)
+        cleaned = clean_srt_to_text(text) or text
+        natural, natural_source, natural_meta = rewrite_with_openrouter(cleaned, language=language, style="natural_accurate")
+        emotional, emotional_source, emotional_meta = rewrite_with_openrouter(cleaned, language=language, style="emotional_tts")
+        if not natural.strip() and not emotional.strip():
+            return json_error("Rewrite returned no text", 502)
+        return jsonify({
+            "ok": True,
+            "success": True,
+            "cleaned_text": cleaned,
+            "options": [
+                {
+                    "id": "natural_accurate",
+                    "title": "Natural Accurate",
+                    "script": natural,
+                    "source": natural_source,
+                    "rewrite": natural_meta,
+                    "quality": natural_meta.get("rewrite_quality"),
+                },
+                {
+                    "id": "emotional_tts",
+                    "title": "Emotional TTS",
+                    "script": emotional or natural,
+                    "source": emotional_source,
+                    "rewrite": emotional_meta,
+                    "quality": emotional_meta.get("rewrite_quality"),
+                },
+            ],
+            "ai_rewrite_configured": bool(natural_meta.get("ai_rewrite_configured") or emotional_meta.get("ai_rewrite_configured")),
+        })
+    except Exception as exc:
+        print(f"rewrite-options error: {exc}", flush=True)
+        return json_error(str(exc), 500)
+
+
+def polish_tts_script(text: str, style: str = "natural_accurate") -> str:
+    cleaned = local_rewrite_for_tts(text, style=style)
+    if not cleaned:
+        return ""
+    # Add readable pauses for Myanmar TTS. This improves rhythm without changing meaning.
+    cleaned = re.sub(r"\s*၊\s*", "၊ ", cleaned)
+    cleaned = re.sub(r"\s*။\s*", "။\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+async def _edge_tts_generate(text: str, voice: str, output_path: Path, rate: str = "+0%", pitch: str = "+0Hz", volume: str = "+0%"):
     import edge_tts
-    communicate = edge_tts.Communicate(text, voice)
+    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch, volume=volume)
     await communicate.save(str(output_path))
 
 
@@ -2442,6 +2910,15 @@ def select_tts_voice(language: str | None = None, gender: str | None = None, req
     return os.getenv("TTS_VOICE_DEFAULT", "en-US-AriaNeural")
 
 
+def tts_voice_params(style: str | None = None) -> tuple[str, str, str]:
+    style_norm = normalize_rewrite_style(style)
+    if style_norm == "emotional_tts":
+        return os.getenv("TTS_RATE_EMOTIONAL", "-6%"), os.getenv("TTS_PITCH_EMOTIONAL", "+2Hz"), os.getenv("TTS_VOLUME", "+0%")
+    if style_norm == "movie_recap":
+        return os.getenv("TTS_RATE_RECAP", "-3%"), os.getenv("TTS_PITCH_RECAP", "+0Hz"), os.getenv("TTS_VOLUME", "+0%")
+    return os.getenv("TTS_RATE", "-4%"), os.getenv("TTS_PITCH", "+0Hz"), os.getenv("TTS_VOLUME", "+0%")
+
+
 @app.post("/tts")
 def tts():
     try:
@@ -2449,18 +2926,26 @@ def tts():
         text = payload.get("text") or payload.get("script") or payload.get("rewrittenScript") or ""
         language = payload.get("language") or "my"
         gender = payload.get("gender") or payload.get("voice_gender") or "female"
+        style = payload.get("style") or payload.get("content_style") or payload.get("rewrite_style") or "natural_accurate"
         requested_voice = payload.get("voice") or payload.get("voice_id")
-        text = clean_srt_to_text(text) or (text or "").strip()
+        text = polish_tts_script(text, style=style)
         if not text:
             return json_error("Missing text for TTS", 400)
         voice = select_tts_voice(language, gender, requested_voice)
+        rate = payload.get("rate") or None
+        pitch = payload.get("pitch") or None
+        volume = payload.get("volume") or None
+        default_rate, default_pitch, default_volume = tts_voice_params(style)
+        rate = rate or default_rate
+        pitch = pitch or default_pitch
+        volume = volume or default_volume
         output_filename = f"tts_{uuid.uuid4().hex[:8]}.mp3"
         output_path = TTS_DIR / output_filename
         try:
-            asyncio.run(_edge_tts_generate(text, voice, output_path))
+            asyncio.run(_edge_tts_generate(text, voice, output_path, rate=rate, pitch=pitch, volume=volume))
         except RuntimeError:
             loop = asyncio.new_event_loop()
-            loop.run_until_complete(_edge_tts_generate(text, voice, output_path))
+            loop.run_until_complete(_edge_tts_generate(text, voice, output_path, rate=rate, pitch=pitch, volume=volume))
             loop.close()
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise RuntimeError("TTS audio file was not created")
@@ -2476,6 +2961,11 @@ def tts():
             "audio_filename": output_filename,
             "voice": voice,
             "engine": "edge_tts",
+            "style": normalize_rewrite_style(style),
+            "rate": rate,
+            "pitch": pitch,
+            "volume": volume,
+            "tts_input_text": text,
             "final_srt_text": final_srt_text,
             "final_srt_url": f"{base_url}/srt/{final_srt_filename}",
             "final_srt_filename": final_srt_filename,
