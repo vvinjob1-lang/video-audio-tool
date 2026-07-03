@@ -240,6 +240,80 @@ def get_cookie_file() -> Path | None:
     return None
 
 
+
+
+_YOUTUBE_COOKIE_HEADER_CACHE: str | None = None
+
+
+def _parse_netscape_cookie_file_to_header(cookie_path: Path | None) -> str:
+    """Convert a Netscape cookies.txt file into a Cookie header for direct YouTube caption requests."""
+    if not cookie_path or not cookie_path.exists() or cookie_path.stat().st_size <= 0:
+        return ""
+    pairs: list[str] = []
+    seen: set[str] = set()
+    try:
+        for raw_line in cookie_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = (raw_line or "").strip()
+            if not line:
+                continue
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            elif line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                domain, _flag, _path, _secure, _expires, name, value = parts[:7]
+                domain_low = (domain or "").lower()
+                if "youtube.com" not in domain_low and "google.com" not in domain_low:
+                    continue
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                pairs.append(f"{name}={value}")
+            elif "=" in line and ";" in line:
+                # Accept an already-built Cookie header if the env/file contains one.
+                for chunk in line.split(";"):
+                    chunk = chunk.strip()
+                    if not chunk or "=" not in chunk:
+                        continue
+                    name, value = chunk.split("=", 1)
+                    if name and name not in seen:
+                        seen.add(name)
+                        pairs.append(f"{name}={value}")
+    except Exception as exc:
+        print(f"cookie header parse warning: {exc}", flush=True)
+    return "; ".join(pairs)
+
+
+def get_youtube_cookie_header() -> str:
+    """Prefer explicit Cookie header env, then parse cookies.txt, then use consent-only fallback."""
+    global _YOUTUBE_COOKIE_HEADER_CACHE
+    explicit = (os.getenv("YOUTUBE_CAPTION_COOKIE_HEADER") or "").strip()
+    if explicit:
+        return explicit
+    if _YOUTUBE_COOKIE_HEADER_CACHE is not None:
+        return _YOUTUBE_COOKIE_HEADER_CACHE
+    parsed = _parse_netscape_cookie_file_to_header(get_cookie_file())
+    _YOUTUBE_COOKIE_HEADER_CACHE = parsed
+    return parsed
+
+
+def build_youtube_request_headers(json_payload: bool = False) -> dict:
+    headers = dict(YOUTUBE_HEADERS)
+    cookie_header = get_youtube_cookie_header()
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    elif not headers.get("Cookie"):
+        headers["Cookie"] = "CONSENT=YES+cb"
+    if json_payload:
+        headers.update({
+            "Content-Type": "application/json",
+            "Origin": "https://www.youtube.com",
+            "Referer": "https://www.youtube.com/",
+        })
+    return headers
+
+
 def friendly_youtube_error(error: Exception) -> tuple[str, int, dict]:
     message = str(error)
     lowered = message.lower()
@@ -464,11 +538,8 @@ def _extract_json_after_marker(text: str, marker: str) -> dict | None:
 
 
 def _youtube_innertube_headers(client: dict) -> dict:
-    headers = dict(YOUTUBE_HEADERS)
+    headers = build_youtube_request_headers(json_payload=True)
     headers.update({
-        "Content-Type": "application/json",
-        "Origin": "https://www.youtube.com",
-        "Referer": "https://www.youtube.com/",
         "X-Youtube-Client-Name": str(client.get("clientName") or "WEB"),
         "X-Youtube-Client-Version": str(client.get("clientVersion") or ""),
     })
@@ -507,7 +578,7 @@ def _fetch_caption_track_as_srt(base_url: str, requested_formats: list[str] | No
     for fmt in (requested_formats or ["vtt", "json3", "srv3", "ttml"]):
         try:
             caption_url = _set_query_param(base_url, fmt=fmt)
-            cap = requests.get(caption_url, headers=YOUTUBE_HEADERS, timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+            cap = requests.get(caption_url, headers=build_youtube_request_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
             if cap.status_code >= 400 or not (cap.text or "").strip():
                 errors.append(f"{fmt}: http {cap.status_code}")
                 continue
@@ -606,7 +677,7 @@ def get_watch_page_caption_tracks(url: str, requested_language: str | None = Non
     watch_url = f"https://www.youtube.com/watch?v={video_id}&hl=en&persist_hl=1"
     errors = []
     try:
-        resp = requests.get(watch_url, headers=YOUTUBE_HEADERS, timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+        resp = requests.get(watch_url, headers=build_youtube_request_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
         resp.raise_for_status()
         html_text = resp.text or ""
     except Exception as exc:
@@ -647,7 +718,7 @@ def get_watch_page_caption_tracks(url: str, requested_language: str | None = Non
     for fmt in fmt_attempts:
         try:
             caption_url = _set_query_param(base_url, fmt=fmt)
-            cap = requests.get(caption_url, headers=YOUTUBE_HEADERS, timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+            cap = requests.get(caption_url, headers=build_youtube_request_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
             if cap.status_code >= 400 or not cap.text.strip():
                 errors.append(f"{fmt}: http {cap.status_code}")
                 continue
@@ -687,7 +758,7 @@ def get_direct_timedtext_caption_srt(url: str, requested_language: str | None = 
     errors = []
     for list_url in list_urls:
         try:
-            resp = requests.get(list_url, headers=YOUTUBE_HEADERS, timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+            resp = requests.get(list_url, headers=build_youtube_request_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
             if resp.status_code >= 400:
                 errors.append(f"list {resp.status_code}")
                 continue
@@ -730,7 +801,7 @@ def get_direct_timedtext_caption_srt(url: str, requested_language: str | None = 
         for host in ["https://www.youtube.com/api/timedtext", "https://video.google.com/timedtext"]:
             try:
                 caption_url = f"{host}?{urlencode(params)}"
-                resp = requests.get(caption_url, headers=YOUTUBE_HEADERS, timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+                resp = requests.get(caption_url, headers=build_youtube_request_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
                 if resp.status_code >= 400 or not resp.text.strip():
                     continue
                 srt_text = normalize_caption_to_srt(resp.text, ext=fmt)
@@ -810,7 +881,7 @@ def get_ytdlp_caption_srt(url: str, requested_language: str | None = None) -> tu
                     if not fmt:
                         errors.append(f"{source_name}:{caption_key}: no usable caption URL")
                         continue
-                    resp = requests.get(fmt.get("url"), headers=YOUTUBE_HEADERS, timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+                    resp = requests.get(fmt.get("url"), headers=build_youtube_request_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
                     resp.raise_for_status()
                     ext = (fmt.get("ext") or "").lower()
                     srt_text = normalize_caption_to_srt(resp.text, ext=ext)
@@ -1392,6 +1463,7 @@ def index():
         "ok": True,
         "service": "video-audio-tool",
         "caption_first": True,
+        "version": "v4-cookie-backed-caption-requests",
         "endpoints": [
             "POST /download", "POST /extract-srt", "POST /debug-youtube-captions", "POST /translate-srt", "POST /process-upload",
             "POST /upload", "POST /extract-srt-upload", "POST /rewrite", "POST /tts", "POST /final-srt",
@@ -1443,7 +1515,9 @@ def debug_youtube_captions():
             "video_id": video_id,
             "requested_language": language,
             "cookie_file_exists": get_cookie_file() is not None,
-            "youtube_caption_cookie_header": bool(os.getenv("YOUTUBE_CAPTION_COOKIE_HEADER")),
+            "youtube_caption_cookie_header_env": bool(os.getenv("YOUTUBE_CAPTION_COOKIE_HEADER")),
+            "youtube_cookie_header_applied": bool(get_youtube_cookie_header()),
+            "youtube_cookie_header_bytes": len(get_youtube_cookie_header() or ""),
             "methods": [],
         }
 
