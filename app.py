@@ -1357,7 +1357,7 @@ def get_innertube_caption_tracks(url: str, requested_language: str | None = None
     bootstrap = _fetch_youtube_watch_bootstrap(normalized_url)
     errors: list[str] = []
     debug = {
-        "version": "v5-dynamic-innertube-captions",
+        "version": "v6-transcript-api-and-proxy-fallback",
         "bootstrap_ok": bool(bootstrap.get("ok")),
         "dynamic_innertube_api_key_found": bool(bootstrap.get("dynamic_innertube_api_key_found")),
         "dynamic_web_client_version_found": bool(bootstrap.get("dynamic_web_client_version_found")),
@@ -1500,6 +1500,220 @@ def get_youtube_caption_srt(url: str, requested_language: str | None = None) -> 
         ("watch_page_caption_tracks", get_watch_page_caption_tracks),
         ("direct_timedtext", get_direct_timedtext_caption_srt),
         ("ytdlp_metadata", get_ytdlp_caption_srt),
+    ]
+    for name, fn in methods:
+        if name == "direct_timedtext" and (os.getenv("YOUTUBE_DIRECT_TIMEDTEXT", "true") or "true").strip().lower() in {"0", "false", "no", "off"}:
+            continue
+        try:
+            result = fn(url, requested_language=requested_language)
+            if result and result[0].strip():
+                return result
+        except Exception as exc:
+            print(f"caption method failed {name}: {exc}", flush=True)
+    return None
+
+
+# ---------------- V6 youtube-transcript-api fallback + better debug ----------------
+# This fallback uses the maintained youtube-transcript-api package as another
+# public-caption method before Whisper. It does not download video/audio.
+def _transcript_raw_items_to_srt(raw_items) -> str:
+    blocks = []
+    for item in raw_items or []:
+        try:
+            if isinstance(item, dict):
+                text = item.get("text") or ""
+                start = float(item.get("start") or 0)
+                duration = float(item.get("duration") or 3)
+            else:
+                text = getattr(item, "text", "") or ""
+                start = float(getattr(item, "start", 0) or 0)
+                duration = float(getattr(item, "duration", 3) or 3)
+            text = _clean_caption_text_line(text)
+            if not text:
+                continue
+            end = start + max(duration, 0.5)
+            blocks.append(f"{len(blocks) + 1}\n{srt_timestamp(start)} --> {srt_timestamp(end)}\n{text}\n")
+        except Exception:
+            continue
+    return "\n".join(blocks).strip() + "\n" if blocks else ""
+
+
+def _fetched_transcript_to_raw_data(fetched):
+    if fetched is None:
+        return []
+    if hasattr(fetched, "to_raw_data"):
+        return fetched.to_raw_data()
+    if isinstance(fetched, list):
+        return fetched
+    try:
+        return list(fetched)
+    except Exception:
+        return []
+
+
+def get_youtube_transcript_api_srt(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    """V6 fallback: use youtube-transcript-api without downloading media."""
+    if not is_youtube_url(url):
+        return None
+    video_id = get_youtube_video_id(url)
+    if not video_id:
+        return None
+    normalized_url = normalize_youtube_url(url)
+    errors = []
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except Exception as exc:
+        print(f"youtube-transcript-api import failed: {exc}", flush=True)
+        return None
+
+    lang_candidates = []
+    for cand in _caption_lang_candidates(requested_language):
+        if cand in {"*", "all", "auto"} or cand.endswith(".*"):
+            continue
+        if cand not in lang_candidates:
+            lang_candidates.append(cand)
+    if "en" not in lang_candidates:
+        lang_candidates.append("en")
+
+    try:
+        # New API: YouTubeTranscriptApi().list(video_id). Old API: YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript_list = None
+        try:
+            ytt_api = YouTubeTranscriptApi()
+            if hasattr(ytt_api, "list"):
+                transcript_list = ytt_api.list(video_id)
+        except Exception as exc:
+            errors.append(f"new_api_list: {exc}")
+        if transcript_list is None and hasattr(YouTubeTranscriptApi, "list_transcripts"):
+            try:
+                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            except Exception as exc:
+                errors.append(f"old_api_list: {exc}")
+
+        manual_languages = []
+        auto_languages = []
+        transcripts = []
+        if transcript_list is not None:
+            try:
+                transcripts = list(transcript_list)
+            except Exception as exc:
+                errors.append(f"list_iter: {exc}")
+            for tr in transcripts:
+                code = getattr(tr, "language_code", "") or ""
+                if getattr(tr, "is_generated", False):
+                    auto_languages.append(code)
+                else:
+                    manual_languages.append(code)
+
+            pools = [
+                ("youtube_transcript_api_manual", [tr for tr in transcripts if not getattr(tr, "is_generated", False)]),
+                ("youtube_transcript_api_auto", [tr for tr in transcripts if getattr(tr, "is_generated", False)]),
+                ("youtube_transcript_api_any", transcripts),
+            ]
+            for source_name, pool in pools:
+                for candidate in lang_candidates + ["en"]:
+                    for tr in pool:
+                        code = getattr(tr, "language_code", "") or ""
+                        if not _caption_key_matches(code, candidate):
+                            continue
+                        try:
+                            fetched = tr.fetch()
+                            raw_items = _fetched_transcript_to_raw_data(fetched)
+                            srt_text = _transcript_raw_items_to_srt(raw_items)
+                            if srt_text.strip():
+                                return srt_text, {
+                                    "source": source_name,
+                                    "subtitle_source": source_name,
+                                    "language": code,
+                                    "format": "transcript_api",
+                                    "title": "YouTube transcript",
+                                    "video_id": video_id,
+                                    "source_url": normalized_url,
+                                    "manual_languages": sorted(set(manual_languages)),
+                                    "auto_languages": sorted(set(auto_languages)),
+                                    "caption_track_count": len(transcripts),
+                                    "no_media_download": True,
+                                    "caption_first": True,
+                                    "errors": errors[-8:],
+                                }
+                        except Exception as exc:
+                            errors.append(f"fetch {source_name}:{code}: {exc}")
+
+        # Direct fetch fallback for current 1.x API.
+        try:
+            ytt_api = YouTubeTranscriptApi()
+            fetched = ytt_api.fetch(video_id, languages=lang_candidates or ["en"])
+            raw_items = _fetched_transcript_to_raw_data(fetched)
+            srt_text = _transcript_raw_items_to_srt(raw_items)
+            if srt_text.strip():
+                return srt_text, {
+                    "source": "youtube_transcript_api_fetch",
+                    "subtitle_source": "youtube_transcript_api_fetch",
+                    "language": getattr(fetched, "language_code", None) or (lang_candidates[0] if lang_candidates else "en"),
+                    "format": "transcript_api",
+                    "title": "YouTube transcript",
+                    "video_id": video_id,
+                    "source_url": normalized_url,
+                    "manual_languages": [],
+                    "auto_languages": [],
+                    "no_media_download": True,
+                    "caption_first": True,
+                    "errors": errors[-8:],
+                }
+        except Exception as exc:
+            errors.append(f"direct_fetch: {exc}")
+    except Exception as exc:
+        errors.append(str(exc))
+    print(f"youtube-transcript-api no result: {errors[-8:]}", flush=True)
+    return None
+
+
+# Optional final fallback: call an alternate caption proxy service if configured.
+# Configure CAPTION_PROXY_URL to an endpoint you control that returns JSON with
+# {success:true, srt_text:"..."}. This is for cases where Railway's IP is blocked.
+def get_external_caption_proxy_srt(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    proxy_url = (os.getenv("CAPTION_PROXY_URL") or "").strip()
+    if not proxy_url:
+        return None
+    try:
+        resp = requests.post(
+            proxy_url,
+            headers={"Content-Type": "application/json"},
+            json={"url": url, "language": requested_language or "auto"},
+            timeout=int(os.getenv("CAPTION_PROXY_TIMEOUT", "45")),
+        )
+        data = resp.json() if resp.headers.get("content-type", "").lower().startswith("application/json") else {}
+        srt_text = (data.get("srt_text") or data.get("srt") or "").strip()
+        if resp.ok and (data.get("success") or data.get("ok")) and srt_text:
+            return srt_text + ("\n" if not srt_text.endswith("\n") else ""), {
+                "source": "external_caption_proxy",
+                "subtitle_source": "external_caption_proxy",
+                "language": data.get("language") or requested_language or "auto",
+                "format": data.get("format") or "srt",
+                "title": data.get("title") or "External caption proxy",
+                "video_id": get_youtube_video_id(url) or "",
+                "source_url": normalize_youtube_url(url) if is_youtube_url(url) else url,
+                "manual_languages": data.get("manual_languages") or [],
+                "auto_languages": data.get("auto_languages") or [],
+                "no_media_download": True,
+                "caption_first": True,
+            }
+    except Exception as exc:
+        print(f"external caption proxy failed: {exc}", flush=True)
+    return None
+
+
+def get_youtube_caption_srt(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    """V6 method order: all public-caption methods, then optional external proxy."""
+    if not is_youtube_url(url):
+        return None
+    methods = [
+        ("dynamic_innertube_caption_tracks_v5", get_innertube_caption_tracks),
+        ("youtube_transcript_api", get_youtube_transcript_api_srt),
+        ("watch_page_caption_tracks", get_watch_page_caption_tracks),
+        ("direct_timedtext", get_direct_timedtext_caption_srt),
+        ("ytdlp_metadata", get_ytdlp_caption_srt),
+        ("external_caption_proxy", get_external_caption_proxy_srt),
     ]
     for name, fn in methods:
         if name == "direct_timedtext" and (os.getenv("YOUTUBE_DIRECT_TIMEDTEXT", "true") or "true").strip().lower() in {"0", "false", "no", "off"}:
@@ -1863,7 +2077,7 @@ def index():
         "ok": True,
         "service": "video-audio-tool",
         "caption_first": True,
-        "version": "v5-dynamic-innertube-captions",
+        "version": "v6-transcript-api-and-proxy-fallback",
         "endpoints": [
             "POST /download", "POST /extract-srt", "POST /debug-youtube-captions", "POST /translate-srt", "POST /process-upload",
             "POST /upload", "POST /extract-srt-upload", "POST /rewrite", "POST /tts", "POST /final-srt",
@@ -1924,9 +2138,11 @@ def debug_youtube_captions():
 
         methods = [
             ("innertube_caption_tracks", get_innertube_caption_tracks),
+            ("youtube_transcript_api", get_youtube_transcript_api_srt),
             ("watch_page_caption_tracks", get_watch_page_caption_tracks),
             ("direct_timedtext", get_direct_timedtext_caption_srt),
             ("ytdlp_metadata", get_ytdlp_caption_srt),
+            ("external_caption_proxy", get_external_caption_proxy_srt),
         ]
 
         for name, fn in methods:
@@ -1948,6 +2164,9 @@ def debug_youtube_captions():
             debug["methods"].append(item)
 
         debug["any_success"] = any(item.get("success") for item in debug["methods"])
+        # Refresh this after method execution so the response includes detailed Innertube attempts.
+        debug["v5_dynamic_innertube_debug"] = YOUTUBE_CAPTION_DEBUG_LAST
+        debug["caption_proxy_configured"] = bool((os.getenv("CAPTION_PROXY_URL") or "").strip())
         return jsonify(debug)
     except Exception as exc:
         print(f"debug-youtube-captions error: {exc}", flush=True)
