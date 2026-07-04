@@ -96,6 +96,55 @@ def build_public_url(path: str) -> str:
     path = "/" + (path or "").lstrip("/")
     return f"{get_public_base_url()}{path}"
 
+
+def safe_download_name(requested_name: str | None, fallback_name: str, expected_ext: str | None = None) -> str:
+    """Return a browser-safe filename for Content-Disposition."""
+    raw = (requested_name or fallback_name or "download").strip()
+    raw = Path(raw).name
+    raw = secure_filename(raw) or secure_filename(fallback_name or "download") or "download"
+    if expected_ext:
+        ext = expected_ext if expected_ext.startswith(".") else f".{expected_ext}"
+        if not raw.lower().endswith(ext.lower()):
+            raw = f"{Path(raw).stem}{ext}"
+    return raw
+
+
+def add_download_name(url: str, download_name: str | None) -> str:
+    """Append ?download_name=... so cross-origin downloads keep friendly names."""
+    if not url or not download_name:
+        return url
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["download_name"] = download_name
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def requested_download_name(fallback_name: str, expected_ext: str | None = None) -> str:
+    return safe_download_name(
+        request.args.get("download_name") or request.args.get("name") or request.args.get("filename"),
+        fallback_name,
+        expected_ext,
+    )
+
+
+def tts_pause_friendly_text(text: str) -> str:
+    """Add light Myanmar sentence endings to improve Edge-TTS pauses."""
+    cleaned = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    out: list[str] = []
+    for raw_line in cleaned.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        line = re.sub(r"\s*၊\s*", "၊ ", line)
+        line = re.sub(r"\s*([!?])\s*", r"\1 ", line).strip()
+        if len(line) >= 18 and not END_PUNCT_RE.search(line):
+            line = f"{line}။"
+        out.append(line)
+    return "\n".join(out).strip()
+
 app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_MB", "250")) * 1024 * 1024
 
 ALLOWED_UPLOAD_EXTENSIONS = {
@@ -1403,7 +1452,7 @@ def get_innertube_caption_tracks(url: str, requested_language: str | None = None
     bootstrap = _fetch_youtube_watch_bootstrap(normalized_url)
     errors: list[str] = []
     debug = {
-        "version": "v14-quality-downloads-clean-translation",
+        "version": "v15-friendly-filenames-tts-rhythm",
         "bootstrap_ok": bool(bootstrap.get("ok")),
         "dynamic_innertube_api_key_found": bool(bootstrap.get("dynamic_innertube_api_key_found")),
         "dynamic_web_client_version_found": bool(bootstrap.get("dynamic_web_client_version_found")),
@@ -2981,7 +3030,7 @@ def index():
         "ok": True,
         "service": "video-audio-tool",
         "caption_first": True,
-        "version": "v14-quality-downloads-clean-translation",
+        "version": "v15-friendly-filenames-tts-rhythm",
         "endpoints": [
             "POST /download", "POST /extract-srt", "POST /extract-srt mode=downsub", "POST /extract-srt mode=subdown", "POST /debug-youtube-captions", "POST /translate-srt", "POST /process-upload",
             "POST /upload", "POST /extract-srt-upload", "POST /rewrite", "POST /rewrite-options", "POST /tts", "POST /final-srt",
@@ -3398,6 +3447,8 @@ def rewrite_options():
         emotional, emotional_source, emotional_meta = rewrite_with_openrouter(cleaned, language=language, style="emotional_tts", target_length_ratio=min(0.38, max(0.22, target_length_ratio + 0.05)))
         natural_filename, natural_url = save_text_response(natural or emotional or "", "natural_rewrite")
         emotional_filename, emotional_url = save_text_response(emotional or natural or "", "emotional_rewrite")
+        natural_url = add_download_name(natural_url, "natural-accurate.txt")
+        emotional_url = add_download_name(emotional_url, "emotional-tts.txt")
         if not natural.strip() and not emotional.strip():
             return json_error("Rewrite returned no text", 502)
         # V11 compatibility: keep the correct structured `options` response,
@@ -3479,7 +3530,7 @@ def polish_tts_script(text: str, style: str = "natural_accurate") -> str:
     if not cleaned:
         return ""
     # Add readable pauses for Myanmar TTS. This improves rhythm without changing meaning.
-    cleaned = re.sub(r"\s*၊\s*", "၊ ", cleaned)
+    cleaned = tts_pause_friendly_text(cleaned)
     cleaned = re.sub(r"\s*။\s*", "။\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
@@ -3558,7 +3609,8 @@ def tts():
             "audio_url": f"{base_url}/tts/{output_filename}",
             "tts_audio_url": f"{base_url}/tts/{output_filename}",
             "audio_filename": output_filename,
-            "download_url": f"{base_url}/tts/{output_filename}",
+            "audio_download_url": add_download_name(f"{base_url}/tts/{output_filename}", "final-audio.mp3"),
+            "download_url": add_download_name(f"{base_url}/tts/{output_filename}", "final-audio.mp3"),
             "audio_duration_seconds": audio_duration_seconds,
             "voice": voice,
             "engine": "edge_tts",
@@ -3568,10 +3620,10 @@ def tts():
             "volume": volume,
             "tts_input_text": text,
             "final_script_text": text,
-            "final_script_url": final_script_url,
+            "final_script_url": add_download_name(final_script_url, "final-script.txt"),
             "final_script_filename": final_script_filename,
             "final_srt_text": final_srt_text,
-            "final_srt_url": f"{base_url}/srt/{final_srt_filename}",
+            "final_srt_url": add_download_name(f"{base_url}/srt/{final_srt_filename}", "final.srt"),
             "final_srt_filename": final_srt_filename,
         })
     except Exception as exc:
@@ -3593,7 +3645,7 @@ def final_srt():
             duration = None
         final_srt_text = build_final_srt_from_script(script, total_duration=duration)
         filename, url = save_srt_response(final_srt_text, "final_srt")
-        return jsonify({"ok": True, "success": True, "final_srt_text": final_srt_text, "final_srt_url": url, "filename": filename})
+        return jsonify({"ok": True, "success": True, "final_srt_text": final_srt_text, "final_srt_url": add_download_name(url, "final.srt"), "filename": filename})
     except Exception as exc:
         print(f"final-srt error: {exc}", flush=True)
         return json_error(str(exc), 500)
@@ -3602,26 +3654,30 @@ def final_srt():
 @app.get("/audio/<path:filename>")
 def serve_audio(filename):
     safe_filename = Path(filename).name
-    return send_from_directory(AUDIO_DIR, safe_filename, mimetype="audio/mpeg", as_attachment=True, download_name=safe_filename, max_age=0)
+    download_name = requested_download_name(safe_filename, ".mp3")
+    return send_from_directory(AUDIO_DIR, safe_filename, mimetype="audio/mpeg", as_attachment=True, download_name=download_name, max_age=0)
 
 
 @app.get("/srt/<path:filename>")
 def serve_srt(filename):
     safe_filename = Path(filename).name
-    return send_from_directory(SRT_DIR, safe_filename, mimetype="text/plain; charset=utf-8", as_attachment=True, download_name=safe_filename, max_age=0)
+    download_name = requested_download_name(safe_filename, ".srt")
+    return send_from_directory(SRT_DIR, safe_filename, mimetype="text/plain; charset=utf-8", as_attachment=True, download_name=download_name, max_age=0)
 
 
 @app.get("/tts/<path:filename>")
 def serve_tts(filename):
     safe_filename = Path(filename).name
-    return send_from_directory(TTS_DIR, safe_filename, mimetype="audio/mpeg", as_attachment=True, download_name=safe_filename, max_age=0)
+    download_name = requested_download_name(safe_filename, ".mp3")
+    return send_from_directory(TTS_DIR, safe_filename, mimetype="audio/mpeg", as_attachment=True, download_name=download_name, max_age=0)
 
 
 
 @app.get("/script/<path:filename>")
 def serve_script(filename):
     safe_filename = Path(filename).name
-    return send_from_directory(SCRIPT_DIR, safe_filename, mimetype="text/plain; charset=utf-8", as_attachment=True, download_name=safe_filename, max_age=0)
+    download_name = requested_download_name(safe_filename, ".txt")
+    return send_from_directory(SCRIPT_DIR, safe_filename, mimetype="text/plain; charset=utf-8", as_attachment=True, download_name=download_name, max_age=0)
 
 @app.errorhandler(RequestEntityTooLarge)
 def handle_large_file(exc):
