@@ -67,9 +67,10 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 SRT_DIR = BASE_DIR / "srt"
 AUDIO_DIR = BASE_DIR / "audio"
 TTS_DIR = BASE_DIR / "tts"
+SCRIPT_DIR = BASE_DIR / "scripts"
 COOKIE_FILE = BASE_DIR / "cookies.txt"
 GENERATED_COOKIE_FILE = Path(os.getenv("YOUTUBE_COOKIES_GENERATED_FILE", "/tmp/youtube_cookies.txt"))
-for directory in (DOWNLOAD_DIR, UPLOAD_DIR, SRT_DIR, AUDIO_DIR, TTS_DIR):
+for directory in (DOWNLOAD_DIR, UPLOAD_DIR, SRT_DIR, AUDIO_DIR, TTS_DIR, SCRIPT_DIR):
     directory.mkdir(exist_ok=True)
 
 app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_MB", "250")) * 1024 * 1024
@@ -1379,7 +1380,7 @@ def get_innertube_caption_tracks(url: str, requested_language: str | None = None
     bootstrap = _fetch_youtube_watch_bootstrap(normalized_url)
     errors: list[str] = []
     debug = {
-        "version": "v12-robust-translation-batching",
+        "version": "v13-artifacts-concise-rewrite-tts",
         "bootstrap_ok": bool(bootstrap.get("ok")),
         "dynamic_innertube_api_key_found": bool(bootstrap.get("dynamic_innertube_api_key_found")),
         "dynamic_web_client_version_found": bool(bootstrap.get("dynamic_web_client_version_found")),
@@ -2404,6 +2405,10 @@ def normalize_rewrite_style(style: str | None) -> str:
         "concise_natural_tts": "natural_accurate",
         "movie_recap": "movie_recap",
         "recap": "movie_recap",
+        "concise_narrative_summary": "concise_summary",
+        "concise_summary": "concise_summary",
+        "summary": "concise_summary",
+        "voiceover_summary": "concise_summary",
         "emotional": "emotional_tts",
         "emotional_tts": "emotional_tts",
         "storytelling": "emotional_tts",
@@ -2418,10 +2423,20 @@ def build_rewrite_prompt(
     style: str = "natural_accurate",
     chunk_index: int | None = None,
     chunk_total: int | None = None,
+    target_length_ratio: float | None = None,
 ) -> str:
     """Prompt for real semantic rewrite, not SRT cleanup."""
     style_norm = normalize_rewrite_style(style)
     input_len = len(text or "")
+    if target_length_ratio is None:
+        if style_norm == "concise_summary":
+            target_length_ratio = float(os.getenv("REWRITE_TARGET_RATIO_CONCISE", "0.28"))
+        elif style_norm == "movie_recap":
+            target_length_ratio = float(os.getenv("REWRITE_TARGET_RATIO_RECAP", "0.35"))
+        else:
+            target_length_ratio = float(os.getenv("REWRITE_TARGET_RATIO", "0.45"))
+    target_percent = int(max(0.18, min(0.65, target_length_ratio)) * 100)
+    target_chars = max(1200, int(input_len * max(0.18, min(0.65, target_length_ratio)))) if input_len > 1000 else max(300, int(input_len * 0.55))
     chunk_note = ""
     if chunk_index is not None and chunk_total is not None and chunk_total > 1:
         chunk_note = (
@@ -2436,17 +2451,28 @@ Your job is to transform machine-translated subtitle text into natural Myanmar s
 CRITICAL RULES:
 - Do NOT simply remove timestamps and join subtitle lines.
 - Do NOT summarize the whole input into one or two sentences.
-- Do NOT drop important events, names, objects, places, motivations, or story order.
+- Do NOT rewrite line-by-line; combine repeated subtitle fragments into smooth narrative paragraphs.
+- Keep only the important plot events, character motivations, cause/effect, and story order.
 - Preserve proper names such as Eternia, Eternos, Castle Grayskull, Sword of Power, and character names.
 - Fix literal Google Translate style into smooth Myanmar prose.
 - Keep the meaning, but rewrite the wording so it sounds written by a human narrator.
 - Use normal Myanmar paragraphs and spoken sentence rhythm.
 - Remove SRT numbers, timestamps, arrows, WEBVTT headers, duplicates, and broken subtitle fragments.
 - Return ONLY the final Myanmar script. No markdown, no title, no explanation.
-- Input length is about {input_len} characters. The output must be substantial, not a tiny summary.{chunk_note}
+- Input length is about {input_len} characters. Target output length is about {target_percent}% of the input, around {target_chars} characters for this chunk.
+- The final script must be shorter than the subtitle text, but still complete enough for a movie recap voice-over.{chunk_note}
 """.strip()
 
-    if style_norm == "emotional_tts":
+    if style_norm == "concise_summary":
+        style_rules = """
+STYLE: Concise Myanmar movie recap voice-over
+- Write as polished spoken Myanmar narration, not subtitles.
+- Reduce length strongly: keep the main plot only, remove repeated details and filler.
+- Use short natural paragraphs with clear transitions.
+- Preserve important names and causal story order.
+- No English instructions, no notes, no headings, no bullet points.
+""".strip()
+    elif style_norm == "emotional_tts":
         style_rules = """
 STYLE: Emotional TTS / dramatic storytelling
 - Make it vivid, cinematic, and suspenseful.
@@ -2546,9 +2572,11 @@ def ai_rewrite_min_chars(input_text: str, style: str = "natural_accurate") -> in
     style_norm = normalize_rewrite_style(style)
     if input_len < 500:
         return max(80, int(input_len * 0.35))
-    ratio = 0.30 if style_norm == "emotional_tts" else 0.35
+    ratio = 0.30 if style_norm == "emotional_tts" else 0.28
     if style_norm == "movie_recap":
-        ratio = 0.22
+        ratio = 0.20
+    if style_norm == "concise_summary":
+        ratio = float(os.getenv("REWRITE_MIN_RATIO_CONCISE", "0.12"))
     return max(450, min(4000, int(input_len * ratio)))
 
 
@@ -2559,9 +2587,21 @@ def validate_ai_rewrite(rewritten: str, input_text: str, style: str = "natural_a
     min_chars = ai_rewrite_min_chars(input_text, style)
     if len(rewritten_clean) < min_chars:
         return False, f"too_short:{len(rewritten_clean)}<{min_chars}"
+    lower = rewritten_clean.lower()
+    leaked_phrases = ["we need to", "must ", "should ", "preserve names", "return only", "the segment", "input subtitle text"]
+    if any(x in lower for x in leaked_phrases):
+        return False, "instruction_leakage"
     # If output is basically one tiny fragment for a long input, reject it.
     if len(input_text or "") > 3000 and len(re.split(r"[။.!?]\s+|\n+", rewritten_clean)) < 6:
         return False, "too_few_sentences_for_long_input"
+    style_norm = normalize_rewrite_style(style)
+    max_ratio = 0.65
+    if style_norm == "concise_summary":
+        max_ratio = float(os.getenv("REWRITE_MAX_RATIO_CONCISE", "0.50"))
+    elif style_norm == "movie_recap":
+        max_ratio = float(os.getenv("REWRITE_MAX_RATIO_RECAP", "0.60"))
+    if len(input_text or "") > 2000 and len(rewritten_clean) > int(len(input_text) * max_ratio):
+        return False, f"too_long:{len(rewritten_clean)}>{int(len(input_text)*max_ratio)}"
     return True, "ok"
 
 
@@ -2576,7 +2616,8 @@ def call_openrouter_rewrite(model: str, prompt: str, style: str) -> tuple[str, d
                 "content": (
                     "You are a Myanmar narration scriptwriter. "
                     "Always return the rewritten Myanmar script only. "
-                    "Never summarize a long input into a tiny answer."
+                    "Write natural, concise Myanmar voice-over narration. "
+                    "No English instructions, no markdown, no explanation."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -2606,7 +2647,41 @@ def call_openrouter_rewrite(model: str, prompt: str, style: str) -> tuple[str, d
     }
 
 
-def rewrite_with_openrouter(text: str, language: str = "my", style: str = "natural_accurate") -> tuple[str, str, dict]:
+
+def local_concise_summary_fallback(text: str, target_ratio: float = 0.28) -> str:
+    """Deterministic emergency fallback: shorter spoken text, not AI-quality summary."""
+    cleaned = local_rewrite_for_tts(text)
+    if not cleaned:
+        return ""
+    sentences = [s.strip() for s in re.split(r"(?<=[။.!?])\s+|\n+", cleaned) if s.strip()]
+    if not sentences:
+        return cleaned
+    target_chars = max(1500, min(12000, int(len(cleaned) * target_ratio)))
+    selected = []
+    total = 0
+    # Keep a stable story arc: beginning + spaced middle + ending.
+    if len(sentences) <= 12:
+        selected = sentences
+    else:
+        selected.extend(sentences[:4])
+        remaining = sentences[4:-3]
+        step = max(1, len(remaining) // 18)
+        selected.extend(remaining[::step])
+        selected.extend(sentences[-3:])
+    out = []
+    seen = set()
+    for sent in selected:
+        key = sent[:80].casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        if total + len(sent) > target_chars and len(out) >= 8:
+            break
+        out.append(sent)
+        total += len(sent)
+    return "\n".join(out).strip()
+
+def rewrite_with_openrouter(text: str, language: str = "my", style: str = "natural_accurate", target_length_ratio: float | None = None) -> tuple[str, str, dict]:
     cleaned = clean_srt_to_text(text) or re.sub(r"\s+", " ", (text or "")).strip()
     if not cleaned:
         return "", "empty", {"ai_rewrite_configured": False, "rewrite_quality": "empty"}
@@ -2620,10 +2695,12 @@ def rewrite_with_openrouter(text: str, language: str = "my", style: str = "natur
         }
 
     style_norm = normalize_rewrite_style(style)
+    if target_length_ratio is None:
+        target_length_ratio = float(os.getenv("REWRITE_TARGET_RATIO_CONCISE", "0.28")) if style_norm == "concise_summary" else None
     models = get_openrouter_model_candidates()
     chunks = split_text_for_ai_rewrite(cleaned)
     attempts: list[dict] = []
-    fallback_text = local_rewrite_for_tts(cleaned, language, style)
+    fallback_text = local_concise_summary_fallback(cleaned, target_length_ratio or 0.28) if style_norm == "concise_summary" else local_rewrite_for_tts(cleaned, language, style)
 
     # For long scripts, chunking avoids one-sentence summaries and output truncation.
     for model in models:
@@ -2631,7 +2708,7 @@ def rewrite_with_openrouter(text: str, language: str = "my", style: str = "natur
             rewritten_chunks: list[str] = []
             model_attempt = {"model": model, "chunks": len(chunks), "chunk_results": []}
             for idx, chunk in enumerate(chunks, start=1):
-                prompt = build_rewrite_prompt(chunk, language=language, style=style_norm, chunk_index=idx, chunk_total=len(chunks))
+                prompt = build_rewrite_prompt(chunk, language=language, style=style_norm, chunk_index=idx, chunk_total=len(chunks), target_length_ratio=target_length_ratio)
                 rewritten_chunk, call_meta = call_openrouter_rewrite(model, prompt, style_norm)
                 ok, reason = validate_ai_rewrite(rewritten_chunk, chunk, style_norm)
                 model_attempt["chunk_results"].append({
@@ -2687,6 +2764,15 @@ def save_srt_response(srt_text: str, base_name: str = "captions") -> tuple[str, 
     return filename, f"{base_url}/srt/{filename}"
 
 
+def save_text_response(text: str, base_name: str = "script") -> tuple[str, str]:
+    safe_base = secure_filename(base_name) or "script"
+    filename = f"{Path(safe_base).stem}_{uuid.uuid4().hex[:8]}.txt"
+    path = SCRIPT_DIR / filename
+    path.write_text(text or "", encoding="utf-8")
+    base_url = request.host_url.rstrip("/")
+    return filename, f"{base_url}/script/{filename}"
+
+
 def build_final_srt_from_script(script: str, seconds_per_line: float = 3.5) -> str:
     text = local_rewrite_for_tts(script)
     if not text:
@@ -2713,11 +2799,11 @@ def index():
         "ok": True,
         "service": "video-audio-tool",
         "caption_first": True,
-        "version": "v12-robust-translation-batching",
+        "version": "v13-artifacts-concise-rewrite-tts",
         "endpoints": [
             "POST /download", "POST /extract-srt", "POST /extract-srt mode=downsub", "POST /extract-srt mode=subdown", "POST /debug-youtube-captions", "POST /translate-srt", "POST /process-upload",
             "POST /upload", "POST /extract-srt-upload", "POST /rewrite", "POST /rewrite-options", "POST /tts", "POST /final-srt",
-            "GET /audio/<filename>", "GET /srt/<filename>", "GET /tts/<filename>",
+            "GET /audio/<filename>", "GET /srt/<filename>", "GET /tts/<filename>", "GET /script/<filename>",
         ],
     })
 
@@ -3081,10 +3167,15 @@ def rewrite():
         text = payload.get("text") or payload.get("srt_text") or payload.get("translated_srt_text") or ""
         language = payload.get("language") or "my"
         style = payload.get("style") or "natural_accurate"
+        target_length_ratio = payload.get("target_length_ratio") or payload.get("targetLengthRatio")
         if not text.strip():
             return json_error("Missing text to rewrite", 400)
         cleaned = clean_srt_to_text(text) or text
-        rewritten, source, rewrite_meta = rewrite_with_openrouter(cleaned, language=language, style=style)
+        try:
+            target_length_ratio = float(target_length_ratio) if target_length_ratio is not None else None
+        except Exception:
+            target_length_ratio = None
+        rewritten, source, rewrite_meta = rewrite_with_openrouter(cleaned, language=language, style=style, target_length_ratio=target_length_ratio)
         if not rewritten.strip():
             return json_error("Rewrite returned no text", 502, source=source, rewrite=rewrite_meta)
         return jsonify({
@@ -3112,11 +3203,19 @@ def rewrite_options():
         payload = request.get_json(silent=True) or {}
         text = payload.get("text") or payload.get("srt_text") or payload.get("translated_srt_text") or ""
         language = payload.get("language") or "my"
+        requested_style = payload.get("style") or "concise_narrative_summary"
+        try:
+            target_length_ratio = float(payload.get("target_length_ratio") or payload.get("targetLengthRatio") or os.getenv("REWRITE_TARGET_RATIO_CONCISE", "0.28"))
+        except Exception:
+            target_length_ratio = 0.28
         if not text.strip():
             return json_error("Missing text to rewrite", 400)
         cleaned = clean_srt_to_text(text) or text
-        natural, natural_source, natural_meta = rewrite_with_openrouter(cleaned, language=language, style="natural_accurate")
-        emotional, emotional_source, emotional_meta = rewrite_with_openrouter(cleaned, language=language, style="emotional_tts")
+        # User wants concise spoken prose, not a full line-by-line retelling.
+        natural, natural_source, natural_meta = rewrite_with_openrouter(cleaned, language=language, style=requested_style, target_length_ratio=target_length_ratio)
+        emotional, emotional_source, emotional_meta = rewrite_with_openrouter(cleaned, language=language, style="emotional_tts", target_length_ratio=min(0.38, max(0.22, target_length_ratio + 0.05)))
+        natural_filename, natural_url = save_text_response(natural or emotional or "", "natural_rewrite")
+        emotional_filename, emotional_url = save_text_response(emotional or natural or "", "emotional_rewrite")
         if not natural.strip() and not emotional.strip():
             return json_error("Rewrite returned no text", 502)
         # V11 compatibility: keep the correct structured `options` response,
@@ -3140,8 +3239,12 @@ def rewrite_options():
             "rewritten_text": primary_script,
             "naturalScript": natural_script,
             "natural_script": natural_script,
+            "natural_script_url": natural_url,
+            "naturalScriptUrl": natural_url,
             "emotionalScript": emotional_script,
             "emotional_script": emotional_script,
+            "emotional_script_url": emotional_url,
+            "emotionalScriptUrl": emotional_url,
             "source": natural_source or emotional_source,
             "quality": natural_meta.get("rewrite_quality") or emotional_meta.get("rewrite_quality"),
             "rewrite_quality": natural_meta.get("rewrite_quality") or emotional_meta.get("rewrite_quality"),
@@ -3152,6 +3255,8 @@ def rewrite_options():
                     "title": "Natural Accurate",
                     "script": natural_script,
                     "text": natural_script,
+                    "script_url": natural_url,
+                    "download_url": natural_url,
                     "result": natural_script,
                     "source": natural_source,
                     "rewrite": natural_meta,
@@ -3162,6 +3267,8 @@ def rewrite_options():
                     "title": "Emotional TTS",
                     "script": emotional_script,
                     "text": emotional_script,
+                    "script_url": emotional_url,
+                    "download_url": emotional_url,
                     "result": emotional_script,
                     "source": emotional_source,
                     "rewrite": emotional_meta,
@@ -3204,7 +3311,9 @@ def select_tts_voice(language: str | None = None, gender: str | None = None, req
     language_norm = normalize_translate_language(language or "my", default="my")
     gender_norm = (gender or "female").lower()
     if language_norm == "my":
-        return os.getenv("TTS_VOICE_MY_MALE" if gender_norm.startswith("m") else "TTS_VOICE_MY_FEMALE", "my-MM-NilarNeural")
+        if gender_norm.startswith("m"):
+            return os.getenv("TTS_VOICE_MY_MALE", "my-MM-ThihaNeural")
+        return os.getenv("TTS_VOICE_MY_FEMALE", "my-MM-NilarNeural")
     if language_norm == "en":
         return os.getenv("TTS_VOICE_EN_MALE" if gender_norm.startswith("m") else "TTS_VOICE_EN_FEMALE", "en-US-AriaNeural")
     return os.getenv("TTS_VOICE_DEFAULT", "en-US-AriaNeural")
@@ -3216,6 +3325,8 @@ def tts_voice_params(style: str | None = None) -> tuple[str, str, str]:
         return os.getenv("TTS_RATE_EMOTIONAL", "-6%"), os.getenv("TTS_PITCH_EMOTIONAL", "+2Hz"), os.getenv("TTS_VOLUME", "+0%")
     if style_norm == "movie_recap":
         return os.getenv("TTS_RATE_RECAP", "-3%"), os.getenv("TTS_PITCH_RECAP", "+0Hz"), os.getenv("TTS_VOLUME", "+0%")
+    if style_norm == "concise_summary":
+        return os.getenv("TTS_RATE_CONCISE", "-8%"), os.getenv("TTS_PITCH_CONCISE", "-1Hz"), os.getenv("TTS_VOLUME", "+0%")
     return os.getenv("TTS_RATE", "-4%"), os.getenv("TTS_PITCH", "+0Hz"), os.getenv("TTS_VOLUME", "+0%")
 
 
@@ -3249,6 +3360,7 @@ def tts():
             loop.close()
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise RuntimeError("TTS audio file was not created")
+        final_script_filename, final_script_url = save_text_response(text, "final_script")
         final_srt_text = build_final_srt_from_script(text)
         final_srt_filename = f"final_tts_{uuid.uuid4().hex[:8]}.srt"
         (SRT_DIR / final_srt_filename).write_text(final_srt_text, encoding="utf-8")
@@ -3266,6 +3378,9 @@ def tts():
             "pitch": pitch,
             "volume": volume,
             "tts_input_text": text,
+            "final_script_text": text,
+            "final_script_url": final_script_url,
+            "final_script_filename": final_script_filename,
             "final_srt_text": final_srt_text,
             "final_srt_url": f"{base_url}/srt/{final_srt_filename}",
             "final_srt_filename": final_srt_filename,
@@ -3307,6 +3422,12 @@ def serve_tts(filename):
     safe_filename = Path(filename).name
     return send_from_directory(TTS_DIR, safe_filename, mimetype="audio/mpeg", as_attachment=True, download_name=safe_filename, max_age=0)
 
+
+
+@app.get("/script/<path:filename>")
+def serve_script(filename):
+    safe_filename = Path(filename).name
+    return send_from_directory(SCRIPT_DIR, safe_filename, mimetype="text/plain; charset=utf-8", as_attachment=True, download_name=safe_filename, max_age=0)
 
 @app.errorhandler(RequestEntityTooLarge)
 def handle_large_file(exc):
