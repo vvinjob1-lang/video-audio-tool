@@ -21,7 +21,12 @@ from werkzeug.utils import secure_filename
 app = Flask(__name__)
 # Lovable previews may run on http://id-preview--*.lovable.app (browser shows "Not secure")
 # as well as https://*.lovable.app.  The previous CORS list allowed only HTTPS
-# Lovable origins, so browser fetches to /rewrite-options could fail even while curl
+# Lovable origins, so browser fetches to /rewrite-options If AI fails:
+- do not return first N characters as final script
+- do not return prefix-only summary
+- either return success:false with needs_retry:true
+- or return distributed extractive fallback from beginning + middle + ending
+- mark fallback as tts_safe:false
 # worked from Railway. Keep this permissive for app/API endpoints only.
 CORS(
     app,
