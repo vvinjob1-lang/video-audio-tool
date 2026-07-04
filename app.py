@@ -1379,7 +1379,7 @@ def get_innertube_caption_tracks(url: str, requested_language: str | None = None
     bootstrap = _fetch_youtube_watch_bootstrap(normalized_url)
     errors: list[str] = []
     debug = {
-        "version": "v11-rewrite-options-compat-flat",
+        "version": "v12-robust-translation-batching",
         "bootstrap_ok": bool(bootstrap.get("ok")),
         "dynamic_innertube_api_key_found": bool(bootstrap.get("dynamic_innertube_api_key_found")),
         "dynamic_web_client_version_found": bool(bootstrap.get("dynamic_web_client_version_found")),
@@ -2223,37 +2223,109 @@ def build_srt_from_blocks(blocks: list[dict]) -> str:
     return "\n".join(output_blocks).strip() + "\n" if output_blocks else ""
 
 
+def _batch_texts_for_google_translate(texts: list[str], max_items: int = 35, max_chars: int = 3200) -> list[list[str]]:
+    """Group subtitle lines into safe batches for deep-translator.
+
+    Google Translate web calls can fail when we send too many short subtitle
+    segments one-by-one or when a single request becomes too large.  This helper
+    keeps each batch small enough for free translation and Railway timeouts.
+    """
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_chars = 0
+    for text in texts:
+        item = (text or "").strip()
+        item_chars = len(item)
+        if current and (len(current) >= max_items or current_chars + item_chars > max_chars):
+            batches.append(current)
+            current = []
+            current_chars = 0
+        current.append(item)
+        current_chars += item_chars
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _translate_one_with_retries(translator, text: str, retries: int = 2) -> str:
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            translated = translator.translate(text)
+            translated = (translated or text).strip()
+            return translated or text
+        except Exception as exc:
+            last_error = exc
+            print(f"Google Translate single retry {attempt + 1} failed: {exc}", flush=True)
+    # Do not fail the whole video because one caption line failed.
+    print(f"Google Translate single line failed permanently; keeping original. Error={last_error}", flush=True)
+    return text
+
+
+def _translate_batch_with_fallback(translator, batch: list[str]) -> list[str]:
+    batch = [(x or "").strip() for x in batch]
+    if not batch:
+        return []
+    if len(batch) == 1:
+        return [_translate_one_with_retries(translator, batch[0])]
+
+    # Try batch translation first. It is much faster and avoids hundreds of
+    # network calls for long SRT files.
+    try:
+        translated = translator.translate_batch(batch)
+        if isinstance(translated, list) and len(translated) == len(batch):
+            return [((x or original).strip() or original) for x, original in zip(translated, batch)]
+        print("Google Translate batch returned unexpected shape; splitting batch.", flush=True)
+    except Exception as exc:
+        print(f"Google Translate batch failed; splitting batch. size={len(batch)} error={exc}", flush=True)
+
+    # Binary split keeps progress even when a medium batch fails.
+    mid = len(batch) // 2
+    return _translate_batch_with_fallback(translator, batch[:mid]) + _translate_batch_with_fallback(translator, batch[mid:])
+
+
 def translate_texts_with_google(texts: list[str], source_language: str = "auto", target_language: str = "my") -> list[str]:
     try:
         from deep_translator import GoogleTranslator
     except Exception as exc:
         raise RuntimeError("deep-translator is not installed. Check requirements.txt and Railway deployment logs.") from exc
+
     source = normalize_translate_language(source_language, default="auto")
     target = normalize_translate_language(target_language, default="my")
     if target == "auto":
         raise ValueError("target_language cannot be auto")
     if source == target:
         return texts
+
+    # Configurable because Railway/free translation can be sensitive to request size.
+    max_items = int(os.environ.get("TRANSLATE_BATCH_ITEMS", "30") or "30")
+    max_chars = int(os.environ.get("TRANSLATE_BATCH_CHARS", "2800") or "2800")
+
     translator = GoogleTranslator(source=source, target=target)
-    translated_texts = []
-    cache = {}
+    translated_texts: list[str] = [""] * len(texts)
+    cache: dict[str, str] = {}
+
+    # Translate only unique non-empty strings, then map back to original positions.
+    unique_texts: list[str] = []
     for text in texts:
         clean_text = (text or "").strip()
-        if not clean_text:
-            translated_texts.append("")
-            continue
-        if clean_text in cache:
-            translated_texts.append(cache[clean_text])
-            continue
-        try:
-            translated = translator.translate(clean_text)
-        except Exception as exc:
-            raise RuntimeError(f"Google Translate failed: {exc}") from exc
-        translated = (translated or clean_text).strip()
-        cache[clean_text] = translated
-        translated_texts.append(translated)
-    return translated_texts
+        if clean_text and clean_text not in cache:
+            cache[clean_text] = ""  # placeholder
+            unique_texts.append(clean_text)
 
+    print(f"translate_srt: unique_segments={len(unique_texts)} batch_items={max_items} batch_chars={max_chars}", flush=True)
+
+    for batch_index, batch in enumerate(_batch_texts_for_google_translate(unique_texts, max_items=max_items, max_chars=max_chars), start=1):
+        print(f"translate_srt: translating batch {batch_index} size={len(batch)} chars={sum(len(x) for x in batch)}", flush=True)
+        translated_batch = _translate_batch_with_fallback(translator, batch)
+        for original, translated in zip(batch, translated_batch):
+            cache[original] = (translated or original).strip() or original
+
+    for i, text in enumerate(texts):
+        clean_text = (text or "").strip()
+        translated_texts[i] = cache.get(clean_text, "") if clean_text else ""
+
+    return translated_texts
 
 def translate_srt_text(srt_text: str, source_language: str = "auto", target_language: str = "my") -> tuple[str, dict]:
     blocks = parse_srt_blocks(srt_text)
@@ -2641,7 +2713,7 @@ def index():
         "ok": True,
         "service": "video-audio-tool",
         "caption_first": True,
-        "version": "v11-rewrite-options-compat-flat",
+        "version": "v12-robust-translation-batching",
         "endpoints": [
             "POST /download", "POST /extract-srt", "POST /extract-srt mode=downsub", "POST /extract-srt mode=subdown", "POST /debug-youtube-captions", "POST /translate-srt", "POST /process-upload",
             "POST /upload", "POST /extract-srt-upload", "POST /rewrite", "POST /rewrite-options", "POST /tts", "POST /final-srt",
