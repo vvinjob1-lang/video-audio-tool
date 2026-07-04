@@ -73,6 +73,29 @@ GENERATED_COOKIE_FILE = Path(os.getenv("YOUTUBE_COOKIES_GENERATED_FILE", "/tmp/y
 for directory in (DOWNLOAD_DIR, UPLOAD_DIR, SRT_DIR, AUDIO_DIR, TTS_DIR, SCRIPT_DIR):
     directory.mkdir(exist_ok=True)
 
+
+def get_public_base_url() -> str:
+    """Return a stable public HTTPS base URL for download links.
+
+    Railway/Flask may see the internal request as http and return http:// URLs.
+    Browser downloads from Lovable are more reliable when we return the public
+    HTTPS hostname explicitly. PUBLIC_BASE_URL can override this if the domain
+    changes.
+    """
+    configured = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    if configured:
+        return configured
+    host = request.headers.get("X-Forwarded-Host") or request.host
+    proto = request.headers.get("X-Forwarded-Proto") or request.scheme or "https"
+    if host.endswith(".up.railway.app"):
+        proto = "https"
+    return f"{proto}://{host}".rstrip("/")
+
+
+def build_public_url(path: str) -> str:
+    path = "/" + (path or "").lstrip("/")
+    return f"{get_public_base_url()}{path}"
+
 app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_MB", "250")) * 1024 * 1024
 
 ALLOWED_UPLOAD_EXTENSIONS = {
@@ -1380,7 +1403,7 @@ def get_innertube_caption_tracks(url: str, requested_language: str | None = None
     bootstrap = _fetch_youtube_watch_bootstrap(normalized_url)
     errors: list[str] = []
     debug = {
-        "version": "v13-artifacts-concise-rewrite-tts",
+        "version": "v14-quality-downloads-clean-translation",
         "bootstrap_ok": bool(bootstrap.get("ok")),
         "dynamic_innertube_api_key_found": bool(bootstrap.get("dynamic_innertube_api_key_found")),
         "dynamic_web_client_version_found": bool(bootstrap.get("dynamic_web_client_version_found")),
@@ -2191,6 +2214,64 @@ def normalize_translate_language(language: str | None, default: str = "my") -> s
     return language_map.get(language, language)
 
 
+BAD_TRANSLATION_PATTERNS = [
+    r"error\s*500", r"server error", r"that[’']?s an error", r"there was an error",
+    r"please try again later", r"that[’']?s all we know", r"\b1500\b",
+]
+BAD_TRANSLATION_RE = re.compile("|".join(BAD_TRANSLATION_PATTERNS), re.IGNORECASE)
+MYANMAR_RE = re.compile(r"[\u1000-\u109F]")
+LATIN_RE = re.compile(r"[A-Za-z]")
+
+
+def has_myanmar_text(text: str) -> bool:
+    return bool(MYANMAR_RE.search(text or ""))
+
+
+def is_service_error_text(text: str) -> bool:
+    return bool(BAD_TRANSLATION_RE.search(text or ""))
+
+
+def latin_ratio(text: str) -> float:
+    visible = [c for c in (text or "") if not c.isspace()]
+    if not visible:
+        return 0.0
+    return sum(1 for c in visible if LATIN_RE.match(c)) / max(1, len(visible))
+
+
+def sanitize_machine_text_line(text: str) -> str:
+    value = html.unescape((text or "").strip())
+    if not value:
+        return ""
+    if is_service_error_text(value):
+        return ""
+    value = re.sub(r"\bError\s*500\s*\(Server Error\)!*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"That[’']?s an error\.?|There was an error\.?|Please try again later\.?|That[’']?s all we know\.?", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+", " ", value).strip(" !.၊။")
+    return value
+
+
+def sanitize_translated_segment(original: str, translated: str, target_language: str = "my") -> tuple[str, bool, str]:
+    """Return clean translation, whether it was changed, and reason.
+
+    Google Translate occasionally returns Google error page text inside a
+    translated segment. That must never be passed to rewrite/TTS.
+    """
+    original = (original or "").strip()
+    translated = (translated or "").strip()
+    if not translated:
+        return original, True, "empty_translation"
+    if is_service_error_text(translated):
+        return original, True, "google_error_text_removed"
+    cleaned = sanitize_machine_text_line(translated)
+    if not cleaned:
+        return original, True, "sanitized_empty"
+    target = normalize_translate_language(target_language, default="my")
+    # If target is Myanmar but a full sentence remains almost entirely English,
+    # keep it for the AI rewrite stage to translate naturally, but mark it.
+    # Do not delete proper names; this is only metadata-quality signaling.
+    return cleaned, cleaned != translated, "sanitized" if cleaned != translated else "ok"
+
+
 def parse_srt_blocks(srt_text: str) -> list[dict]:
     text = (srt_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
@@ -2334,13 +2415,28 @@ def translate_srt_text(srt_text: str, source_language: str = "auto", target_lang
         raise ValueError("Missing or invalid SRT text")
     original_texts = [block["text"] for block in blocks]
     translated_texts = translate_texts_with_google(original_texts, source_language=source_language, target_language=target_language)
-    for block, translated_text in zip(blocks, translated_texts):
-        block["translated_text"] = translated_text
+    sanitized_count = 0
+    google_error_count = 0
+    untranslated_count = 0
+    target_norm = normalize_translate_language(target_language, default="my")
+    for block, original_text, translated_text in zip(blocks, original_texts, translated_texts):
+        clean_translated, changed, reason = sanitize_translated_segment(original_text, translated_text, target_norm)
+        if changed:
+            sanitized_count += 1
+        if reason == "google_error_text_removed":
+            google_error_count += 1
+        if target_norm == "my" and clean_translated and not has_myanmar_text(clean_translated) and latin_ratio(clean_translated) > 0.55:
+            untranslated_count += 1
+        block["translated_text"] = clean_translated
     meta = {
-        "engine": "google_translate",
+        "engine": "google_translate_with_sanitizer",
         "source_language": normalize_translate_language(source_language, default="auto"),
-        "target_language": normalize_translate_language(target_language, default="my"),
+        "target_language": target_norm,
         "segments": len(blocks),
+        "sanitized_segments": sanitized_count,
+        "google_error_segments_removed": google_error_count,
+        "possibly_untranslated_segments": untranslated_count,
+        "quality_warning": bool(google_error_count or untranslated_count),
     }
     return build_srt_from_blocks(blocks), meta
 
@@ -2351,6 +2447,8 @@ def clean_srt_to_text(srt_text: str) -> str:
     for raw_line in (srt_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         line = raw_line.strip()
         if not line:
+            continue
+        if is_service_error_text(line):
             continue
         if line.upper() == "WEBVTT" or line.upper().startswith(("NOTE", "STYLE", "REGION")):
             continue
@@ -2455,6 +2553,9 @@ CRITICAL RULES:
 - Keep only the important plot events, character motivations, cause/effect, and story order.
 - Preserve proper names such as Eternia, Eternos, Castle Grayskull, Sword of Power, and character names.
 - Fix literal Google Translate style into smooth Myanmar prose.
+- If any English remains in the input, translate it naturally into Myanmar before rewriting.
+- Keep English only for proper names such as Ki-Taek, Ki-Woo, Park, Moon-Gwang, Da-Song, Seoul, NASA, etc.
+- Completely remove any machine/service error text such as Error 500, Server Error, That is an error, Please try again later.
 - Keep the meaning, but rewrite the wording so it sounds written by a human narrator.
 - Use normal Myanmar paragraphs and spoken sentence rhythm.
 - Remove SRT numbers, timestamps, arrows, WEBVTT headers, duplicates, and broken subtitle fragments.
@@ -2591,6 +2692,12 @@ def validate_ai_rewrite(rewritten: str, input_text: str, style: str = "natural_a
     leaked_phrases = ["we need to", "must ", "should ", "preserve names", "return only", "the segment", "input subtitle text"]
     if any(x in lower for x in leaked_phrases):
         return False, "instruction_leakage"
+    if is_service_error_text(rewritten_clean):
+        return False, "service_error_text_leakage"
+    # Myanmar TTS scripts should not be mostly English, except for names.
+    if normalize_rewrite_style(style) in {"natural_accurate", "emotional_tts", "movie_recap", "concise_summary"}:
+        if len(rewritten_clean) > 500 and latin_ratio(rewritten_clean) > float(os.getenv("REWRITE_MAX_LATIN_RATIO", "0.18")):
+            return False, f"too_much_english:{latin_ratio(rewritten_clean):.2f}"
     # If output is basically one tiny fragment for a long input, reject it.
     if len(input_text or "") > 3000 and len(re.split(r"[။.!?]\s+|\n+", rewritten_clean)) < 6:
         return False, "too_few_sentences_for_long_input"
@@ -2648,30 +2755,47 @@ def call_openrouter_rewrite(model: str, prompt: str, style: str) -> tuple[str, d
 
 
 
-def local_concise_summary_fallback(text: str, target_ratio: float = 0.28) -> str:
-    """Deterministic emergency fallback: shorter spoken text, not AI-quality summary."""
+def local_concise_summary_fallback(text: str, target_ratio: float = 0.22) -> str:
+    """Deterministic emergency fallback.
+
+    This is intentionally shorter and safer than the old cleanup fallback. It
+    removes service-error text and avoids carrying long subtitle-style output
+    into TTS. It is still not AI-quality; metadata marks it as not TTS-safe.
+    """
     cleaned = local_rewrite_for_tts(text)
     if not cleaned:
         return ""
-    sentences = [s.strip() for s in re.split(r"(?<=[။.!?])\s+|\n+", cleaned) if s.strip()]
+    raw_sentences = [s.strip() for s in re.split(r"(?<=[။.!?])\s+|\n+", cleaned) if s.strip()]
+    sentences = []
+    for sent in raw_sentences:
+        sent = sanitize_machine_text_line(sent)
+        if not sent:
+            continue
+        # Drop mostly-English error/untranslated fragments in fallback mode.
+        if len(sent) > 40 and not has_myanmar_text(sent) and latin_ratio(sent) > 0.55:
+            continue
+        if is_service_error_text(sent):
+            continue
+        sentences.append(sent)
     if not sentences:
-        return cleaned
-    target_chars = max(1500, min(12000, int(len(cleaned) * target_ratio)))
-    selected = []
-    total = 0
-    # Keep a stable story arc: beginning + spaced middle + ending.
-    if len(sentences) <= 12:
+        return ""
+    target_chars = max(900, min(6500, int(len(cleaned) * target_ratio)))
+    selected: list[str] = []
+    if len(sentences) <= 14:
         selected = sentences
     else:
-        selected.extend(sentences[:4])
-        remaining = sentences[4:-3]
-        step = max(1, len(remaining) // 18)
-        selected.extend(remaining[::step])
+        # Keep beginning, major middle beats, and ending.
+        selected.extend(sentences[:3])
+        middle = sentences[3:-3]
+        desired_middle = max(8, min(22, int(len(middle) * 0.22)))
+        step = max(1, len(middle) // desired_middle) if middle else 1
+        selected.extend(middle[::step])
         selected.extend(sentences[-3:])
     out = []
     seen = set()
+    total = 0
     for sent in selected:
-        key = sent[:80].casefold()
+        key = re.sub(r"\s+", " ", sent[:90]).casefold()
         if key in seen:
             continue
         seen.add(key)
@@ -2688,10 +2812,14 @@ def rewrite_with_openrouter(text: str, language: str = "my", style: str = "natur
 
     api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not api_key:
-        return local_rewrite_for_tts(cleaned, language, style), "local_tts_cleanup", {
+        fallback = local_concise_summary_fallback(cleaned, target_length_ratio or 0.22)
+        return fallback, "local_sanitized_summary_fallback", {
             "ai_rewrite_configured": False,
-            "rewrite_quality": "cleanup_only",
-            "message": "OPENROUTER_API_KEY is not configured, so this is cleanup only, not a true rewrite.",
+            "rewrite_quality": "needs_openrouter_key_sanitized_fallback",
+            "tts_safe": False,
+            "input_chars": len(cleaned),
+            "output_chars": len(fallback),
+            "message": "OPENROUTER_API_KEY is not configured. This is a shortened sanitized preview only, not a true AI rewrite.",
         }
 
     style_norm = normalize_rewrite_style(style)
@@ -2700,7 +2828,10 @@ def rewrite_with_openrouter(text: str, language: str = "my", style: str = "natur
     models = get_openrouter_model_candidates()
     chunks = split_text_for_ai_rewrite(cleaned)
     attempts: list[dict] = []
-    fallback_text = local_concise_summary_fallback(cleaned, target_length_ratio or 0.28) if style_norm == "concise_summary" else local_rewrite_for_tts(cleaned, language, style)
+    # Never use a full subtitle cleanup as fallback for TTS; it creates long,
+    # robotic Google-Translate-like audio. Use concise sanitized fallback and
+    # mark it as not AI-rewritten.
+    fallback_text = local_concise_summary_fallback(cleaned, target_length_ratio or 0.22)
 
     # For long scripts, chunking avoids one-sentence summaries and output truncation.
     for model in models:
@@ -2743,16 +2874,17 @@ def rewrite_with_openrouter(text: str, language: str = "my", style: str = "natur
             print(f"OpenRouter rewrite failed model={model} style={style_norm}: {exc}", flush=True)
             continue
 
-    return fallback_text, "local_tts_cleanup", {
+    return fallback_text, "local_sanitized_summary_fallback", {
         "ai_rewrite_configured": True,
-        "rewrite_quality": "cleanup_only_after_ai_unusable",
+        "rewrite_quality": "needs_ai_retry_sanitized_fallback",
+        "tts_safe": False,
         "model": models[0] if models else os.getenv("OPENROUTER_MODEL", ""),
         "models_tried": models[:5],
         "style": style_norm,
         "input_chars": len(cleaned),
         "output_chars": len(fallback_text),
         "attempts": attempts[-5:],
-        "message": "AI rewrite was unavailable, too short, or failed validation; returned cleanup only.",
+        "message": "AI rewrite was unavailable or failed validation. Returned a shortened sanitized fallback for preview only; retry AI before final TTS.",
     }
 
 def save_srt_response(srt_text: str, base_name: str = "captions") -> tuple[str, str]:
@@ -2760,8 +2892,7 @@ def save_srt_response(srt_text: str, base_name: str = "captions") -> tuple[str, 
     filename = f"{Path(safe_base).stem}_{uuid.uuid4().hex[:8]}.srt"
     path = SRT_DIR / filename
     path.write_text(srt_text, encoding="utf-8")
-    base_url = request.host_url.rstrip("/")
-    return filename, f"{base_url}/srt/{filename}"
+    return filename, build_public_url(f"/srt/{filename}")
 
 
 def save_text_response(text: str, base_name: str = "script") -> tuple[str, str]:
@@ -2769,23 +2900,74 @@ def save_text_response(text: str, base_name: str = "script") -> tuple[str, str]:
     filename = f"{Path(safe_base).stem}_{uuid.uuid4().hex[:8]}.txt"
     path = SCRIPT_DIR / filename
     path.write_text(text or "", encoding="utf-8")
-    base_url = request.host_url.rstrip("/")
-    return filename, f"{base_url}/script/{filename}"
+    return filename, build_public_url(f"/script/{filename}")
 
 
-def build_final_srt_from_script(script: str, seconds_per_line: float = 3.5) -> str:
+def get_audio_duration_seconds(path: Path) -> float | None:
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if result.returncode == 0:
+            duration = float((result.stdout or "").strip())
+            if duration > 0:
+                return duration
+    except Exception as exc:
+        print(f"ffprobe duration failed: {exc}", flush=True)
+    return None
+
+
+def split_script_into_srt_cues(script: str) -> list[str]:
     text = local_rewrite_for_tts(script)
     if not text:
+        return []
+    pieces = [p.strip() for p in re.split(r"(?<=[။.!?])\s+|\n+", text) if p.strip()]
+    cues: list[str] = []
+    for piece in pieces:
+        piece = sanitize_machine_text_line(piece)
+        if not piece:
+            continue
+        # Split very long sentences into readable cue lengths.
+        if len(piece) <= 95:
+            cues.append(piece)
+            continue
+        words = piece.split()
+        current = ""
+        for word in words:
+            if current and len(current) + 1 + len(word) > 85:
+                cues.append(current.strip())
+                current = word
+            else:
+                current = f"{current} {word}".strip()
+        if current:
+            cues.append(current.strip())
+    return cues
+
+
+def build_final_srt_from_script(script: str, seconds_per_line: float = 3.5, total_duration: float | None = None) -> str:
+    lines = split_script_into_srt_cues(script)
+    if not lines:
         return ""
-    # Split Myanmar and Western punctuation into readable subtitle cues.
-    pieces = re.split(r"(?<=[။.!?])\s+|\n+", text)
-    lines = [p.strip() for p in pieces if p.strip()]
+    weights = [max(18, len(line)) for line in lines]
+    total_weight = sum(weights) or len(lines)
+    if not total_duration or total_duration <= 0:
+        durations = [max(2.0, min(7.0, len(line) / 18.0)) for line in lines]
+    else:
+        # Spread cues across the actual generated audio duration so the final
+        # SRT ends exactly with the MP3. Enforce readable min/max then normalize.
+        raw = [total_duration * (w / total_weight) for w in weights]
+        durations = [max(1.4, min(8.0, x)) for x in raw]
+        scale = total_duration / max(0.001, sum(durations))
+        durations = [d * scale for d in durations]
     blocks = []
     start = 0.0
-    for idx, line in enumerate(lines, start=1):
-        # Approximate timing before/without forced alignment.
-        duration = max(2.0, min(7.0, len(line) / 18.0)) if line else seconds_per_line
+    for idx, (line, duration) in enumerate(zip(lines, durations), start=1):
         end = start + duration
+        if idx == len(lines) and total_duration and total_duration > 0:
+            end = total_duration
         blocks.append(f"{idx}\n{srt_timestamp(start)} --> {srt_timestamp(end)}\n{line}\n")
         start = end
     return "\n".join(blocks).strip() + "\n" if blocks else ""
@@ -2799,7 +2981,7 @@ def index():
         "ok": True,
         "service": "video-audio-tool",
         "caption_first": True,
-        "version": "v13-artifacts-concise-rewrite-tts",
+        "version": "v14-quality-downloads-clean-translation",
         "endpoints": [
             "POST /download", "POST /extract-srt", "POST /extract-srt mode=downsub", "POST /extract-srt mode=subdown", "POST /debug-youtube-captions", "POST /translate-srt", "POST /process-upload",
             "POST /upload", "POST /extract-srt-upload", "POST /rewrite", "POST /rewrite-options", "POST /tts", "POST /final-srt",
@@ -3038,7 +3220,7 @@ def translate_srt():
         target_code = translation_meta["target_language"].replace("-", "_")
         translated_filename = f"translated_{target_code}_{uuid.uuid4().hex[:8]}.srt"
         (SRT_DIR / translated_filename).write_text(translated_srt_text, encoding="utf-8")
-        base_url = request.host_url.rstrip("/")
+        base_url = get_public_base_url()
         return jsonify({
             "ok": True,
             "success": True,
@@ -3069,7 +3251,7 @@ def extract_srt_upload():
     try:
         uploaded_srt = request.files.get("srt_file") or request.files.get("srt") or request.files.get("subtitle")
         srt_text, srt_source_filename = read_uploaded_srt(uploaded_srt)
-        base_url = request.host_url.rstrip("/")
+        base_url = get_public_base_url()
         if srt_text:
             srt_filename, srt_url = save_srt_response(srt_text, Path(srt_source_filename or "manual_srt").stem)
             return jsonify({
@@ -3111,7 +3293,7 @@ def process_upload():
         language = request.form.get("language") or request.values.get("language") or "auto"
         target_language = request.form.get("target_language") or request.values.get("target_language") or ""
         source_language = request.form.get("source_language") or request.values.get("source_language") or "auto"
-        base_url = request.host_url.rstrip("/")
+        base_url = get_public_base_url()
         srt_text, srt_source_filename = read_uploaded_srt(uploaded_srt)
         response_payload = {}
         if srt_text:
@@ -3261,6 +3443,8 @@ def rewrite_options():
                     "source": natural_source,
                     "rewrite": natural_meta,
                     "quality": natural_meta.get("rewrite_quality"),
+                    "tts_safe": bool(natural_meta.get("tts_safe", natural_meta.get("rewrite_quality") == "ai_rewrite")),
+                    "needs_retry": natural_meta.get("rewrite_quality") != "ai_rewrite",
                 },
                 {
                     "id": "emotional_tts",
@@ -3273,6 +3457,8 @@ def rewrite_options():
                     "source": emotional_source,
                     "rewrite": emotional_meta,
                     "quality": emotional_meta.get("rewrite_quality"),
+                    "tts_safe": bool(emotional_meta.get("tts_safe", emotional_meta.get("rewrite_quality") == "ai_rewrite")),
+                    "needs_retry": emotional_meta.get("rewrite_quality") != "ai_rewrite",
                 },
             ],
             "rewrites": {
@@ -3361,16 +3547,19 @@ def tts():
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise RuntimeError("TTS audio file was not created")
         final_script_filename, final_script_url = save_text_response(text, "final_script")
-        final_srt_text = build_final_srt_from_script(text)
+        audio_duration_seconds = get_audio_duration_seconds(output_path)
+        final_srt_text = build_final_srt_from_script(text, total_duration=audio_duration_seconds)
         final_srt_filename = f"final_tts_{uuid.uuid4().hex[:8]}.srt"
         (SRT_DIR / final_srt_filename).write_text(final_srt_text, encoding="utf-8")
-        base_url = request.host_url.rstrip("/")
+        base_url = get_public_base_url()
         return jsonify({
             "ok": True,
             "success": True,
             "audio_url": f"{base_url}/tts/{output_filename}",
             "tts_audio_url": f"{base_url}/tts/{output_filename}",
             "audio_filename": output_filename,
+            "download_url": f"{base_url}/tts/{output_filename}",
+            "audio_duration_seconds": audio_duration_seconds,
             "voice": voice,
             "engine": "edge_tts",
             "style": normalize_rewrite_style(style),
@@ -3397,7 +3586,12 @@ def final_srt():
         script = payload.get("script") or payload.get("text") or payload.get("rewrittenScript") or ""
         if not script.strip():
             return json_error("Missing script/text", 400)
-        final_srt_text = build_final_srt_from_script(script)
+        duration = payload.get("duration_seconds") or payload.get("audio_duration_seconds")
+        try:
+            duration = float(duration) if duration is not None else None
+        except Exception:
+            duration = None
+        final_srt_text = build_final_srt_from_script(script, total_duration=duration)
         filename, url = save_srt_response(final_srt_text, "final_srt")
         return jsonify({"ok": True, "success": True, "final_srt_text": final_srt_text, "final_srt_url": url, "filename": filename})
     except Exception as exc:
