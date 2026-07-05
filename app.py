@@ -1,513 +1,2862 @@
 import asyncio
+import base64
+import html
 import json
-import math
 import os
 import re
-import shutil
 import subprocess
 import tempfile
-import time
 import uuid
-from datetime import datetime
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 import requests
-from flask import Flask, jsonify, request, send_file
+import yt_dlp
+from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
-APP_VERSION = "v16-iamhc-qwen-rewrite-quality"
-
-BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-DOWNLOAD_DIR = BASE_DIR / "downloads"
-SRT_DIR = BASE_DIR / "srt"
-SCRIPT_DIR = BASE_DIR / "scripts"
-for folder in (UPLOAD_DIR, DOWNLOAD_DIR, SRT_DIR, SCRIPT_DIR):
-    folder.mkdir(parents=True, exist_ok=True)
-
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://video-audio-tool-production.up.railway.app").rstrip("/")
-
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_MB", "500")) * 1024 * 1024
-
+# Lovable previews may run on http://id-preview--*.lovable.app (browser shows "Not secure")
+# as well as https://*.lovable.app.  The previous CORS list allowed only HTTPS
+# Lovable origins, so browser fetches to /rewrite-options could fail even while curl
+# worked from Railway. Keep this permissive for app/API endpoints only.
 CORS(
     app,
     resources={r"/*": {"origins": "*"}},
     methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
+    expose_headers=["Content-Type", "Content-Disposition"],
+    supports_credentials=False,
+    max_age=86400,
 )
 
-
-# -----------------------------
-# Generic helpers
-# -----------------------------
-
-def now_stamp() -> str:
-    return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-
-
-def uid(n: int = 8) -> str:
-    return uuid.uuid4().hex[:n]
-
-
-def env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def public_url(prefix: str, filename: str, download_name: Optional[str] = None) -> str:
-    url = f"{PUBLIC_BASE_URL}/{prefix.strip('/')}/{filename}"
-    if download_name:
-        url += f"?download_name={requests.utils.quote(download_name)}"
-    return url
-
-
-def json_error(message: str, status: int = 400, **extra):
-    payload = {"success": False, "ok": False, "error": message, **extra}
-    return jsonify(payload), status
-
-
-def safe_name(name: str, fallback_ext: str = "") -> str:
-    name = secure_filename(name or "")
-    if not name:
-        name = f"file_{uid()}{fallback_ext}"
-    return name
-
-
-def write_text_file(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text or "", encoding="utf-8")
-
-
-def run_cmd(cmd: List[str], timeout: int = 240) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
-
-
-def ffmpeg_exists() -> bool:
-    return shutil.which("ffmpeg") is not None
-
-
-def ffprobe_exists() -> bool:
-    return shutil.which("ffprobe") is not None
-
-
-def audio_duration_seconds(path: Path) -> Optional[float]:
-    if not ffprobe_exists() or not path.exists():
-        return None
-    try:
-        cp = run_cmd([
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", str(path)
-        ], timeout=30)
-        if cp.returncode == 0:
-            val = float(cp.stdout.strip())
-            if val > 0:
-                return val
-    except Exception:
-        return None
-    return None
-
-
-# -----------------------------
-# Subtitle parsing / cleaning
-# -----------------------------
-
-TIMESTAMP_RE = re.compile(
-    r"^\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}.*$"
+_ALLOWED_ORIGIN_RE = re.compile(
+    r"^https?://("
+    r"localhost(:\d+)?|127\.0\.0\.1(:\d+)?|"
+    r".*\.lovable\.app|.*\.lovableproject\.com|.*\.lovable\.dev"
+    r")$",
+    re.IGNORECASE,
 )
-INDEX_RE = re.compile(r"^\s*\d+\s*$")
-BAD_TEXT_PATTERNS = [
-    "Error 500", "Server Error", "That’s an error", "That's an error", "Please try again later",
-    "We need to", "Let's tackle", "Return only", "Input subtitle text", "Preserve names",
-    "The segment", "Possible translation", "In Myanmar", "Do not include", "reasoning_content",
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get("Origin", "")
+    if origin and _ALLOWED_ORIGIN_RE.match(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+    elif not origin:
+        response.headers.setdefault("Access-Control-Allow-Origin", "*")
+    response.headers.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    response.headers.setdefault("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+    response.headers.setdefault("Access-Control-Expose-Headers", "Content-Type, Content-Disposition")
+    response.headers.setdefault("Access-Control-Max-Age", "86400")
+    return response
+
+@app.before_request
+def handle_preflight_requests():
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DOWNLOAD_DIR = BASE_DIR / "downloads"
+UPLOAD_DIR = BASE_DIR / "uploads"
+SRT_DIR = BASE_DIR / "srt"
+AUDIO_DIR = BASE_DIR / "audio"
+TTS_DIR = BASE_DIR / "tts"
+SCRIPT_DIR = BASE_DIR / "scripts"
+COOKIE_FILE = BASE_DIR / "cookies.txt"
+GENERATED_COOKIE_FILE = Path(os.getenv("YOUTUBE_COOKIES_GENERATED_FILE", "/tmp/youtube_cookies.txt"))
+for directory in (DOWNLOAD_DIR, UPLOAD_DIR, SRT_DIR, AUDIO_DIR, TTS_DIR, SCRIPT_DIR):
+    directory.mkdir(exist_ok=True)
+
+
+def get_public_base_url() -> str:
+    """Return a stable public HTTPS base URL for download links.
+
+    Railway/Flask may see the internal request as http and return http:// URLs.
+    Browser downloads from Lovable are more reliable when we return the public
+    HTTPS hostname explicitly. PUBLIC_BASE_URL can override this if the domain
+    changes.
+    """
+    configured = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    if configured:
+        return configured
+    host = request.headers.get("X-Forwarded-Host") or request.host
+    proto = request.headers.get("X-Forwarded-Proto") or request.scheme or "https"
+    if host.endswith(".up.railway.app"):
+        proto = "https"
+    return f"{proto}://{host}".rstrip("/")
+
+
+def build_public_url(path: str) -> str:
+    path = "/" + (path or "").lstrip("/")
+    return f"{get_public_base_url()}{path}"
+
+
+def safe_download_name(requested_name: str | None, fallback_name: str, expected_ext: str | None = None) -> str:
+    """Return a browser-safe filename for Content-Disposition."""
+    raw = (requested_name or fallback_name or "download").strip()
+    raw = Path(raw).name
+    raw = secure_filename(raw) or secure_filename(fallback_name or "download") or "download"
+    if expected_ext:
+        ext = expected_ext if expected_ext.startswith(".") else f".{expected_ext}"
+        if not raw.lower().endswith(ext.lower()):
+            raw = f"{Path(raw).stem}{ext}"
+    return raw
+
+
+def add_download_name(url: str, download_name: str | None) -> str:
+    """Append ?download_name=... so cross-origin downloads keep friendly names."""
+    if not url or not download_name:
+        return url
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["download_name"] = download_name
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def requested_download_name(fallback_name: str, expected_ext: str | None = None) -> str:
+    return safe_download_name(
+        request.args.get("download_name") or request.args.get("name") or request.args.get("filename"),
+        fallback_name,
+        expected_ext,
+    )
+
+
+def tts_pause_friendly_text(text: str) -> str:
+    """Add light Myanmar sentence endings to improve Edge-TTS pauses."""
+    cleaned = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    out: list[str] = []
+    for raw_line in cleaned.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        line = re.sub(r"\s*၊\s*", "၊ ", line)
+        line = re.sub(r"\s*([!?])\s*", r"\1 ", line).strip()
+        if len(line) >= 18 and not END_PUNCT_RE.search(line):
+            line = f"{line}။"
+        out.append(line)
+    return "\n".join(out).strip()
+
+app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_MB", "250")) * 1024 * 1024
+
+ALLOWED_UPLOAD_EXTENSIONS = {
+    "mp4", "mov", "m4v", "mkv", "webm", "avi",
+    "mp3", "m4a", "wav", "aac", "ogg", "flac",
+}
+ALLOWED_SRT_EXTENSIONS = {"srt", "vtt", "txt"}
+OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+IAMHC_DEFAULT_BASE_URL = "https://api.iamhc.cn/v1"
+APP_VERSION = "v16.1-v14-srt-restore-iamhc-qwen"
+SRT_TIMESTAMP_RE = re.compile(
+    r"^\s*(?:\d{2}:)?\d{2}:\d{2}[,.]\d{3}\s*-->\s*(?:\d{2}:)?\d{2}:\d{2}[,.]\d{3}.*$"
+)
+END_PUNCT_RE = re.compile(r"[။.!?…]$")
+YOUTUBE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9,my;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    # Helps avoid the consent interstitial on fresh datacenter sessions.
+    "Cookie": os.getenv("YOUTUBE_CAPTION_COOKIE_HEADER", "CONSENT=YES+cb"),
+}
+
+YOUTUBE_INNERTUBE_DEFAULT_API_KEY = os.getenv(
+    "YOUTUBE_INNERTUBE_API_KEY",
+    # Public web client key. Can be overridden from Railway Variables if YouTube changes it.
+    "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+)
+
+YOUTUBE_INNERTUBE_CLIENTS = [
+    {
+        "label": "WEB",
+        "clientName": "WEB",
+        "clientVersion": os.getenv("YOUTUBE_WEB_CLIENT_VERSION", "2.20240726.00.00"),
+        "hl": "en",
+        "gl": "US",
+    },
+    {
+        "label": "MWEB",
+        "clientName": "MWEB",
+        "clientVersion": os.getenv("YOUTUBE_MWEB_CLIENT_VERSION", "2.20240726.00.00"),
+        "hl": "en",
+        "gl": "US",
+    },
+    {
+        "label": "WEB_EMBEDDED_PLAYER",
+        "clientName": "WEB_EMBEDDED_PLAYER",
+        "clientVersion": os.getenv("YOUTUBE_WEB_EMBEDDED_CLIENT_VERSION", "1.20240723.01.00"),
+        "hl": "en",
+        "gl": "US",
+        "thirdParty": {"embedUrl": "https://www.youtube.com/"},
+    },
 ]
 
 
-def is_timestamp_line(line: str) -> bool:
-    return bool(TIMESTAMP_RE.match(line or ""))
+class YTDLPLogger:
+    def debug(self, msg):
+        pass
+
+    def warning(self, msg):
+        print(f"yt-dlp warning: {msg}", flush=True)
+
+    def error(self, msg):
+        print(f"yt-dlp error: {msg}", flush=True)
 
 
-def normalize_timestamp(ts: str) -> str:
-    ts = ts.strip().replace(".", ",")
-    # Ensure milliseconds have three digits.
-    if "," in ts:
-        head, ms = ts.split(",", 1)
-        ts = f"{head},{ms[:3].ljust(3, '0')}"
-    return ts
+def json_error(message: str, status_code: int = 500, **extra):
+    payload = {"ok": False, "success": False, "error": message}
+    payload.update(extra)
+    return jsonify(payload), status_code
 
 
-def seconds_to_srt_time(seconds: float) -> str:
-    seconds = max(0.0, float(seconds))
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    ms = int(round((seconds - int(seconds)) * 1000))
-    if ms >= 1000:
-        s += 1
-        ms -= 1000
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+def allowed_upload_filename(filename: str) -> bool:
+    return bool(filename and "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_UPLOAD_EXTENSIONS)
 
 
-def srt_time_to_seconds(ts: str) -> float:
-    ts = normalize_timestamp(ts)
-    hms, ms = ts.split(",", 1)
-    h, m, s = [int(x) for x in hms.split(":")]
-    return h * 3600 + m * 60 + s + int(ms) / 1000.0
+def allowed_srt_filename(filename: str) -> bool:
+    return bool(filename and "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_SRT_EXTENSIONS)
 
 
-def parse_srt_blocks(text: str) -> List[Dict[str, str]]:
-    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"^WEBVTT.*?(\n\n|$)", "", text, flags=re.I | re.S).strip()
-    raw_blocks = re.split(r"\n\s*\n", text)
-    blocks: List[Dict[str, str]] = []
-    for raw in raw_blocks:
-        lines = [ln.strip("\ufeff ") for ln in raw.split("\n") if ln.strip()]
-        if not lines:
+def save_uploaded_media(file_storage) -> Path:
+    if not file_storage or not getattr(file_storage, "filename", ""):
+        raise ValueError("Missing uploaded file")
+    filename = secure_filename(file_storage.filename)
+    if not allowed_upload_filename(filename):
+        raise ValueError("Unsupported file type. Upload MP4, MOV, MKV, WEBM, MP3, M4A, WAV, AAC, OGG, or FLAC.")
+    ext = filename.rsplit(".", 1)[1].lower()
+    upload_path = UPLOAD_DIR / f"{Path(filename).stem}_{uuid.uuid4().hex[:8]}.{ext}"
+    file_storage.save(upload_path)
+    if not upload_path.exists() or upload_path.stat().st_size == 0:
+        raise RuntimeError("Uploaded file was empty or could not be saved")
+    return upload_path
+
+
+def read_uploaded_srt(file_storage) -> tuple[str | None, str | None]:
+    if not file_storage or not getattr(file_storage, "filename", ""):
+        return None, None
+    filename = secure_filename(file_storage.filename)
+    if not allowed_srt_filename(filename):
+        raise ValueError("Unsupported subtitle file. Upload .srt, .vtt, or .txt.")
+    raw = file_storage.read()
+    text = raw.decode("utf-8", errors="replace")
+    lower_name = filename.lower()
+    if lower_name.endswith(".vtt"):
+        text = vtt_to_srt_text(text)
+    if "-->" not in text and lower_name.endswith(".txt"):
+        text = text_to_basic_srt(text)
+    if not text.strip():
+        raise ValueError("Uploaded subtitle file is empty")
+    return text, filename
+
+
+def text_to_basic_srt(text: str) -> str:
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    blocks = []
+    start = 0.0
+    for idx, line in enumerate(lines, start=1):
+        end = start + 3.0
+        blocks.append(f"{idx}\n{srt_timestamp(start)} --> {srt_timestamp(end)}\n{line}\n")
+        start = end
+    return "\n".join(blocks).strip() + "\n" if blocks else ""
+
+
+def normalize_youtube_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        raise ValueError("URL is required")
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().replace("www.", "")
+    path = parsed.path.strip("/")
+    video_id = None
+    if host in {"youtube.com", "m.youtube.com", "music.youtube.com", "youtube-nocookie.com"} and path.startswith("shorts/"):
+        video_id = path.split("/")[1]
+    elif host == "youtu.be" and path:
+        video_id = path.split("/")[0]
+    elif host in {"youtube.com", "m.youtube.com", "music.youtube.com", "youtube-nocookie.com"} and (path.startswith("embed/") or path.startswith("live/")):
+        video_id = path.split("/")[1]
+    elif host in {"youtube.com", "m.youtube.com", "music.youtube.com", "youtube-nocookie.com"}:
+        video_id = parse_qs(parsed.query).get("v", [None])[0]
+    if video_id:
+        video_id = re.sub(r"[^0-9A-Za-z_-]", "", video_id)
+        if not video_id:
+            raise ValueError("Invalid YouTube video id")
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return url
+
+
+def get_youtube_video_id(url: str) -> str | None:
+    try:
+        normalized = normalize_youtube_url(url)
+        parsed = urlparse(normalized)
+        return parse_qs(parsed.query).get("v", [None])[0]
+    except Exception:
+        return None
+
+
+def is_youtube_url(url: str) -> bool:
+    try:
+        parsed = urlparse((url or "").strip())
+        host = (parsed.netloc or "").lower().replace("www.", "")
+        return host in {"youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "youtube-nocookie.com"}
+    except Exception:
+        return False
+
+
+def get_cookie_file() -> Path | None:
+    cookie_b64 = os.getenv("YOUTUBE_COOKIES_B64") or os.getenv("YOUTUBE_COOKIES_BASE64")
+    cookie_text = os.getenv("YOUTUBE_COOKIES_TXT")
+    try:
+        if cookie_b64:
+            GENERATED_COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            decoded = base64.b64decode(cookie_b64).decode("utf-8", errors="replace")
+            GENERATED_COOKIE_FILE.write_text(decoded, encoding="utf-8")
+            GENERATED_COOKIE_FILE.chmod(0o600)
+            if GENERATED_COOKIE_FILE.stat().st_size > 0:
+                return GENERATED_COOKIE_FILE
+        if cookie_text:
+            GENERATED_COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            GENERATED_COOKIE_FILE.write_text(cookie_text, encoding="utf-8")
+            GENERATED_COOKIE_FILE.chmod(0o600)
+            if GENERATED_COOKIE_FILE.stat().st_size > 0:
+                return GENERATED_COOKIE_FILE
+    except Exception as exc:
+        print(f"cookie setup warning: {exc}", flush=True)
+    if COOKIE_FILE.exists() and COOKIE_FILE.stat().st_size > 0:
+        return COOKIE_FILE
+    return None
+
+
+
+
+_YOUTUBE_COOKIE_HEADER_CACHE: str | None = None
+
+
+def _parse_netscape_cookie_file_to_header(cookie_path: Path | None) -> str:
+    """Convert a Netscape cookies.txt file into a Cookie header for direct YouTube caption requests."""
+    if not cookie_path or not cookie_path.exists() or cookie_path.stat().st_size <= 0:
+        return ""
+    pairs: list[str] = []
+    seen: set[str] = set()
+    try:
+        for raw_line in cookie_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = (raw_line or "").strip()
+            if not line:
+                continue
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            elif line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                domain, _flag, _path, _secure, _expires, name, value = parts[:7]
+                domain_low = (domain or "").lower()
+                if "youtube.com" not in domain_low and "google.com" not in domain_low:
+                    continue
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                pairs.append(f"{name}={value}")
+            elif "=" in line and ";" in line:
+                # Accept an already-built Cookie header if the env/file contains one.
+                for chunk in line.split(";"):
+                    chunk = chunk.strip()
+                    if not chunk or "=" not in chunk:
+                        continue
+                    name, value = chunk.split("=", 1)
+                    if name and name not in seen:
+                        seen.add(name)
+                        pairs.append(f"{name}={value}")
+    except Exception as exc:
+        print(f"cookie header parse warning: {exc}", flush=True)
+    return "; ".join(pairs)
+
+
+def get_youtube_cookie_header() -> str:
+    """Prefer explicit Cookie header env, then parse cookies.txt, then use consent-only fallback."""
+    global _YOUTUBE_COOKIE_HEADER_CACHE
+    explicit = (os.getenv("YOUTUBE_CAPTION_COOKIE_HEADER") or "").strip()
+    if explicit:
+        return explicit
+    if _YOUTUBE_COOKIE_HEADER_CACHE is not None:
+        return _YOUTUBE_COOKIE_HEADER_CACHE
+    parsed = _parse_netscape_cookie_file_to_header(get_cookie_file())
+    _YOUTUBE_COOKIE_HEADER_CACHE = parsed
+    return parsed
+
+
+def build_youtube_request_headers(json_payload: bool = False) -> dict:
+    headers = dict(YOUTUBE_HEADERS)
+    cookie_header = get_youtube_cookie_header()
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    elif not headers.get("Cookie"):
+        headers["Cookie"] = "CONSENT=YES+cb"
+    if json_payload:
+        headers.update({
+            "Content-Type": "application/json",
+            "Origin": "https://www.youtube.com",
+            "Referer": "https://www.youtube.com/",
+        })
+    return headers
+
+
+def friendly_youtube_error(error: Exception) -> tuple[str, int, dict]:
+    message = str(error)
+    lowered = message.lower()
+    extra = {
+        "needs_upload": True,
+        "fallback_message": "Upload an SRT/VTT file, or use the Upload tab with content you have rights to process.",
+        "fallback_options": ["Upload .srt/.vtt", "Upload video/audio", "Try another video with public captions"],
+    }
+    if "drm" in lowered or "drm protected" in lowered:
+        extra.update({"drm_protected": True, "bypass_supported": False, "audio_available": False, "subtitle_only_possible": True})
+        return (
+            "This YouTube video is DRM protected for media download. This app cannot bypass DRM. "
+            "If public captions exist, the SRT-first flow can still use them; otherwise use manual SRT/upload fallback.",
+            451,
+            extra,
+        )
+    if "sign in to confirm" in lowered or "not a bot" in lowered or "use --cookies" in lowered or "cookies" in lowered:
+        return ("YouTube is rejecting Railway/datacenter access for this request. Upload/manual SRT fallback may be required.", 403, extra)
+    if "requested format is not available" in lowered or "only images are available" in lowered or "no video formats" in lowered:
+        return ("YouTube did not expose a downloadable audio/video format from Railway. Captions may still work if public.", 502, extra)
+    if "video unavailable" in lowered:
+        return ("This YouTube video is unavailable from the backend. It may be private, region-restricted, deleted, or blocked.", 404, extra)
+    return message, 500, extra
+
+
+def build_ydl_opts(
+    output_base: Path | None = None,
+    fallback: bool = False,
+    use_cookies: bool = False,
+    format_selector: str | None = None,
+    skip_download: bool = False,
+) -> dict:
+    player_clients = ["default", "mweb", "ios", "tv"] if fallback else ["default", "mweb"]
+    opts = {
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": False,
+        "ignoreerrors": False,
+        "retries": 5,
+        "fragment_retries": 5,
+        "socket_timeout": 30,
+        "nocheckcertificate": True,
+        "geo_bypass": True,
+        "http_headers": YOUTUBE_HEADERS,
+        "logger": YTDLPLogger(),
+        "extractor_args": {"youtube": {"player_client": player_clients}},
+        "overwrites": True,
+    }
+    if skip_download:
+        opts.update({
+            "skip_download": True,
+            "ignore_no_formats_error": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitlesformat": "srt/vtt/ttml/srv3/json3/best",
+            "subtitleslangs": ["en", "en-US", "en-GB", "en.*", "my", "und", "all"],
+        })
+    else:
+        if output_base is None:
+            output_base = DOWNLOAD_DIR / uuid.uuid4().hex
+        opts.update({
+            "format": format_selector or "bestaudio[acodec!=none]/best[acodec!=none]/best",
+            "outtmpl": str(output_base) + ".%(ext)s",
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+            "prefer_ffmpeg": True,
+        })
+    if use_cookies:
+        cookie_path = get_cookie_file()
+        if cookie_path:
+            opts["cookiefile"] = str(cookie_path)
+    ffmpeg_location = os.getenv("FFMPEG_LOCATION")
+    if ffmpeg_location:
+        opts["ffmpeg_location"] = ffmpeg_location
+    return opts
+
+
+def download_audio_as_mp3(url: str) -> tuple[Path, dict]:
+    normalized_url = normalize_youtube_url(url)
+    output_base = DOWNLOAD_DIR / uuid.uuid4().hex
+    final_mp3 = Path(str(output_base) + ".mp3")
+    cookie_available = get_cookie_file() is not None
+    cookies_mode = (os.getenv("YTDLP_COOKIES_MODE", "auto") or "auto").strip().lower()
+    if cookies_mode in {"always", "true", "1", "yes"}:
+        cookie_modes = [True] if cookie_available else [False]
+    elif cookies_mode in {"never", "false", "0", "no"}:
+        cookie_modes = [False]
+    else:
+        cookie_modes = [False, True] if cookie_available else [False]
+    format_selectors = [
+        "bestaudio[ext=m4a]/bestaudio[acodec!=none]/best[acodec!=none]/best",
+        "bestaudio*/best[acodec!=none]/best",
+        "worstaudio[acodec!=none]/worst[acodec!=none]/worst",
+    ]
+    attempt_profiles = []
+    for use_cookies in cookie_modes:
+        for fallback in (False, True):
+            for fmt in format_selectors:
+                attempt_profiles.append({"use_cookies": use_cookies, "fallback": fallback, "format_selector": fmt})
+    last_error = None
+    for attempt_number, profile in enumerate(attempt_profiles, start=1):
+        try:
+            print(f"yt-dlp audio attempt {attempt_number}/{len(attempt_profiles)} {profile}", flush=True)
+            ydl_opts = build_ydl_opts(output_base, fallback=profile["fallback"], use_cookies=profile["use_cookies"], format_selector=profile["format_selector"])
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(normalized_url, download=True)
+            if not isinstance(info, dict):
+                raise RuntimeError("yt-dlp did not return a valid video info object")
+            matches = [final_mp3, *list(DOWNLOAD_DIR.glob(f"{output_base.name}*.mp3"))]
+            for match in matches:
+                if match.exists() and match.stat().st_size > 0:
+                    return match, {"title": info.get("title") or "audio", "video_id": info.get("id"), "source_url": normalized_url}
+            raise RuntimeError("MP3 file was not created. Check FFmpeg on Railway.")
+        except Exception as exc:
+            last_error = exc
+            print(f"audio download attempt failed profile={profile}: {exc}", flush=True)
+            if "drm" in str(exc).lower():
+                raise RuntimeError(str(exc))
+    raise RuntimeError(str(last_error) if last_error else "Download failed")
+
+
+# ---------------- Downsub-style caption-first helpers ----------------
+
+def _caption_lang_candidates(requested_language: str | None = None) -> list[str]:
+    env_value = os.getenv("YOUTUBE_CAPTION_LANGUAGES", "en,en-US,en-GB,en.*,my,und,auto,*")
+    candidates: list[str] = []
+    normalized = normalize_whisper_language(requested_language)
+    if normalized and normalized not in {"auto", "detect"}:
+        candidates.append(normalized)
+    for item in env_value.split(","):
+        value = (item or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+    if "*" not in candidates:
+        candidates.append("*")
+    return candidates
+
+
+def _caption_key_matches(key: str, candidate: str) -> bool:
+    key_low = (key or "").lower()
+    candidate_low = (candidate or "").lower()
+    if not key_low or not candidate_low:
+        return False
+    if candidate_low in {"*", "auto", "all"}:
+        return True
+    if candidate_low.endswith(".*"):
+        base = candidate_low[:-2]
+        return key_low == base or key_low.startswith(base + "-")
+    return key_low == candidate_low
+
+
+def _unique_ordered(items):
+    out = []
+    seen = set()
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _pick_track(tracks: list[dict], requested_language: str | None = None) -> tuple[str, dict] | None:
+    if not tracks:
+        return None
+    candidates = _caption_lang_candidates(requested_language)
+    manual = [t for t in tracks if (t.get("kind") or "") != "asr"]
+    auto = [t for t in tracks if (t.get("kind") or "") == "asr"]
+    pools = [("youtube_caption_tracks", manual), ("youtube_auto_caption", auto), ("youtube_caption_tracks", tracks)]
+    for source_name, pool in pools:
+        for candidate in candidates:
+            for track in pool:
+                lang = track.get("languageCode") or track.get("lang") or track.get("language") or ""
+                if _caption_key_matches(lang, candidate):
+                    return source_name, track
+    return ("youtube_caption_tracks", tracks[0])
+
+
+def _set_query_param(url: str, **params) -> str:
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    for key, value in params.items():
+        if value is None:
+            query.pop(key, None)
+        else:
+            query[key] = str(value)
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def _extract_json_after_marker(text: str, marker: str) -> dict | None:
+    pos = text.find(marker)
+    if pos < 0:
+        return None
+    start = text.find("{", pos)
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
             continue
-        idx = ""
-        ts_line = ""
-        body_lines: List[str] = []
-        for i, line in enumerate(lines):
-            if is_timestamp_line(line):
-                ts_line = line
-                if i > 0 and INDEX_RE.match(lines[i - 1]):
-                    idx = lines[i - 1].strip()
-                body_lines = lines[i + 1:]
-                break
-        if not ts_line:
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                raw = text[start:i + 1]
+                try:
+                    return json.loads(raw)
+                except Exception:
+                    return None
+    return None
+
+
+
+def _youtube_innertube_headers(client: dict) -> dict:
+    headers = build_youtube_request_headers(json_payload=True)
+    headers.update({
+        "X-Youtube-Client-Name": str(client.get("clientName") or "WEB"),
+        "X-Youtube-Client-Version": str(client.get("clientVersion") or ""),
+    })
+    return headers
+
+
+def _youtube_innertube_context(client: dict) -> dict:
+    client_context = {
+        "clientName": client.get("clientName") or "WEB",
+        "clientVersion": client.get("clientVersion") or "2.20240726.00.00",
+        "hl": client.get("hl") or "en",
+        "gl": client.get("gl") or "US",
+    }
+    if client.get("thirdParty"):
+        client_context["thirdParty"] = client["thirdParty"]
+    return {"client": client_context}
+
+
+def _extract_caption_tracks_from_player_response(player_response: dict) -> tuple[list[dict], list[str], list[str]]:
+    caption_renderer = (
+        (player_response or {})
+        .get("captions", {})
+        .get("playerCaptionsTracklistRenderer", {})
+    )
+    tracks = caption_renderer.get("captionTracks") or []
+    manual_languages = sorted({t.get("languageCode") for t in tracks if t.get("languageCode") and t.get("kind") != "asr"})
+    auto_languages = sorted({t.get("languageCode") for t in tracks if t.get("languageCode") and t.get("kind") == "asr"})
+    return tracks, manual_languages, auto_languages
+
+
+def _fetch_caption_track_as_srt(base_url: str, requested_formats: list[str] | None = None) -> tuple[str, str, list[str]]:
+    """Fetch a YouTube caption baseUrl in multiple formats and return SRT + format + errors."""
+    errors: list[str] = []
+    if not base_url:
+        return "", "", ["empty caption baseUrl"]
+    for fmt in (requested_formats or ["vtt", "json3", "srv3", "ttml"]):
+        try:
+            caption_url = _set_query_param(base_url, fmt=fmt)
+            cap = requests.get(caption_url, headers=build_youtube_request_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+            if cap.status_code >= 400 or not (cap.text or "").strip():
+                errors.append(f"{fmt}: http {cap.status_code}")
+                continue
+            srt_text = normalize_caption_to_srt(cap.text, ext=fmt)
+            if srt_text.strip():
+                return srt_text, fmt, errors
+            errors.append(f"{fmt}: empty after conversion")
+        except Exception as exc:
+            errors.append(f"{fmt}: {exc}")
+    return "", "", errors
+
+
+def get_innertube_caption_tracks(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    """Downsub-style fallback: ask YouTube's Innertube player API for captionTracks/baseUrl."""
+    if not is_youtube_url(url):
+        return None
+    video_id = get_youtube_video_id(url)
+    if not video_id:
+        return None
+    normalized_url = normalize_youtube_url(url)
+    api_key = os.getenv("YOUTUBE_INNERTUBE_API_KEY", YOUTUBE_INNERTUBE_DEFAULT_API_KEY)
+    if not api_key:
+        return None
+    errors: list[str] = []
+    for client in YOUTUBE_INNERTUBE_CLIENTS:
+        label = client.get("label") or client.get("clientName") or "WEB"
+        try:
+            payload = {
+                "context": _youtube_innertube_context(client),
+                "videoId": video_id,
+                "contentCheckOk": True,
+                "racyCheckOk": True,
+            }
+            player_url = f"https://www.youtube.com/youtubei/v1/player?key={api_key}&prettyPrint=false"
+            resp = requests.post(
+                player_url,
+                headers=_youtube_innertube_headers(client),
+                data=json.dumps(payload),
+                timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")),
+            )
+            if resp.status_code >= 400:
+                errors.append(f"{label}: player http {resp.status_code}")
+                continue
+            try:
+                player_response = resp.json()
+            except Exception as exc:
+                errors.append(f"{label}: invalid json {exc}")
+                continue
+
+            tracks, manual_languages, auto_languages = _extract_caption_tracks_from_player_response(player_response)
+            if not tracks:
+                playability = (player_response.get("playabilityStatus") or {}).get("status") or ""
+                reason = (player_response.get("playabilityStatus") or {}).get("reason") or ""
+                errors.append(f"{label}: no captionTracks status={playability} reason={reason[:80]}")
+                continue
+            selected = _pick_track(tracks, requested_language)
+            if not selected:
+                errors.append(f"{label}: no selected track")
+                continue
+            source_name, track = selected
+            base_url = track.get("baseUrl") or ""
+            srt_text, used_fmt, fetch_errors = _fetch_caption_track_as_srt(base_url)
+            errors.extend([f"{label}: {e}" for e in fetch_errors[-3:]])
+            if srt_text.strip():
+                title = ((player_response.get("videoDetails") or {}).get("title") or "YouTube captions")
+                subtitle_source = source_name if track.get("kind") != "asr" else "youtube_auto_caption"
+                return srt_text, {
+                    "source": "youtube_innertube_caption_tracks",
+                    "subtitle_source": subtitle_source,
+                    "language": track.get("languageCode") or "",
+                    "format": used_fmt,
+                    "title": title,
+                    "video_id": video_id,
+                    "source_url": normalized_url,
+                    "manual_languages": manual_languages,
+                    "auto_languages": auto_languages,
+                    "caption_track_count": len(tracks),
+                    "innertube_client": label,
+                    "no_media_download": True,
+                    "caption_first": True,
+                    "errors": errors[-8:],
+                }
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+            print(f"innertube captionTracks failed client={label}: {exc}", flush=True)
+    print(f"innertube captionTracks no result: {errors[-8:]}", flush=True)
+    return None
+
+
+def get_watch_page_caption_tracks(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    """Downsub-style first method: read captionTracks/baseUrl from YouTube watch page."""
+    if not is_youtube_url(url):
+        return None
+    normalized_url = normalize_youtube_url(url)
+    video_id = get_youtube_video_id(normalized_url)
+    watch_url = f"https://www.youtube.com/watch?v={video_id}&hl=en&persist_hl=1"
+    errors = []
+    try:
+        resp = requests.get(watch_url, headers=build_youtube_request_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+        resp.raise_for_status()
+        html_text = resp.text or ""
+    except Exception as exc:
+        print(f"watch-page fetch failed: {exc}", flush=True)
+        return None
+
+    player_response = _extract_json_after_marker(html_text, "ytInitialPlayerResponse")
+    if not player_response:
+        # Sometimes the JSON is assigned as window["ytInitialPlayerResponse"].
+        m = re.search(r"ytInitialPlayerResponse\s*=\s*({.+?})\s*;", html_text)
+        if m:
+            try:
+                player_response = json.loads(m.group(1))
+            except Exception:
+                player_response = None
+    if not player_response:
+        return None
+
+    caption_renderer = (
+        player_response.get("captions", {})
+        .get("playerCaptionsTracklistRenderer", {})
+    )
+    tracks = caption_renderer.get("captionTracks") or []
+    if not tracks:
+        return None
+
+    manual_languages = sorted({t.get("languageCode") for t in tracks if t.get("languageCode") and t.get("kind") != "asr"})
+    auto_languages = sorted({t.get("languageCode") for t in tracks if t.get("languageCode") and t.get("kind") == "asr"})
+    selected = _pick_track(tracks, requested_language)
+    if not selected:
+        return None
+    source_name, track = selected
+    base_url = track.get("baseUrl") or ""
+    if not base_url:
+        return None
+
+    fmt_attempts = ["vtt", "json3", "srv3", "ttml"]
+    for fmt in fmt_attempts:
+        try:
+            caption_url = _set_query_param(base_url, fmt=fmt)
+            cap = requests.get(caption_url, headers=build_youtube_request_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+            if cap.status_code >= 400 or not cap.text.strip():
+                errors.append(f"{fmt}: http {cap.status_code}")
+                continue
+            srt_text = normalize_caption_to_srt(cap.text, ext=fmt)
+            if srt_text.strip():
+                return srt_text, {
+                    "source": source_name,
+                    "subtitle_source": source_name if track.get("kind") != "asr" else "youtube_auto_caption",
+                    "language": track.get("languageCode") or "",
+                    "format": fmt,
+                    "title": (player_response.get("videoDetails") or {}).get("title") or "YouTube captions",
+                    "video_id": video_id,
+                    "source_url": normalized_url,
+                    "manual_languages": manual_languages,
+                    "auto_languages": auto_languages,
+                    "caption_track_count": len(tracks),
+                    "no_media_download": True,
+                    "caption_first": True,
+                    "errors": errors[-5:],
+                }
+            errors.append(f"{fmt}: empty after conversion")
+        except Exception as exc:
+            errors.append(f"{fmt}: {exc}")
+            print(f"watch-page caption fetch failed fmt={fmt}: {exc}", flush=True)
+    return None
+
+
+def get_direct_timedtext_caption_srt(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    video_id = get_youtube_video_id(url)
+    if not video_id:
+        return None
+    list_urls = [
+        f"https://www.youtube.com/api/timedtext?{urlencode({'type': 'list', 'v': video_id})}",
+        f"https://video.google.com/timedtext?{urlencode({'type': 'list', 'v': video_id})}",
+    ]
+    tracks = []
+    errors = []
+    for list_url in list_urls:
+        try:
+            resp = requests.get(list_url, headers=build_youtube_request_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+            if resp.status_code >= 400:
+                errors.append(f"list {resp.status_code}")
+                continue
+            root = ET.fromstring(resp.text or "")
+            for track in root.findall(".//track"):
+                lang_code = track.attrib.get("lang_code") or track.attrib.get("lang") or ""
+                if not lang_code:
+                    continue
+                tracks.append({
+                    "lang": lang_code,
+                    "name": track.attrib.get("name") or "",
+                    "kind": track.attrib.get("kind") or "",
+                })
+        except Exception as exc:
+            errors.append(str(exc))
+    if not tracks:
+        return None
+
+    manual_tracks = [t for t in tracks if t.get("kind") != "asr"]
+    asr_tracks = [t for t in tracks if t.get("kind") == "asr"]
+    selected = _pick_track(
+        [{"languageCode": t["lang"], "kind": t.get("kind", ""), "name": t.get("name", "")} for t in tracks],
+        requested_language,
+    )
+    if not selected:
+        return None
+    source_name, selected_track = selected
+    track = {"lang": selected_track.get("languageCode"), "kind": selected_track.get("kind", ""), "name": selected_track.get("name", "")}
+    if track.get("kind") == "asr":
+        source_name = "youtube_direct_auto_caption"
+    else:
+        source_name = "youtube_direct_timedtext"
+
+    for fmt in ["vtt", "json3", "srv3", "ttml"]:
+        params = {"v": video_id, "lang": track["lang"], "fmt": fmt}
+        if track.get("kind"):
+            params["kind"] = track["kind"]
+        if track.get("name"):
+            params["name"] = track["name"]
+        for host in ["https://www.youtube.com/api/timedtext", "https://video.google.com/timedtext"]:
+            try:
+                caption_url = f"{host}?{urlencode(params)}"
+                resp = requests.get(caption_url, headers=build_youtube_request_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+                if resp.status_code >= 400 or not resp.text.strip():
+                    continue
+                srt_text = normalize_caption_to_srt(resp.text, ext=fmt)
+                if srt_text.strip():
+                    return srt_text, {
+                        "source": source_name,
+                        "subtitle_source": source_name,
+                        "language": track["lang"],
+                        "format": fmt,
+                        "title": "YouTube captions",
+                        "video_id": video_id,
+                        "source_url": normalize_youtube_url(url),
+                        "manual_languages": sorted({t["lang"] for t in manual_tracks}),
+                        "auto_languages": sorted({t["lang"] for t in asr_tracks}),
+                        "no_media_download": True,
+                        "caption_first": True,
+                        "errors": errors[-5:],
+                    }
+            except Exception as exc:
+                errors.append(str(exc))
+    return None
+
+
+def _pick_caption_key(caption_map: dict, candidates: list[str]) -> str | None:
+    if not caption_map:
+        return None
+    keys = list(caption_map.keys())
+    for candidate in candidates:
+        for key in keys:
+            if _caption_key_matches(key, candidate):
+                return key
+    for key in keys:
+        if (key or "").lower().startswith("en"):
+            return key
+    return keys[0] if keys else None
+
+
+def _pick_caption_format(formats: list[dict]) -> dict | None:
+    if not formats:
+        return None
+    for ext in ["srt", "vtt", "json3", "srv3", "ttml"]:
+        for item in formats:
+            if (item.get("ext") or "").lower() == ext and item.get("url"):
+                return item
+    for item in formats:
+        if item.get("url"):
+            return item
+    return None
+
+
+def get_ytdlp_caption_srt(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    if not is_youtube_url(url):
+        return None
+    normalized_url = normalize_youtube_url(url)
+    cookie_available = get_cookie_file() is not None
+    cookie_modes = [False, True] if cookie_available else [False]
+    errors = []
+    for use_cookies in cookie_modes:
+        for fallback in (False, True):
+            try:
+                ydl_opts = build_ydl_opts(fallback=fallback, use_cookies=use_cookies, skip_download=True)
+                print(f"Caption-first yt-dlp metadata check cookies={use_cookies} fallback={fallback}", flush=True)
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(normalized_url, download=False)
+                if not isinstance(info, dict):
+                    continue
+                candidates = _caption_lang_candidates(requested_language)
+                subtitle_maps = [
+                    ("youtube_manual_subtitle", info.get("subtitles") or {}),
+                    ("youtube_auto_caption", info.get("automatic_captions") or {}),
+                ]
+                for source_name, caption_map in subtitle_maps:
+                    caption_key = _pick_caption_key(caption_map, candidates)
+                    if not caption_key:
+                        continue
+                    fmt = _pick_caption_format(caption_map.get(caption_key) or [])
+                    if not fmt:
+                        errors.append(f"{source_name}:{caption_key}: no usable caption URL")
+                        continue
+                    resp = requests.get(fmt.get("url"), headers=build_youtube_request_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+                    resp.raise_for_status()
+                    ext = (fmt.get("ext") or "").lower()
+                    srt_text = normalize_caption_to_srt(resp.text, ext=ext)
+                    if not srt_text.strip():
+                        errors.append(f"{source_name}:{caption_key}: empty after conversion")
+                        continue
+                    return srt_text, {
+                        "source": source_name,
+                        "subtitle_source": source_name,
+                        "language": caption_key,
+                        "format": ext or "unknown",
+                        "title": info.get("title") or "",
+                        "video_id": info.get("id") or get_youtube_video_id(url) or "",
+                        "source_url": normalized_url,
+                        "manual_languages": sorted((info.get("subtitles") or {}).keys()),
+                        "auto_languages": sorted((info.get("automatic_captions") or {}).keys()),
+                        "no_media_download": True,
+                        "caption_first": True,
+                        "errors": errors[-5:],
+                    }
+            except Exception as exc:
+                errors.append(str(exc))
+                print(f"yt-dlp caption metadata failed: {exc}", flush=True)
+    return None
+
+
+def get_youtube_caption_srt(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    if not is_youtube_url(url):
+        return None
+    methods = [
+        ("innertube_caption_tracks", get_innertube_caption_tracks),
+        ("watch_page_caption_tracks", get_watch_page_caption_tracks),
+        ("direct_timedtext", get_direct_timedtext_caption_srt),
+        ("ytdlp_metadata", get_ytdlp_caption_srt),
+    ]
+    for name, fn in methods:
+        if name == "direct_timedtext" and (os.getenv("YOUTUBE_DIRECT_TIMEDTEXT", "true") or "true").strip().lower() in {"0", "false", "no", "off"}:
             continue
         try:
-            start_raw, end_raw = re.split(r"\s*-->\s*", ts_line, maxsplit=1)
-            end_raw = end_raw.split()[0]
-            start = normalize_timestamp(start_raw)
-            end = normalize_timestamp(end_raw)
+            result = fn(url, requested_language=requested_language)
+            if result and result[0].strip():
+                return result
+        except Exception as exc:
+            print(f"caption method failed {name}: {exc}", flush=True)
+    return None
+
+
+def _caption_ts_to_srt(ts: str) -> str:
+    ts = (ts or "").strip().replace(",", ".")
+    if re.fullmatch(r"\d+(?:\.\d+)?", ts):
+        return srt_timestamp(float(ts))
+    parts = ts.split(":")
+    try:
+        if len(parts) == 2:
+            hours = 0
+            minutes = int(parts[0])
+            seconds_float = float(parts[1])
+        elif len(parts) == 3:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds_float = float(parts[2])
+        else:
+            return "00:00:00,000"
+        seconds = int(seconds_float)
+        millis = int(round((seconds_float - seconds) * 1000))
+        if millis >= 1000:
+            seconds += 1
+            millis -= 1000
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+    except Exception:
+        return "00:00:00,000"
+
+
+def _clean_caption_text_line(line: str) -> str:
+    line = html.unescape((line or "").strip())
+    line = re.sub(r"<\d{1,2}:\d{2}:\d{2}[.,]\d{3}>", "", line)
+    line = re.sub(r"<[^>]+>", "", line)
+    line = re.sub(r"\{[^}]*\}", "", line)
+    line = line.replace("\u00a0", " ")
+    return re.sub(r"\s+", " ", line).strip()
+
+
+def vtt_to_srt_text(vtt_text: str) -> str:
+    text = (vtt_text or "").replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    if not text.strip():
+        return ""
+    lines = text.split("\n")
+    blocks: list[str] = []
+    i = 0
+    cue_number = 1
+    time_re = re.compile(r"((?:\d{1,2}:)?\d{2}:\d{2}[.,]\d{3})\s*-->\s*((?:\d{1,2}:)?\d{2}:\d{2}[.,]\d{3})")
+    while i < len(lines):
+        line = (lines[i] or "").strip()
+        upper = line.upper()
+        if not line or upper == "WEBVTT" or upper.startswith("X-TIMESTAMP"):
+            i += 1
+            continue
+        if upper.startswith(("NOTE", "STYLE", "REGION")):
+            i += 1
+            while i < len(lines) and (lines[i] or "").strip():
+                i += 1
+            continue
+        match = time_re.search(line)
+        if not match and i + 1 < len(lines):
+            next_line = (lines[i + 1] or "").strip()
+            match = time_re.search(next_line)
+            if match:
+                i += 1
+        if not match:
+            i += 1
+            continue
+        start = _caption_ts_to_srt(match.group(1))
+        end = _caption_ts_to_srt(match.group(2))
+        i += 1
+        text_lines: list[str] = []
+        seen_lines: set[str] = set()
+        while i < len(lines) and (lines[i] or "").strip():
+            cleaned = _clean_caption_text_line(lines[i])
+            if cleaned:
+                key = cleaned.casefold()
+                if key not in seen_lines:
+                    seen_lines.add(key)
+                    text_lines.append(cleaned)
+            i += 1
+        cue_text = re.sub(r"\s+", " ", " ".join(text_lines)).strip()
+        if cue_text:
+            blocks.append(f"{cue_number}\n{start} --> {end}\n{cue_text}\n")
+            cue_number += 1
+    return "\n".join(blocks).strip() + "\n" if blocks else ""
+
+
+def json3_to_srt_text(json_text: str) -> str:
+    raw = (json_text or "").strip()
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return ""
+    events = data.get("events") or []
+    blocks = []
+    for event in events:
+        segs = event.get("segs") or []
+        text = "".join(seg.get("utf8") or "" for seg in segs)
+        text = _clean_caption_text_line(text)
+        if not text:
+            continue
+        start_ms = int(event.get("tStartMs") or 0)
+        dur_ms = int(event.get("dDurationMs") or 3000)
+        start = start_ms / 1000.0
+        end = (start_ms + max(dur_ms, 500)) / 1000.0
+        blocks.append(f"{len(blocks) + 1}\n{srt_timestamp(start)} --> {srt_timestamp(end)}\n{text}\n")
+    return "\n".join(blocks).strip() + "\n" if blocks else ""
+
+
+def ttml_to_srt_text(ttml_text: str) -> str:
+    raw = (ttml_text or "").strip()
+    if not raw:
+        return ""
+    try:
+        raw2 = re.sub(r"xmlns(:\w+)?=\"[^\"]+\"", "", raw)
+        root = ET.fromstring(raw2)
+        blocks = []
+        for p in root.iter():
+            if p.tag.split("}")[-1].lower() != "p":
+                continue
+            start = p.attrib.get("begin") or p.attrib.get("start") or "00:00:00.000"
+            end = p.attrib.get("end") or ""
+            dur = p.attrib.get("dur")
+            if not end and dur:
+                try:
+                    # Minimal duration support: convert begin + dur if dur is numeric seconds.
+                    if dur.endswith("s"):
+                        begin_seconds = _ts_to_seconds(start)
+                        end = srt_timestamp(begin_seconds + float(dur[:-1])).replace(",", ".")
+                    else:
+                        end = start
+                except Exception:
+                    end = start
+            text = _clean_caption_text_line(" ".join(p.itertext()))
+            if text:
+                blocks.append(f"{len(blocks) + 1}\n{_caption_ts_to_srt(start)} --> {_caption_ts_to_srt(end or start)}\n{text}\n")
+        return "\n".join(blocks).strip() + "\n" if blocks else ""
+    except Exception:
+        return ""
+
+
+def srv_xml_to_srt_text(xml_text: str) -> str:
+    raw = (xml_text or "").strip()
+    if not raw:
+        return ""
+    try:
+        root = ET.fromstring(raw)
+        blocks = []
+        for node in root.findall(".//text"):
+            start = float(node.attrib.get("start", "0") or 0)
+            dur = float(node.attrib.get("dur", "3") or 3)
+            text = _clean_caption_text_line("".join(node.itertext()))
+            if text:
+                blocks.append(f"{len(blocks) + 1}\n{srt_timestamp(start)} --> {srt_timestamp(start + dur)}\n{text}\n")
+        return "\n".join(blocks).strip() + "\n" if blocks else ""
+    except Exception:
+        return ""
+
+
+def normalize_caption_to_srt(caption_text: str, ext: str | None = None) -> str:
+    ext_low = (ext or "").lower()
+    raw = (caption_text or "").strip()
+    if not raw:
+        return ""
+    if ext_low == "srt" or ("-->" in raw and not raw.lstrip("\ufeff").upper().startswith("WEBVTT")):
+        return raw.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
+    if ext_low == "vtt" or raw.lstrip("\ufeff").upper().startswith("WEBVTT"):
+        return vtt_to_srt_text(raw)
+    if ext_low == "json3" or raw.startswith("{"):
+        return json3_to_srt_text(raw)
+    if ext_low == "ttml" or raw.lstrip().startswith("<tt"):
+        return ttml_to_srt_text(raw)
+    if ext_low in {"srv1", "srv2", "srv3", "xml"} or raw.lstrip().startswith("<transcript"):
+        return srv_xml_to_srt_text(raw)
+    return ""
+
+
+def caption_first_enabled() -> bool:
+    return (os.getenv("YOUTUBE_CAPTION_FIRST", "true") or "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def should_whisper_fallback_for_url() -> bool:
+    return (os.getenv("URL_WHISPER_FALLBACK", "true") or "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+
+
+# ---------------- V5 dynamic Innertube / Downsub-style overrides ----------------
+# These definitions intentionally appear after the V4 helpers so they override the older
+# static Innertube behavior. The key change is using the current watch-page ytcfg
+# INNERTUBE_API_KEY, clientVersion, visitorData, and multiple player clients.
+YOUTUBE_CAPTION_DEBUG_LAST: dict = {}
+
+
+def _extract_ytcfg_from_html(html_text: str) -> dict:
+    """Extract YouTube ytcfg.set({...}) data from a watch page."""
+    if not html_text:
+        return {}
+    cfg = _extract_json_after_marker(html_text, "ytcfg.set")
+    if isinstance(cfg, dict):
+        return cfg
+    # Fallback regex for minified variants.
+    for pattern in [
+        r"ytcfg\.set\s*\(\s*({.+?})\s*\)\s*;",
+        r"window\[\"ytcfg\"\]\.set\s*\(\s*({.+?})\s*\)\s*;",
+    ]:
+        m = re.search(pattern, html_text, flags=re.DOTALL)
+        if not m:
+            continue
+        try:
+            return json.loads(m.group(1))
         except Exception:
             continue
-        body = "\n".join(body_lines).strip()
-        if body:
-            blocks.append({"index": idx or str(len(blocks) + 1), "start": start, "end": end, "text": body})
-    return blocks
+    return {}
 
 
-def compose_srt(blocks: List[Dict[str, str]], texts: Optional[List[str]] = None) -> str:
-    out: List[str] = []
-    for i, block in enumerate(blocks, start=1):
-        txt = texts[i - 1] if texts is not None and i - 1 < len(texts) else block.get("text", "")
-        txt = (txt or "").strip()
-        if not txt:
-            txt = block.get("text", "")
-        out.append(f"{i}\n{block['start']} --> {block['end']}\n{txt}")
-    return "\n\n".join(out).strip() + "\n"
-
-
-def vtt_to_srt(vtt_text: str) -> str:
-    lines = (vtt_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    clean = []
-    for ln in lines:
-        if ln.strip().upper().startswith("WEBVTT"):
+def _extract_player_response_from_html(html_text: str) -> dict:
+    if not html_text:
+        return {}
+    player_response = _extract_json_after_marker(html_text, "ytInitialPlayerResponse")
+    if isinstance(player_response, dict):
+        return player_response
+    for pattern in [
+        r"ytInitialPlayerResponse\s*=\s*({.+?})\s*;",
+        r"window\[\"ytInitialPlayerResponse\"\]\s*=\s*({.+?})\s*;",
+    ]:
+        m = re.search(pattern, html_text, flags=re.DOTALL)
+        if not m:
             continue
-        if ln.strip().startswith(("NOTE", "STYLE", "REGION")):
+        try:
+            return json.loads(m.group(1))
+        except Exception:
             continue
-        clean.append(ln.replace(".", ",") if "-->" in ln else ln)
-    text = "\n".join(clean).strip()
-    blocks = parse_srt_blocks(text)
-    if blocks:
-        return compose_srt(blocks)
-    # Last-resort: keep text as one subtitle.
-    plain = clean_srt_to_text(text)
-    if not plain:
-        return ""
-    return f"1\n00:00:00,000 --> 00:00:05,000\n{plain}\n"
+    return {}
 
 
-def remove_html_tags(text: str) -> str:
-    text = re.sub(r"<[^>]+>", "", text or "")
-    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-    return text
+def _fetch_youtube_watch_bootstrap(url: str) -> dict:
+    """Fetch the current YouTube watch page and extract dynamic Innertube config."""
+    video_id = get_youtube_video_id(url)
+    normalized_url = normalize_youtube_url(url)
+    watch_urls = [
+        f"https://www.youtube.com/watch?v={video_id}&hl=en&persist_hl=1&bpctr=9999999999&has_verified=1",
+        f"https://m.youtube.com/watch?v={video_id}&hl=en&persist_hl=1&bpctr=9999999999&has_verified=1",
+    ]
+    errors = []
+    for watch_url in watch_urls:
+        try:
+            resp = requests.get(
+                watch_url,
+                headers=build_youtube_request_headers(),
+                timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")),
+            )
+            html_text = resp.text or ""
+            info = {
+                "watch_url": watch_url,
+                "status_code": resp.status_code,
+                "html_chars": len(html_text),
+                "consent_page": "consent.youtube" in html_text.lower() or "before you continue" in html_text.lower(),
+                "signin_page": "sign in to confirm" in html_text.lower() or "not a bot" in html_text.lower(),
+            }
+            if resp.status_code >= 400 or not html_text.strip():
+                errors.append({**info, "error": f"watch page HTTP {resp.status_code}"})
+                continue
+            ytcfg = _extract_ytcfg_from_html(html_text)
+            player_response = _extract_player_response_from_html(html_text)
+            cfg_client = ((ytcfg.get("INNERTUBE_CONTEXT") or {}).get("client") or {}) if isinstance(ytcfg, dict) else {}
+            api_key = (ytcfg.get("INNERTUBE_API_KEY") if isinstance(ytcfg, dict) else None) or os.getenv("YOUTUBE_INNERTUBE_API_KEY") or YOUTUBE_INNERTUBE_DEFAULT_API_KEY
+            client_version = (
+                cfg_client.get("clientVersion")
+                or (ytcfg.get("INNERTUBE_CLIENT_VERSION") if isinstance(ytcfg, dict) else None)
+                or os.getenv("YOUTUBE_WEB_CLIENT_VERSION")
+                or "2.20240726.00.00"
+            )
+            visitor_data = (
+                cfg_client.get("visitorData")
+                or (ytcfg.get("VISITOR_DATA") if isinstance(ytcfg, dict) else None)
+                or ""
+            )
+            return {
+                "ok": True,
+                "normalized_url": normalized_url,
+                "video_id": video_id,
+                "watch": info,
+                "ytcfg": ytcfg if isinstance(ytcfg, dict) else {},
+                "player_response": player_response if isinstance(player_response, dict) else {},
+                "innertube_api_key": api_key,
+                "web_client_version": client_version,
+                "visitor_data": visitor_data,
+                "dynamic_innertube_api_key_found": bool(isinstance(ytcfg, dict) and ytcfg.get("INNERTUBE_API_KEY")),
+                "dynamic_web_client_version_found": bool(client_version),
+                "visitor_data_found": bool(visitor_data),
+                "errors": errors[-4:],
+            }
+        except Exception as exc:
+            errors.append({"watch_url": watch_url, "error": str(exc)})
+    return {"ok": False, "normalized_url": normalized_url, "video_id": video_id, "errors": errors[-6:]}
 
 
-def clean_srt_to_text(text: str) -> str:
-    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-    lines: List[str] = []
+def _v5_innertube_client_profiles(bootstrap: dict, video_id: str) -> list[dict]:
+    web_version = bootstrap.get("web_client_version") or os.getenv("YOUTUBE_WEB_CLIENT_VERSION") or "2.20240726.00.00"
+    embedded_version = os.getenv("YOUTUBE_WEB_EMBEDDED_CLIENT_VERSION", "1.20240723.01.00")
+    # Headers use numeric client IDs; context uses string client names.
+    return [
+        {
+            "label": "WEB_DYNAMIC",
+            "clientName": "WEB",
+            "clientNameHeader": "1",
+            "clientVersion": web_version,
+            "hl": "en",
+            "gl": "US",
+        },
+        {
+            "label": "MWEB_DYNAMIC",
+            "clientName": "MWEB",
+            "clientNameHeader": "2",
+            "clientVersion": web_version,
+            "hl": "en",
+            "gl": "US",
+        },
+        {
+            "label": "WEB_EMBEDDED_PLAYER",
+            "clientName": "WEB_EMBEDDED_PLAYER",
+            "clientNameHeader": "56",
+            "clientVersion": embedded_version,
+            "hl": "en",
+            "gl": "US",
+            "thirdParty": {"embedUrl": f"https://www.youtube.com/embed/{video_id}"},
+        },
+        {
+            "label": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+            "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+            "clientNameHeader": "85",
+            "clientVersion": os.getenv("YOUTUBE_TVHTML5_CLIENT_VERSION", "2.0"),
+            "hl": "en",
+            "gl": "US",
+            "thirdParty": {"embedUrl": f"https://www.youtube.com/embed/{video_id}"},
+        },
+        {
+            "label": "ANDROID",
+            "clientName": "ANDROID",
+            "clientNameHeader": "3",
+            "clientVersion": os.getenv("YOUTUBE_ANDROID_CLIENT_VERSION", "19.09.37"),
+            "androidSdkVersion": 30,
+            "hl": "en",
+            "gl": "US",
+            "userAgent": os.getenv("YOUTUBE_ANDROID_UA", "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip"),
+        },
+        {
+            "label": "IOS",
+            "clientName": "IOS",
+            "clientNameHeader": "5",
+            "clientVersion": os.getenv("YOUTUBE_IOS_CLIENT_VERSION", "19.09.3"),
+            "deviceMake": "Apple",
+            "deviceModel": "iPhone16,2",
+            "hl": "en",
+            "gl": "US",
+            "userAgent": os.getenv("YOUTUBE_IOS_UA", "com.google.ios.youtube/19.09.3 (iPhone16,2; U; CPU iOS 17_2 like Mac OS X;)"),
+        },
+    ]
+
+
+def _v5_innertube_context(client: dict, bootstrap: dict) -> dict:
+    client_context = {
+        "clientName": client.get("clientName") or "WEB",
+        "clientVersion": client.get("clientVersion") or bootstrap.get("web_client_version") or "2.20240726.00.00",
+        "hl": client.get("hl") or "en",
+        "gl": client.get("gl") or "US",
+    }
+    for optional_key in ["androidSdkVersion", "deviceMake", "deviceModel", "userAgent"]:
+        if client.get(optional_key) is not None:
+            client_context[optional_key] = client[optional_key]
+    if bootstrap.get("visitor_data"):
+        client_context["visitorData"] = bootstrap["visitor_data"]
+    if client.get("thirdParty"):
+        client_context["thirdParty"] = client["thirdParty"]
+    return {"client": client_context}
+
+
+def _v5_innertube_headers(client: dict, bootstrap: dict) -> dict:
+    headers = build_youtube_request_headers(json_payload=True)
+    headers["X-Youtube-Client-Name"] = str(client.get("clientNameHeader") or client.get("clientName") or "1")
+    headers["X-Youtube-Client-Version"] = str(client.get("clientVersion") or bootstrap.get("web_client_version") or "")
+    if bootstrap.get("visitor_data"):
+        headers["X-Goog-Visitor-Id"] = bootstrap["visitor_data"]
+    if client.get("userAgent"):
+        headers["User-Agent"] = client["userAgent"]
+    return headers
+
+
+def _try_player_response_caption_tracks(player_response: dict, requested_language: str | None, meta_base: dict) -> tuple[str, dict] | None:
+    tracks, manual_languages, auto_languages = _extract_caption_tracks_from_player_response(player_response or {})
+    if not tracks:
+        return None
+    selected = _pick_track(tracks, requested_language)
+    if not selected:
+        return None
+    source_name, track = selected
+    base_url = track.get("baseUrl") or ""
+    srt_text, used_fmt, fetch_errors = _fetch_caption_track_as_srt(base_url)
+    if not srt_text.strip():
+        return None
+    subtitle_source = source_name if track.get("kind") != "asr" else "youtube_auto_caption"
+    return srt_text, {
+        **meta_base,
+        "source": meta_base.get("source") or "youtube_player_response_caption_tracks",
+        "subtitle_source": subtitle_source,
+        "language": track.get("languageCode") or "",
+        "format": used_fmt,
+        "manual_languages": manual_languages,
+        "auto_languages": auto_languages,
+        "caption_track_count": len(tracks),
+        "no_media_download": True,
+        "caption_first": True,
+        "errors": fetch_errors[-5:],
+    }
+
+
+def get_innertube_caption_tracks(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    """V5: dynamic Downsub-style captionTracks extraction using current ytcfg + multiple clients."""
+    global YOUTUBE_CAPTION_DEBUG_LAST
+    if not is_youtube_url(url):
+        return None
+    video_id = get_youtube_video_id(url)
+    if not video_id:
+        return None
+    normalized_url = normalize_youtube_url(url)
+    bootstrap = _fetch_youtube_watch_bootstrap(normalized_url)
+    errors: list[str] = []
+    debug = {
+        "version": APP_VERSION,
+        "bootstrap_ok": bool(bootstrap.get("ok")),
+        "dynamic_innertube_api_key_found": bool(bootstrap.get("dynamic_innertube_api_key_found")),
+        "dynamic_web_client_version_found": bool(bootstrap.get("dynamic_web_client_version_found")),
+        "visitor_data_found": bool(bootstrap.get("visitor_data_found")),
+        "watch": bootstrap.get("watch") or {},
+        "bootstrap_errors": bootstrap.get("errors") or [],
+        "attempts": [],
+    }
+
+    # First use captionTracks already embedded in the watch-page player response.
+    try:
+        watch_player_result = _try_player_response_caption_tracks(
+            bootstrap.get("player_response") or {},
+            requested_language,
+            {
+                "source": "youtube_watchpage_player_response",
+                "title": ((bootstrap.get("player_response") or {}).get("videoDetails") or {}).get("title") or "YouTube captions",
+                "video_id": video_id,
+                "source_url": normalized_url,
+                "innertube_client": "watch_page_ytInitialPlayerResponse",
+            },
+        )
+        debug["attempts"].append({"client": "watch_page_ytInitialPlayerResponse", "success": bool(watch_player_result)})
+        if watch_player_result:
+            YOUTUBE_CAPTION_DEBUG_LAST = debug
+            return watch_player_result
+    except Exception as exc:
+        errors.append(f"watch_player_response: {exc}")
+        debug["attempts"].append({"client": "watch_page_ytInitialPlayerResponse", "success": False, "error": str(exc)})
+
+    api_keys = _unique_ordered([
+        bootstrap.get("innertube_api_key"),
+        os.getenv("YOUTUBE_INNERTUBE_API_KEY"),
+        YOUTUBE_INNERTUBE_DEFAULT_API_KEY,
+    ])
+    if not api_keys:
+        debug["errors"] = ["no innertube api key"]
+        YOUTUBE_CAPTION_DEBUG_LAST = debug
+        return None
+
+    for api_key in api_keys:
+        for client in _v5_innertube_client_profiles(bootstrap, video_id):
+            label = client.get("label") or client.get("clientName") or "WEB"
+            attempt = {"client": label, "success": False, "api_key_source": "dynamic" if api_key == bootstrap.get("innertube_api_key") else "fallback"}
+            try:
+                payload = {
+                    "context": _v5_innertube_context(client, bootstrap),
+                    "videoId": video_id,
+                    "contentCheckOk": True,
+                    "racyCheckOk": True,
+                    "playbackContext": {"contentPlaybackContext": {"html5Preference": "HTML5_PREF_WANTS"}},
+                }
+                player_url = f"https://www.youtube.com/youtubei/v1/player?key={api_key}&prettyPrint=false"
+                resp = requests.post(
+                    player_url,
+                    headers=_v5_innertube_headers(client, bootstrap),
+                    data=json.dumps(payload),
+                    timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")),
+                )
+                attempt["http_status"] = resp.status_code
+                if resp.status_code >= 400:
+                    attempt["error"] = f"player http {resp.status_code}"
+                    errors.append(f"{label}: player http {resp.status_code}")
+                    debug["attempts"].append(attempt)
+                    continue
+                try:
+                    player_response = resp.json()
+                except Exception as exc:
+                    attempt["error"] = f"invalid json {exc}"
+                    errors.append(f"{label}: invalid json {exc}")
+                    debug["attempts"].append(attempt)
+                    continue
+                playability = (player_response.get("playabilityStatus") or {})
+                attempt["playability_status"] = playability.get("status")
+                attempt["playability_reason"] = (playability.get("reason") or "")[:140]
+                tracks, manual_languages, auto_languages = _extract_caption_tracks_from_player_response(player_response)
+                attempt["caption_track_count"] = len(tracks)
+                attempt["manual_languages"] = manual_languages
+                attempt["auto_languages"] = auto_languages
+                if not tracks:
+                    errors.append(f"{label}: no captionTracks status={attempt.get('playability_status')} reason={attempt.get('playability_reason')}")
+                    debug["attempts"].append(attempt)
+                    continue
+                selected = _pick_track(tracks, requested_language)
+                if not selected:
+                    attempt["error"] = "no selected track"
+                    errors.append(f"{label}: no selected track")
+                    debug["attempts"].append(attempt)
+                    continue
+                source_name, track = selected
+                base_url = track.get("baseUrl") or ""
+                srt_text, used_fmt, fetch_errors = _fetch_caption_track_as_srt(base_url)
+                attempt["selected_language"] = track.get("languageCode") or ""
+                attempt["selected_kind"] = track.get("kind") or "manual"
+                attempt["caption_fetch_errors"] = fetch_errors[-4:]
+                if srt_text.strip():
+                    attempt["success"] = True
+                    attempt["format"] = used_fmt
+                    debug["attempts"].append(attempt)
+                    YOUTUBE_CAPTION_DEBUG_LAST = debug
+                    subtitle_source = source_name if track.get("kind") != "asr" else "youtube_auto_caption"
+                    return srt_text, {
+                        "source": "youtube_innertube_caption_tracks_v5",
+                        "subtitle_source": subtitle_source,
+                        "language": track.get("languageCode") or "",
+                        "format": used_fmt,
+                        "title": ((player_response.get("videoDetails") or {}).get("title") or "YouTube captions"),
+                        "video_id": video_id,
+                        "source_url": normalized_url,
+                        "manual_languages": manual_languages,
+                        "auto_languages": auto_languages,
+                        "caption_track_count": len(tracks),
+                        "innertube_client": label,
+                        "no_media_download": True,
+                        "caption_first": True,
+                        "dynamic_innertube_api_key_found": bool(bootstrap.get("dynamic_innertube_api_key_found")),
+                        "visitor_data_found": bool(bootstrap.get("visitor_data_found")),
+                        "errors": errors[-8:] + fetch_errors[-4:],
+                    }
+                attempt["error"] = "caption track found but no text returned"
+                debug["attempts"].append(attempt)
+                errors.extend([f"{label}: {e}" for e in fetch_errors[-3:]])
+            except Exception as exc:
+                attempt["error"] = str(exc)
+                debug["attempts"].append(attempt)
+                errors.append(f"{label}: {exc}")
+                print(f"V5 innertube captionTracks failed client={label}: {exc}", flush=True)
+    debug["errors"] = errors[-12:]
+    YOUTUBE_CAPTION_DEBUG_LAST = debug
+    print(f"V5 innertube captionTracks no result: {errors[-12:]}", flush=True)
+    return None
+
+
+def get_youtube_caption_srt(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    """V5 method order: dynamic Innertube first, then older caption-first fallbacks."""
+    if not is_youtube_url(url):
+        return None
+    methods = [
+        ("dynamic_innertube_caption_tracks_v5", get_innertube_caption_tracks),
+        ("watch_page_caption_tracks", get_watch_page_caption_tracks),
+        ("direct_timedtext", get_direct_timedtext_caption_srt),
+        ("ytdlp_metadata", get_ytdlp_caption_srt),
+    ]
+    for name, fn in methods:
+        if name == "direct_timedtext" and (os.getenv("YOUTUBE_DIRECT_TIMEDTEXT", "true") or "true").strip().lower() in {"0", "false", "no", "off"}:
+            continue
+        try:
+            result = fn(url, requested_language=requested_language)
+            if result and result[0].strip():
+                return result
+        except Exception as exc:
+            print(f"caption method failed {name}: {exc}", flush=True)
+    return None
+
+
+# ---------------- V6 youtube-transcript-api fallback + better debug ----------------
+# This fallback uses the maintained youtube-transcript-api package as another
+# public-caption method before Whisper. It does not download video/audio.
+def _transcript_raw_items_to_srt(raw_items) -> str:
+    blocks = []
+    for item in raw_items or []:
+        try:
+            if isinstance(item, dict):
+                text = item.get("text") or ""
+                start = float(item.get("start") or 0)
+                duration = float(item.get("duration") or 3)
+            else:
+                text = getattr(item, "text", "") or ""
+                start = float(getattr(item, "start", 0) or 0)
+                duration = float(getattr(item, "duration", 3) or 3)
+            text = _clean_caption_text_line(text)
+            if not text:
+                continue
+            end = start + max(duration, 0.5)
+            blocks.append(f"{len(blocks) + 1}\n{srt_timestamp(start)} --> {srt_timestamp(end)}\n{text}\n")
+        except Exception:
+            continue
+    return "\n".join(blocks).strip() + "\n" if blocks else ""
+
+
+def _fetched_transcript_to_raw_data(fetched):
+    if fetched is None:
+        return []
+    if hasattr(fetched, "to_raw_data"):
+        return fetched.to_raw_data()
+    if isinstance(fetched, list):
+        return fetched
+    try:
+        return list(fetched)
+    except Exception:
+        return []
+
+
+def get_youtube_transcript_api_srt(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    """V6 fallback: use youtube-transcript-api without downloading media."""
+    if not is_youtube_url(url):
+        return None
+    video_id = get_youtube_video_id(url)
+    if not video_id:
+        return None
+    normalized_url = normalize_youtube_url(url)
+    errors = []
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except Exception as exc:
+        print(f"youtube-transcript-api import failed: {exc}", flush=True)
+        return None
+
+    lang_candidates = []
+    for cand in _caption_lang_candidates(requested_language):
+        if cand in {"*", "all", "auto"} or cand.endswith(".*"):
+            continue
+        if cand not in lang_candidates:
+            lang_candidates.append(cand)
+    if "en" not in lang_candidates:
+        lang_candidates.append("en")
+
+    try:
+        # New API: YouTubeTranscriptApi().list(video_id). Old API: YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript_list = None
+        try:
+            ytt_api = YouTubeTranscriptApi()
+            if hasattr(ytt_api, "list"):
+                transcript_list = ytt_api.list(video_id)
+        except Exception as exc:
+            errors.append(f"new_api_list: {exc}")
+        if transcript_list is None and hasattr(YouTubeTranscriptApi, "list_transcripts"):
+            try:
+                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            except Exception as exc:
+                errors.append(f"old_api_list: {exc}")
+
+        manual_languages = []
+        auto_languages = []
+        transcripts = []
+        if transcript_list is not None:
+            try:
+                transcripts = list(transcript_list)
+            except Exception as exc:
+                errors.append(f"list_iter: {exc}")
+            for tr in transcripts:
+                code = getattr(tr, "language_code", "") or ""
+                if getattr(tr, "is_generated", False):
+                    auto_languages.append(code)
+                else:
+                    manual_languages.append(code)
+
+            pools = [
+                ("youtube_transcript_api_manual", [tr for tr in transcripts if not getattr(tr, "is_generated", False)]),
+                ("youtube_transcript_api_auto", [tr for tr in transcripts if getattr(tr, "is_generated", False)]),
+                ("youtube_transcript_api_any", transcripts),
+            ]
+            for source_name, pool in pools:
+                for candidate in lang_candidates + ["en"]:
+                    for tr in pool:
+                        code = getattr(tr, "language_code", "") or ""
+                        if not _caption_key_matches(code, candidate):
+                            continue
+                        try:
+                            fetched = tr.fetch()
+                            raw_items = _fetched_transcript_to_raw_data(fetched)
+                            srt_text = _transcript_raw_items_to_srt(raw_items)
+                            if srt_text.strip():
+                                return srt_text, {
+                                    "source": source_name,
+                                    "subtitle_source": source_name,
+                                    "language": code,
+                                    "format": "transcript_api",
+                                    "title": "YouTube transcript",
+                                    "video_id": video_id,
+                                    "source_url": normalized_url,
+                                    "manual_languages": sorted(set(manual_languages)),
+                                    "auto_languages": sorted(set(auto_languages)),
+                                    "caption_track_count": len(transcripts),
+                                    "no_media_download": True,
+                                    "caption_first": True,
+                                    "errors": errors[-8:],
+                                }
+                        except Exception as exc:
+                            errors.append(f"fetch {source_name}:{code}: {exc}")
+
+        # Direct fetch fallback for current 1.x API.
+        try:
+            ytt_api = YouTubeTranscriptApi()
+            fetched = ytt_api.fetch(video_id, languages=lang_candidates or ["en"])
+            raw_items = _fetched_transcript_to_raw_data(fetched)
+            srt_text = _transcript_raw_items_to_srt(raw_items)
+            if srt_text.strip():
+                return srt_text, {
+                    "source": "youtube_transcript_api_fetch",
+                    "subtitle_source": "youtube_transcript_api_fetch",
+                    "language": getattr(fetched, "language_code", None) or (lang_candidates[0] if lang_candidates else "en"),
+                    "format": "transcript_api",
+                    "title": "YouTube transcript",
+                    "video_id": video_id,
+                    "source_url": normalized_url,
+                    "manual_languages": [],
+                    "auto_languages": [],
+                    "no_media_download": True,
+                    "caption_first": True,
+                    "errors": errors[-8:],
+                }
+        except Exception as exc:
+            errors.append(f"direct_fetch: {exc}")
+    except Exception as exc:
+        errors.append(str(exc))
+    print(f"youtube-transcript-api no result: {errors[-8:]}", flush=True)
+    return None
+
+
+# Optional final fallback: call an alternate caption proxy service if configured.
+# Configure CAPTION_PROXY_URL to an endpoint you control that returns JSON with
+# {success:true, srt_text:"..."}. This is for cases where Railway's IP is blocked.
+def get_external_caption_proxy_srt(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    proxy_url = (os.getenv("CAPTION_PROXY_URL") or "").strip()
+    if not proxy_url:
+        return None
+    try:
+        resp = requests.post(
+            proxy_url,
+            headers={"Content-Type": "application/json"},
+            json={"url": url, "language": requested_language or "auto"},
+            timeout=int(os.getenv("CAPTION_PROXY_TIMEOUT", "45")),
+        )
+        data = resp.json() if resp.headers.get("content-type", "").lower().startswith("application/json") else {}
+        srt_text = (data.get("srt_text") or data.get("srt") or "").strip()
+        if resp.ok and (data.get("success") or data.get("ok")) and srt_text:
+            return srt_text + ("\n" if not srt_text.endswith("\n") else ""), {
+                "source": "external_caption_proxy",
+                "subtitle_source": "external_caption_proxy",
+                "language": data.get("language") or requested_language or "auto",
+                "format": data.get("format") or "srt",
+                "title": data.get("title") or "External caption proxy",
+                "video_id": get_youtube_video_id(url) or "",
+                "source_url": normalize_youtube_url(url) if is_youtube_url(url) else url,
+                "manual_languages": data.get("manual_languages") or [],
+                "auto_languages": data.get("auto_languages") or [],
+                "no_media_download": True,
+                "caption_first": True,
+            }
+    except Exception as exc:
+        print(f"external caption proxy failed: {exc}", flush=True)
+    return None
+
+
+
+SUPPORTED_EXTRACT_MODES = {"auto", "caption_first", "captions", "default", "youtube", "whisper", "downsub", "subdown"}
+
+
+def normalize_extract_mode(mode: str | None) -> str:
+    value = (mode or "caption_first").strip().lower().replace("-", "_")
+    aliases = {
+        "": "caption_first",
+        "normal": "caption_first",
+        "standard": "caption_first",
+        "captionfirst": "caption_first",
+        "caption_first": "caption_first",
+        "captions_first": "caption_first",
+        "sub_down": "subdown",
+        "subsdown": "subdown",
+        "subdown_org": "subdown",
+        "down_sub": "downsub",
+        "downsub_com": "downsub",
+    }
+    value = aliases.get(value, value)
+    return value if value in SUPPORTED_EXTRACT_MODES else value
+
+
+def _mode_open_url(provider: str, url: str) -> str:
+    provider = (provider or "downsub").strip().lower()
+    encoded = urlencode({"url": url})
+    if provider == "subdown":
+        # SubDown.org supports a normal URL form; keep this configurable in case it changes.
+        base = (os.getenv("SUBDOWN_OPEN_URL") or "https://subdown.org/en/").strip()
+    else:
+        base = (os.getenv("DOWNSUB_OPEN_URL") or "https://downsub.com/").strip()
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}{encoded}"
+
+
+def _provider_api_urls(provider: str) -> list[str]:
+    provider = (provider or "downsub").strip().lower()
+    env_names = [
+        f"{provider.upper()}_API_URL",
+        f"{provider.upper()}_ENDPOINT_URL",
+        f"{provider.upper()}_EXTRACT_URL",
+    ]
+    if provider == "downsub":
+        env_names += ["DOWNSUB_URL", "DOWNSUB_FALLBACK_URL"]
+    if provider == "subdown":
+        env_names += ["SUBDOWN_URL", "SUBDOWN_FALLBACK_URL"]
+    # Generic override that can be shared by both modes.
+    env_names += ["SILENT_SUBTITLE_API_URL"]
+    urls = []
     seen = set()
-    for raw in text.split("\n"):
-        line = raw.strip().strip("\ufeff")
-        if not line:
-            continue
-        if line.upper().startswith("WEBVTT"):
-            continue
-        if INDEX_RE.match(line):
-            continue
-        if is_timestamp_line(line) or "-->" in line:
-            continue
-        if line.startswith(("NOTE", "STYLE", "REGION")):
-            continue
-        line = remove_html_tags(line)
-        line = re.sub(r"\s+", " ", line).strip()
-        if not line:
-            continue
-        key = line.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        lines.append(line)
-    # Keep paragraphs but avoid a single huge unpunctuated line.
-    return "\n".join(lines).strip()
+    for name in env_names:
+        value = (os.getenv(name) or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            urls.append(value)
+    return urls
 
 
-def sanitize_bad_service_text(text: str) -> str:
-    text = text or ""
-    lines = []
-    for ln in text.splitlines():
-        if any(pat.lower() in ln.lower() for pat in BAD_TEXT_PATTERNS[:5]):
+def _provider_api_headers(provider: str) -> dict:
+    provider = (provider or "downsub").strip().lower()
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "Content-Type": "application/json",
+        "User-Agent": YOUTUBE_HEADERS.get("User-Agent", "Mozilla/5.0"),
+    }
+    key = (
+        os.getenv(f"{provider.upper()}_API_KEY")
+        or os.getenv(f"{provider.upper()}_TOKEN")
+        or os.getenv("SILENT_SUBTITLE_API_KEY")
+        or ""
+    ).strip()
+    if key:
+        auth_mode = (os.getenv(f"{provider.upper()}_AUTH_MODE") or "bearer").strip().lower()
+        if auth_mode == "x-api-key":
+            headers["X-API-Key"] = key
+        elif auth_mode == "query":
+            # Query auth is handled inside _with_provider_query_auth.
+            pass
+        else:
+            headers["Authorization"] = f"Bearer {key}"
+            headers["X-API-Key"] = key
+    return headers
+
+
+def _with_provider_query_auth(api_url: str, provider: str) -> str:
+    provider = (provider or "downsub").strip().lower()
+    key = (
+        os.getenv(f"{provider.upper()}_API_KEY")
+        or os.getenv(f"{provider.upper()}_TOKEN")
+        or os.getenv("SILENT_SUBTITLE_API_KEY")
+        or ""
+    ).strip()
+    auth_mode = (os.getenv(f"{provider.upper()}_AUTH_MODE") or "bearer").strip().lower()
+    if not key or auth_mode != "query":
+        return api_url
+    key_param = os.getenv(f"{provider.upper()}_API_KEY_PARAM") or "api_key"
+    parsed = urlparse(api_url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query[key_param] = key
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def _maybe_fetch_caption_url(value: str, provider: str, language: str | None = None) -> tuple[str, dict] | None:
+    value = (value or "").strip()
+    if not value.startswith(("http://", "https://")):
+        return None
+    try:
+        resp = requests.get(value, headers=_provider_api_headers(provider), timeout=int(os.getenv("SILENT_SUBTITLE_TIMEOUT", "45")))
+        text = resp.text or ""
+        if not resp.ok or not text.strip():
+            return None
+        content_type = (resp.headers.get("content-type") or "").lower()
+        ext = "vtt" if "vtt" in content_type or value.lower().endswith(".vtt") else "srt"
+        srt_text = normalize_caption_to_srt(text, ext=ext) or normalize_caption_to_srt(text, ext="vtt") or normalize_caption_to_srt(text, ext="json3")
+        if srt_text.strip():
+            return srt_text, {"provider_download_url": value, "format": ext, "language": language or "auto"}
+    except Exception as exc:
+        print(f"{provider} caption URL fetch failed: {exc}", flush=True)
+    return None
+
+
+def _extract_srt_from_provider_json(data, provider: str, language: str | None = None) -> tuple[str, dict] | None:
+    if not isinstance(data, dict):
+        return None
+    text_keys = [
+        "srt_text", "srt", "subtitle", "subtitle_text", "caption", "caption_text",
+        "content", "text", "body", "transcript", "vtt_text", "vtt",
+    ]
+    url_keys = [
+        "srt_url", "download_url", "subtitle_url", "caption_url", "file_url", "url", "vtt_url",
+    ]
+    containers = [data]
+    for key in ("data", "result", "response", "payload", "subtitle", "caption"):
+        if isinstance(data.get(key), dict):
+            containers.append(data[key])
+    for container in containers:
+        for key in text_keys:
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                ext = "vtt" if key.startswith("vtt") or value.lstrip("\ufeff").upper().startswith("WEBVTT") else "srt"
+                srt_text = normalize_caption_to_srt(value, ext=ext) or text_to_basic_srt(value)
+                if srt_text.strip():
+                    return srt_text, {"provider_field": key, "format": ext, "language": container.get("language") or language or "auto"}
+        for key in url_keys:
+            value = container.get(key)
+            if isinstance(value, str):
+                fetched = _maybe_fetch_caption_url(value, provider, language=container.get("language") or language)
+                if fetched:
+                    srt_text, meta = fetched
+                    meta["provider_field"] = key
+                    return srt_text, meta
+    # Some APIs return a list of subtitle options.
+    for list_key in ("subtitles", "captions", "files", "items", "tracks"):
+        items = data.get(list_key)
+        if not isinstance(items, list):
             continue
-        if "<html" in ln.lower() or "</html" in ln.lower():
+        candidates = []
+        for item in items:
+            if isinstance(item, dict):
+                lang = str(item.get("language") or item.get("lang") or item.get("languageCode") or "")
+                fmt = str(item.get("format") or item.get("ext") or "")
+                score = 0
+                if language and _caption_key_matches(lang, language):
+                    score += 50
+                if lang.startswith("en"):
+                    score += 10
+                if fmt.lower() == "srt":
+                    score += 5
+                candidates.append((score, item))
+        for _, item in sorted(candidates, key=lambda x: x[0], reverse=True):
+            result = _extract_srt_from_provider_json(item, provider, language=language)
+            if result:
+                return result
+    return None
+
+
+def get_downsub_subdown_mode_srt(url: str, requested_language: str | None = None, provider: str = "downsub") -> tuple[str, dict] | None:
+    """Accept mode=downsub/subdown without scraping those websites by default.
+
+    If an official or user-controlled API endpoint is configured via environment variables
+    (DOWNSUB_API_URL, SUBDOWN_API_URL, or SILENT_SUBTITLE_API_URL), this calls it and
+    normalizes the result to SRT. Without a configured API, it returns None and /extract-srt
+    will return a structured manual-upload fallback response instead of a DRM/media error.
+    """
+    provider = "subdown" if (provider or "").strip().lower() == "subdown" else "downsub"
+    api_urls = _provider_api_urls(provider)
+    if not api_urls:
+        return None
+    timeout = int(os.getenv("SILENT_SUBTITLE_TIMEOUT", "45"))
+    errors = []
+    for raw_api_url in api_urls:
+        api_url = _with_provider_query_auth(raw_api_url, provider)
+        # Support templates such as https://example.com/extract?url={url}&lang={language}
+        if "{url}" in api_url or "{language}" in api_url:
+            api_url = api_url.replace("{url}", requests.utils.quote(url, safe=""))
+            api_url = api_url.replace("{language}", requests.utils.quote(requested_language or "auto", safe=""))
+        payload = {"url": url, "language": requested_language or "auto", "format": "srt", "mode": provider}
+        headers = _provider_api_headers(provider)
+        for method in ("POST", "GET"):
+            try:
+                if method == "POST":
+                    resp = requests.post(api_url, headers=headers, json=payload, timeout=timeout)
+                else:
+                    resp = requests.get(api_url, headers=headers, params=payload, timeout=timeout)
+                content_type = (resp.headers.get("content-type") or "").lower()
+                text = resp.text or ""
+                if not resp.ok:
+                    errors.append(f"{method} {api_url}: HTTP {resp.status_code} {text[:160]}")
+                    continue
+                if "application/json" in content_type:
+                    data = resp.json()
+                    result = _extract_srt_from_provider_json(data, provider, language=requested_language)
+                    if result:
+                        srt_text, meta = result
+                        meta.update({
+                            "source": f"{provider}_api",
+                            "subtitle_source": f"{provider}_api",
+                            "provider": provider,
+                            "api_url": raw_api_url,
+                            "no_media_download": True,
+                            "caption_first": True,
+                            "errors": errors[-5:],
+                        })
+                        return srt_text, meta
+                    errors.append(f"{method} {api_url}: JSON returned no subtitle text")
+                else:
+                    srt_text = normalize_caption_to_srt(text, ext="srt") or normalize_caption_to_srt(text, ext="vtt") or text_to_basic_srt(text)
+                    if srt_text.strip():
+                        return srt_text, {
+                            "source": f"{provider}_api",
+                            "subtitle_source": f"{provider}_api",
+                            "provider": provider,
+                            "api_url": raw_api_url,
+                            "format": "srt",
+                            "language": requested_language or "auto",
+                            "no_media_download": True,
+                            "caption_first": True,
+                            "errors": errors[-5:],
+                        }
+                    errors.append(f"{method} {api_url}: non-JSON response returned no subtitle text")
+            except Exception as exc:
+                errors.append(f"{method} {api_url}: {exc}")
+                print(f"{provider} API attempt failed: {exc}", flush=True)
+    return None
+
+
+def make_srt_success_response(srt_text: str, meta: dict, base_name: str = "captions"):
+    srt_filename, srt_url = save_srt_response(srt_text, meta.get("video_id") or base_name)
+    return jsonify({
+        "ok": True,
+        "success": True,
+        "srt_text": srt_text,
+        "srt_url": srt_url,
+        "filename": srt_filename,
+        "subtitle_source": meta.get("subtitle_source") or meta.get("source") or "youtube_caption_tracks",
+        "source": meta.get("source") or meta.get("subtitle_source") or "youtube_caption_tracks",
+        "mode": meta.get("mode") or meta.get("provider") or "caption_first",
+        "no_media_download": True if meta.get("no_media_download", True) else False,
+        "caption_first": True,
+        "manual_languages": meta.get("manual_languages") or [],
+        "auto_languages": meta.get("auto_languages") or [],
+        "caption": meta,
+    })
+
+
+def downsub_subdown_manual_fallback_response(url: str, provider: str, status_code: int = 404, errors: list[str] | None = None):
+    provider = "subdown" if (provider or "").strip().lower() == "subdown" else "downsub"
+    return json_error(
+        f"Silent {provider} fallback mode is accepted, but no configured {provider} API returned SRT text.",
+        status_code,
+        mode=provider,
+        accepted_mode=True,
+        caption_first=True,
+        no_media_download=True,
+        needs_upload=True,
+        needs_manual_srt_upload=True,
+        fallback_message="Open Downsub/SubDown, download SRT/VTT, then upload the file to continue.",
+        fallback_options=["Upload .srt/.vtt", "Open Downsub", "Open SubDown"],
+        open_downsub_url=_mode_open_url("downsub", url),
+        open_subdown_url=_mode_open_url("subdown", url),
+        configured_api_urls=_provider_api_urls(provider),
+        caption_errors=(errors or [])[-8:],
+    )
+
+
+def get_youtube_caption_srt(url: str, requested_language: str | None = None) -> tuple[str, dict] | None:
+    """V7 method order: all public-caption methods, then optional external proxy."""
+    if not is_youtube_url(url):
+        return None
+    methods = [
+        ("dynamic_innertube_caption_tracks_v5", get_innertube_caption_tracks),
+        ("youtube_transcript_api", get_youtube_transcript_api_srt),
+        ("watch_page_caption_tracks", get_watch_page_caption_tracks),
+        ("direct_timedtext", get_direct_timedtext_caption_srt),
+        ("ytdlp_metadata", get_ytdlp_caption_srt),
+        ("external_caption_proxy", get_external_caption_proxy_srt),
+    ]
+    for name, fn in methods:
+        if name == "direct_timedtext" and (os.getenv("YOUTUBE_DIRECT_TIMEDTEXT", "true") or "true").strip().lower() in {"0", "false", "no", "off"}:
             continue
-        lines.append(ln)
-    return "\n".join(lines).strip()
+        try:
+            result = fn(url, requested_language=requested_language)
+            if result and result[0].strip():
+                return result
+        except Exception as exc:
+            print(f"caption method failed {name}: {exc}", flush=True)
+    return None
+
+
+# ---------------- Audio, Whisper, SRT, translation ----------------
+
+def convert_media_file_to_mp3(input_path: Path) -> Path:
+    output_path = AUDIO_DIR / f"{input_path.stem}_{uuid.uuid4().hex[:8]}.mp3"
+    ffmpeg_binary = os.getenv("FFMPEG_BINARY", "ffmpeg")
+    command = [
+        ffmpeg_binary, "-y", "-i", str(input_path), "-vn",
+        "-acodec", "libmp3lame", "-ar", "44100", "-ac", "2", "-b:a", "192k", str(output_path),
+    ]
+    print("Running ffmpeg conversion:", " ".join(command), flush=True)
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        print("ffmpeg conversion failed:", result.stderr[-3000:], flush=True)
+        raise RuntimeError("FFmpeg could not convert the media file to MP3")
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError("MP3 file was not created from uploaded media")
+    return output_path
+
+
+def srt_timestamp(seconds: float) -> str:
+    if seconds is None:
+        seconds = 0
+    milliseconds = int(round(float(seconds) * 1000))
+    hours = milliseconds // 3_600_000
+    milliseconds %= 3_600_000
+    minutes = milliseconds // 60_000
+    milliseconds %= 60_000
+    secs = milliseconds // 1000
+    millis = milliseconds % 1000
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _ts_to_seconds(ts: str) -> float:
+    ts = (ts or "").replace(",", ".").strip()
+    parts = ts.split(":")
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    return float(ts)
+
+
+def normalize_whisper_language(language: str | None) -> str | None:
+    if not language:
+        return None
+    language = language.strip().lower()
+    if language in {"auto", "detect", "auto-detect", "autodetect"}:
+        return None
+    language_map = {
+        "myanmar": "my", "burmese": "my", "my-mm": "my", "မြန်မာ": "my",
+        "english": "en", "en-us": "en", "en-gb": "en",
+    }
+    return language_map.get(language, language)
+
+
+def transcribe_mp3_to_srt(mp3_path: Path, language: str | None = None) -> tuple[str, dict]:
+    try:
+        from faster_whisper import WhisperModel
+    except Exception as exc:
+        raise RuntimeError("faster-whisper is not installed. Check requirements.txt and Railway deployment logs.") from exc
+    model_name = os.getenv("WHISPER_MODEL", "base")
+    device = os.getenv("WHISPER_DEVICE", "cpu")
+    compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+    requested_language = normalize_whisper_language(language)
+    language_attempts: list[str | None] = []
+    if requested_language:
+        language_attempts.append(requested_language)
+    language_attempts.append(None)
+    for item in os.getenv("WHISPER_FALLBACK_LANGUAGES", "en,my").split(","):
+        code = normalize_whisper_language(item)
+        if code and code not in language_attempts:
+            language_attempts.append(code)
+    print(f"Loading Whisper model={model_name}, device={device}, compute_type={compute_type}", flush=True)
+    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    attempts = []
+    candidates = []
+    for language_code in language_attempts:
+        for vad_filter in (False, True):
+            try:
+                segments_iter, info = model.transcribe(
+                    str(mp3_path),
+                    language=language_code,
+                    beam_size=5,
+                    vad_filter=vad_filter,
+                    condition_on_previous_text=False,
+                    temperature=0.0,
+                    no_speech_threshold=0.6,
+                    log_prob_threshold=-1.0,
+                )
+                blocks = []
+                plain_parts = []
+                for segment in segments_iter:
+                    text = (segment.text or "").strip()
+                    if not text:
+                        continue
+                    plain_parts.append(text)
+                    blocks.append(f"{len(blocks) + 1}\n{srt_timestamp(segment.start)} --> {srt_timestamp(segment.end)}\n{text}\n")
+                plain = " ".join(plain_parts).strip()
+                score = len(plain) + len(blocks) * 10
+                log = {
+                    "language": language_code or "auto",
+                    "vad_filter": vad_filter,
+                    "detected_language": getattr(info, "language", None),
+                    "language_probability": getattr(info, "language_probability", None),
+                    "segments": len(blocks),
+                    "chars": len(plain),
+                    "score": score,
+                }
+                attempts.append(log)
+                if blocks:
+                    candidates.append((score, "\n".join(blocks).strip() + "\n", info, language_code, vad_filter, len(blocks)))
+            except Exception as exc:
+                attempts.append({"language": language_code or "auto", "vad_filter": vad_filter, "error": str(exc)})
+                print(f"Whisper attempt failed: {exc}", flush=True)
+    if candidates:
+        score, srt_text, info, used_language, vad_filter, segments = max(candidates, key=lambda item: item[0])
+        return srt_text, {
+            "model": model_name,
+            "device": device,
+            "compute_type": compute_type,
+            "requested_language": requested_language or "auto",
+            "used_language": used_language or "auto",
+            "detected_language": getattr(info, "language", None),
+            "language_probability": getattr(info, "language_probability", None),
+            "duration": getattr(info, "duration", None),
+            "segments": segments,
+            "vad_filter": vad_filter,
+            "score": score,
+            "attempts": attempts,
+        }
+    raise RuntimeError(f"Whisper finished but did not produce any subtitle text. Attempts={attempts}")
+
+
+def create_srt_from_mp3(mp3_path: Path, language: str | None = None, base_name: str | None = None) -> tuple[str, str, dict]:
+    srt_text, whisper_meta = transcribe_mp3_to_srt(mp3_path, language=language)
+    safe_base = secure_filename(base_name or mp3_path.stem) or "media"
+    srt_filename = f"{Path(safe_base).stem}_{uuid.uuid4().hex[:8]}.srt"
+    (SRT_DIR / srt_filename).write_text(srt_text, encoding="utf-8")
+    return srt_text, srt_filename, whisper_meta
+
+
+def normalize_translate_language(language: str | None, default: str = "my") -> str:
+    if not language:
+        return default
+    language = language.strip().lower()
+    if language in {"auto", "detect", "auto-detect", "autodetect"}:
+        return "auto"
+    language_map = {
+        "myanmar": "my", "burmese": "my", "မြန်မာ": "my", "my": "my",
+        "english": "en", "en-us": "en", "en-gb": "en", "en": "en",
+        "thai": "th", "chinese": "zh-CN", "simplified chinese": "zh-CN", "traditional chinese": "zh-TW",
+        "japanese": "ja", "korean": "ko", "spanish": "es", "french": "fr", "german": "de",
+    }
+    return language_map.get(language, language)
+
+
+BAD_TRANSLATION_PATTERNS = [
+    r"error\s*500", r"server error", r"that[’']?s an error", r"there was an error",
+    r"please try again later", r"that[’']?s all we know", r"\b1500\b",
+]
+BAD_TRANSLATION_RE = re.compile("|".join(BAD_TRANSLATION_PATTERNS), re.IGNORECASE)
+MYANMAR_RE = re.compile(r"[\u1000-\u109F]")
+LATIN_RE = re.compile(r"[A-Za-z]")
+
+
+def has_myanmar_text(text: str) -> bool:
+    return bool(MYANMAR_RE.search(text or ""))
+
+
+def is_service_error_text(text: str) -> bool:
+    return bool(BAD_TRANSLATION_RE.search(text or ""))
 
 
 def latin_ratio(text: str) -> float:
-    letters = re.findall(r"[A-Za-z]", text or "")
-    total = len(re.sub(r"\s+", "", text or "")) or 1
-    return len(letters) / total
+    visible = [c for c in (text or "") if not c.isspace()]
+    if not visible:
+        return 0.0
+    return sum(1 for c in visible if LATIN_RE.match(c)) / max(1, len(visible))
 
 
-def contains_bad_text(text: str) -> bool:
-    lower = (text or "").lower()
-    return any(pat.lower() in lower for pat in BAD_TEXT_PATTERNS) or bool(TIMESTAMP_RE.search(text or "")) or "-->" in (text or "")
+def sanitize_machine_text_line(text: str) -> str:
+    value = html.unescape((text or "").strip())
+    if not value:
+        return ""
+    if is_service_error_text(value):
+        return ""
+    value = re.sub(r"\bError\s*500\s*\(Server Error\)!*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"That[’']?s an error\.?|There was an error\.?|Please try again later\.?|That[’']?s all we know\.?", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+", " ", value).strip(" !.၊။")
+    return value
 
 
-def ensure_myanmar_punctuation(text: str) -> str:
-    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"[ \t]+", " ", text)
-    raw_parts = [p.strip() for p in re.split(r"\n+", text) if p.strip()]
-    fixed: List[str] = []
-    for part in raw_parts:
-        # Split very long lines using common connectors and punctuation.
-        subparts = re.split(r"(?<=[။.!?])\s+", part)
-        expanded: List[str] = []
-        for sp in subparts:
-            sp = sp.strip()
-            if len(sp) > 260:
-                pieces = re.split(r"(ပြီး|သော်လည်း|ဒါကြောင့်|ထို့နောက်|အဲ့ဒီနောက်|နောက်ဆုံးမှာ|သို့သော်)", sp)
-                buffer = ""
-                for piece in pieces:
-                    buffer += piece
-                    if len(buffer) > 140:
-                        expanded.append(buffer.strip())
-                        buffer = ""
-                if buffer.strip():
-                    expanded.append(buffer.strip())
-            elif sp:
-                expanded.append(sp)
-        for sp in expanded:
-            sp = sp.strip(" ,")
-            if sp and not re.search(r"[။.!?]$", sp):
-                sp += "။"
-            if sp:
-                fixed.append(sp)
-    # Paragraph breaks every 3 sentences.
-    paragraphs = []
-    for i in range(0, len(fixed), 3):
-        paragraphs.append(" ".join(fixed[i:i + 3]))
-    return "\n\n".join(paragraphs).strip()
+def sanitize_translated_segment(original: str, translated: str, target_language: str = "my") -> tuple[str, bool, str]:
+    """Return clean translation, whether it was changed, and reason.
+
+    Google Translate occasionally returns Google error page text inside a
+    translated segment. That must never be passed to rewrite/TTS.
+    """
+    original = (original or "").strip()
+    translated = (translated or "").strip()
+    if not translated:
+        return original, True, "empty_translation"
+    if is_service_error_text(translated):
+        return original, True, "google_error_text_removed"
+    cleaned = sanitize_machine_text_line(translated)
+    if not cleaned:
+        return original, True, "sanitized_empty"
+    target = normalize_translate_language(target_language, default="my")
+    # If target is Myanmar but a full sentence remains almost entirely English,
+    # keep it for the AI rewrite stage to translate naturally, but mark it.
+    # Do not delete proper names; this is only metadata-quality signaling.
+    return cleaned, cleaned != translated, "sanitized" if cleaned != translated else "ok"
 
 
-def split_text_chunks(text: str, max_chars: int = 2200) -> List[str]:
-    text = (text or "").strip()
-    if len(text) <= max_chars:
-        return [text] if text else []
-    # Split on lines/sentence boundaries.
-    units = []
-    for para in re.split(r"\n+", text):
-        para = para.strip()
-        if not para:
+def parse_srt_blocks(srt_text: str) -> list[dict]:
+    text = (srt_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+    # VTT uploads can reach here.
+    if text.upper().startswith("WEBVTT"):
+        text = vtt_to_srt_text(text)
+    raw_blocks = re.split(r"\n\s*\n", text)
+    parsed_blocks = []
+    for raw_block in raw_blocks:
+        lines = [line.rstrip() for line in raw_block.split("\n") if line.strip()]
+        if not lines:
             continue
-        parts = re.split(r"(?<=[။.!?])\s+", para)
-        units.extend([p.strip() for p in parts if p.strip()])
-    chunks: List[str] = []
-    cur = ""
-    for unit in units:
-        if len(cur) + len(unit) + 1 <= max_chars:
-            cur = f"{cur}\n{unit}".strip()
-        else:
-            if cur:
-                chunks.append(cur)
-            if len(unit) > max_chars:
-                for i in range(0, len(unit), max_chars):
-                    chunks.append(unit[i:i + max_chars])
-                cur = ""
-            else:
-                cur = unit
-    if cur:
-        chunks.append(cur)
-    return chunks
+        idx = None
+        time_line = None
+        if lines and re.fullmatch(r"\d+", lines[0].strip()):
+            idx = lines.pop(0).strip()
+        if lines and "-->" in lines[0]:
+            time_line = lines.pop(0).strip()
+        text_lines = [_clean_caption_text_line(x) for x in lines]
+        text_lines = [x for x in text_lines if x]
+        if time_line and text_lines:
+            parsed_blocks.append({"index": idx, "time": time_line, "text": " ".join(text_lines).strip()})
+    return parsed_blocks
 
 
-def distributed_fallback_summary(text: str, target_ratio: float = 0.28) -> str:
-    """Last-resort preview only. Never first-N only; sample beginning/middle/end."""
+def build_srt_from_blocks(blocks: list[dict]) -> str:
+    output_blocks = []
+    for position, block in enumerate(blocks, start=1):
+        output_blocks.append(f"{position}\n{block['time']}\n{(block.get('translated_text') or block.get('text') or '').strip()}\n")
+    return "\n".join(output_blocks).strip() + "\n" if output_blocks else ""
+
+
+def _batch_texts_for_google_translate(texts: list[str], max_items: int = 35, max_chars: int = 3200) -> list[list[str]]:
+    """Group subtitle lines into safe batches for deep-translator.
+
+    Google Translate web calls can fail when we send too many short subtitle
+    segments one-by-one or when a single request becomes too large.  This helper
+    keeps each batch small enough for free translation and Railway timeouts.
+    """
+    batches: list[list[str]] = []
+    current: list[str] = []
+    current_chars = 0
+    for text in texts:
+        item = (text or "").strip()
+        item_chars = len(item)
+        if current and (len(current) >= max_items or current_chars + item_chars > max_chars):
+            batches.append(current)
+            current = []
+            current_chars = 0
+        current.append(item)
+        current_chars += item_chars
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _translate_one_with_retries(translator, text: str, retries: int = 2) -> str:
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            translated = translator.translate(text)
+            translated = (translated or text).strip()
+            return translated or text
+        except Exception as exc:
+            last_error = exc
+            print(f"Google Translate single retry {attempt + 1} failed: {exc}", flush=True)
+    # Do not fail the whole video because one caption line failed.
+    print(f"Google Translate single line failed permanently; keeping original. Error={last_error}", flush=True)
+    return text
+
+
+def _translate_batch_with_fallback(translator, batch: list[str]) -> list[str]:
+    batch = [(x or "").strip() for x in batch]
+    if not batch:
+        return []
+    if len(batch) == 1:
+        return [_translate_one_with_retries(translator, batch[0])]
+
+    # Try batch translation first. It is much faster and avoids hundreds of
+    # network calls for long SRT files.
+    try:
+        translated = translator.translate_batch(batch)
+        if isinstance(translated, list) and len(translated) == len(batch):
+            return [((x or original).strip() or original) for x, original in zip(translated, batch)]
+        print("Google Translate batch returned unexpected shape; splitting batch.", flush=True)
+    except Exception as exc:
+        print(f"Google Translate batch failed; splitting batch. size={len(batch)} error={exc}", flush=True)
+
+    # Binary split keeps progress even when a medium batch fails.
+    mid = len(batch) // 2
+    return _translate_batch_with_fallback(translator, batch[:mid]) + _translate_batch_with_fallback(translator, batch[mid:])
+
+
+def translate_texts_with_google(texts: list[str], source_language: str = "auto", target_language: str = "my") -> list[str]:
+    try:
+        from deep_translator import GoogleTranslator
+    except Exception as exc:
+        raise RuntimeError("deep-translator is not installed. Check requirements.txt and Railway deployment logs.") from exc
+
+    source = normalize_translate_language(source_language, default="auto")
+    target = normalize_translate_language(target_language, default="my")
+    if target == "auto":
+        raise ValueError("target_language cannot be auto")
+    if source == target:
+        return texts
+
+    # Configurable because Railway/free translation can be sensitive to request size.
+    max_items = int(os.environ.get("TRANSLATE_BATCH_ITEMS", "30") or "30")
+    max_chars = int(os.environ.get("TRANSLATE_BATCH_CHARS", "2800") or "2800")
+
+    translator = GoogleTranslator(source=source, target=target)
+    translated_texts: list[str] = [""] * len(texts)
+    cache: dict[str, str] = {}
+
+    # Translate only unique non-empty strings, then map back to original positions.
+    unique_texts: list[str] = []
+    for text in texts:
+        clean_text = (text or "").strip()
+        if clean_text and clean_text not in cache:
+            cache[clean_text] = ""  # placeholder
+            unique_texts.append(clean_text)
+
+    print(f"translate_srt: unique_segments={len(unique_texts)} batch_items={max_items} batch_chars={max_chars}", flush=True)
+
+    for batch_index, batch in enumerate(_batch_texts_for_google_translate(unique_texts, max_items=max_items, max_chars=max_chars), start=1):
+        print(f"translate_srt: translating batch {batch_index} size={len(batch)} chars={sum(len(x) for x in batch)}", flush=True)
+        translated_batch = _translate_batch_with_fallback(translator, batch)
+        for original, translated in zip(batch, translated_batch):
+            cache[original] = (translated or original).strip() or original
+
+    for i, text in enumerate(texts):
+        clean_text = (text or "").strip()
+        translated_texts[i] = cache.get(clean_text, "") if clean_text else ""
+
+    return translated_texts
+
+def translate_srt_text(srt_text: str, source_language: str = "auto", target_language: str = "my") -> tuple[str, dict]:
+    blocks = parse_srt_blocks(srt_text)
+    if not blocks:
+        raise ValueError("Missing or invalid SRT text")
+    original_texts = [block["text"] for block in blocks]
+    translated_texts = translate_texts_with_google(original_texts, source_language=source_language, target_language=target_language)
+    sanitized_count = 0
+    google_error_count = 0
+    untranslated_count = 0
+    target_norm = normalize_translate_language(target_language, default="my")
+    for block, original_text, translated_text in zip(blocks, original_texts, translated_texts):
+        clean_translated, changed, reason = sanitize_translated_segment(original_text, translated_text, target_norm)
+        if changed:
+            sanitized_count += 1
+        if reason == "google_error_text_removed":
+            google_error_count += 1
+        if target_norm == "my" and clean_translated and not has_myanmar_text(clean_translated) and latin_ratio(clean_translated) > 0.55:
+            untranslated_count += 1
+        block["translated_text"] = clean_translated
+    meta = {
+        "engine": "google_translate_with_sanitizer",
+        "source_language": normalize_translate_language(source_language, default="auto"),
+        "target_language": target_norm,
+        "segments": len(blocks),
+        "sanitized_segments": sanitized_count,
+        "google_error_segments_removed": google_error_count,
+        "possibly_untranslated_segments": untranslated_count,
+        "quality_warning": bool(google_error_count or untranslated_count),
+    }
+    return build_srt_from_blocks(blocks), meta
+
+
+def clean_srt_to_text(srt_text: str) -> str:
+    lines = []
+    seen_recent = set()
+    for raw_line in (srt_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if is_service_error_text(line):
+            continue
+        if line.upper() == "WEBVTT" or line.upper().startswith(("NOTE", "STYLE", "REGION")):
+            continue
+        if re.fullmatch(r"\d+", line):
+            continue
+        if SRT_TIMESTAMP_RE.match(line) or "-->" in line:
+            continue
+        line = _clean_caption_text_line(line)
+        if not line:
+            continue
+        key = line.casefold()
+        if key in seen_recent:
+            continue
+        seen_recent.add(key)
+        if len(seen_recent) > 50:
+            seen_recent = set(list(seen_recent)[-25:])
+        lines.append(line)
+    return re.sub(r"\s+", " ", " ".join(lines)).strip()
+
+
+def local_rewrite_for_tts(text: str, language: str = "my", style: str = "natural_accurate") -> str:
+    """Honest non-AI cleanup. This is not a true semantic rewrite."""
     cleaned = clean_srt_to_text(text)
     if not cleaned:
+        cleaned = re.sub(r"\s+", " ", (text or "")).strip()
+    if not cleaned:
         return ""
-    target = max(600, int(len(cleaned) * max(0.12, min(target_ratio, 0.35))))
-    if len(cleaned) <= target:
-        return ensure_myanmar_punctuation(cleaned)
-    zones = [
-        cleaned[: max(1, len(cleaned) // 3)],
-        cleaned[len(cleaned) // 3: 2 * len(cleaned) // 3],
-        cleaned[2 * len(cleaned) // 3:],
-    ]
-    zone_target = max(180, target // 3)
-    pieces = []
-    for zone in zones:
-        sentences = re.split(r"(?<=[။.!?])\s+|\n+", zone)
-        chosen = ""
-        for sent in sentences:
-            sent = sent.strip()
-            if not sent:
-                continue
-            if len(chosen) + len(sent) + 1 > zone_target and len(chosen) > zone_target * 0.65:
-                break
-            chosen = f"{chosen} {sent}".strip()
-        if not chosen:
-            chosen = zone[:zone_target]
-        pieces.append(chosen.strip())
-    return ensure_myanmar_punctuation("\n".join(pieces))
-
-
-def important_tokens(text: str, max_tokens: int = 28) -> List[str]:
-    text = text or ""
-    # English/Korean style names and longer Myanmar tokens.
-    tokens = re.findall(r"[A-Z][A-Za-z-]{2,}|[က-အ][က-အါ-ှ]{3,}", text)
-    freq: Dict[str, int] = {}
-    for tok in tokens:
-        if len(tok.strip()) < 4:
+    cleaned = html.unescape(cleaned)
+    cleaned = re.sub(r"\s+([၊။,.!?])", r"\1", cleaned)
+    cleaned = re.sub(r"([။.!?])\s*", r"\1\n", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    paragraphs = []
+    seen = set()
+    for p in cleaned.splitlines():
+        p = p.strip(" \t-–—")
+        if not p:
             continue
-        freq[tok] = freq.get(tok, 0) + 1
-    return [k for k, _ in sorted(freq.items(), key=lambda x: (-x[1], x[0]))[:max_tokens]]
-
-
-def coverage_score(source: str, script: str) -> Dict[str, object]:
-    source = source or ""
-    script_lower = (script or "").lower()
-    n = len(source)
-    if n < 300:
-        return {"start": True, "middle": True, "end": True, "end_tokens": [], "missing_end": []}
-    zones = {
-        "start": source[: int(n * 0.2)],
-        "middle": source[int(n * 0.4): int(n * 0.6)],
-        "end": source[int(n * 0.8):],
-    }
-    result = {}
-    for name, zone in zones.items():
-        toks = important_tokens(zone, 15)
-        if not toks:
-            result[name] = True
-            result[f"{name}_tokens"] = []
-            result[f"missing_{name}"] = []
+        key = p.casefold()
+        if key in seen:
             continue
-        hits = [t for t in toks if t.lower() in script_lower]
-        result[name] = len(hits) >= max(1, math.ceil(len(toks) * 0.18))
-        result[f"{name}_tokens"] = toks
-        result[f"missing_{name}"] = [t for t in toks if t not in hits]
-    return result
+        seen.add(key)
+        paragraphs.append(p)
+    return "\n".join(paragraphs).strip()
 
 
-def script_quality(source_text: str, script: str, source: str = "") -> Dict[str, object]:
-    script = script or ""
-    source_text = source_text or ""
-    ratio = len(script) / max(1, len(source_text))
-    bad_quality = any(x in (source or "").lower() for x in ["fallback", "cleanup", "local"])
-    cov = coverage_score(source_text, script)
-    punctuation_count = script.count("။") + script.count(".") + script.count("!") + script.count("?")
-    tts_safe = bool(script.strip()) and not contains_bad_text(script) and not bad_quality
-    if ratio > 0.55 or ratio < 0.12:
-        tts_safe = False
-    if cov.get("end") is False:
-        tts_safe = False
-    if len(script) > 600 and punctuation_count < max(1, len(script) // 450):
-        tts_safe = False
-    if latin_ratio(script) > float(os.getenv("REWRITE_MAX_LATIN_RATIO", "0.25")):
-        # Allow names, but block mostly English outputs.
-        tts_safe = False
-    return {
-        "ratio": round(ratio, 4),
-        "tts_safe": tts_safe,
-        "needs_retry": not tts_safe,
-        "bad_text": contains_bad_text(script),
-        "latin_ratio": round(latin_ratio(script), 4),
-        "coverage": cov,
-        "punctuation_count": punctuation_count,
+def normalize_rewrite_style(style: str | None) -> str:
+    value = (style or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "natural": "natural_accurate",
+        "accurate": "natural_accurate",
+        "natural_accurate": "natural_accurate",
+        "concise_natural_tts": "natural_accurate",
+        "movie_recap": "movie_recap",
+        "recap": "movie_recap",
+        "concise_narrative_summary": "concise_summary",
+        "concise_summary": "concise_summary",
+        "summary": "concise_summary",
+        "voiceover_summary": "concise_summary",
+        "emotional": "emotional_tts",
+        "emotional_tts": "emotional_tts",
+        "storytelling": "emotional_tts",
+        "dramatic": "emotional_tts",
+    }
+    return aliases.get(value, "natural_accurate")
+
+
+def build_rewrite_prompt(
+    text: str,
+    language: str = "my",
+    style: str = "natural_accurate",
+    chunk_index: int | None = None,
+    chunk_total: int | None = None,
+    target_length_ratio: float | None = None,
+) -> str:
+    """Prompt for real semantic rewrite, not SRT cleanup."""
+    style_norm = normalize_rewrite_style(style)
+    input_len = len(text or "")
+    if target_length_ratio is None:
+        if style_norm == "concise_summary":
+            target_length_ratio = float(os.getenv("REWRITE_TARGET_RATIO_CONCISE", "0.28"))
+        elif style_norm == "movie_recap":
+            target_length_ratio = float(os.getenv("REWRITE_TARGET_RATIO_RECAP", "0.35"))
+        else:
+            target_length_ratio = float(os.getenv("REWRITE_TARGET_RATIO", "0.45"))
+    target_percent = int(max(0.18, min(0.65, target_length_ratio)) * 100)
+    target_chars = max(1200, int(input_len * max(0.18, min(0.65, target_length_ratio)))) if input_len > 1000 else max(300, int(input_len * 0.55))
+    chunk_note = ""
+    if chunk_index is not None and chunk_total is not None and chunk_total > 1:
+        chunk_note = (
+            f"\nThis is segment {chunk_index} of {chunk_total}. Rewrite ONLY this segment. "
+            "Do not add an introduction, ending, title, summary, or recap of the whole story."
+        )
+
+    base_rules = f"""
+You are a senior Myanmar voice-over scriptwriter, not a subtitle cleaner.
+Your job is to transform machine-translated subtitle text into natural Myanmar spoken narration.
+
+CRITICAL RULES:
+- Do NOT simply remove timestamps and join subtitle lines.
+- Do NOT summarize the whole input into one or two sentences.
+- Do NOT rewrite line-by-line; combine repeated subtitle fragments into smooth narrative paragraphs.
+- Keep only the important plot events, character motivations, cause/effect, and story order.
+- Preserve proper names such as Eternia, Eternos, Castle Grayskull, Sword of Power, and character names.
+- Fix literal Google Translate style into smooth Myanmar prose.
+- If any English remains in the input, translate it naturally into Myanmar before rewriting.
+- Keep English only for proper names such as Ki-Taek, Ki-Woo, Park, Moon-Gwang, Da-Song, Seoul, NASA, etc.
+- Completely remove any machine/service error text such as Error 500, Server Error, That is an error, Please try again later.
+- Keep the meaning, but rewrite the wording so it sounds written by a human narrator.
+- Use normal Myanmar paragraphs and spoken sentence rhythm.
+- Remove SRT numbers, timestamps, arrows, WEBVTT headers, duplicates, and broken subtitle fragments.
+- Return ONLY the final Myanmar script. No markdown, no title, no explanation.
+- Input length is about {input_len} characters. Target output length is about {target_percent}% of the input, around {target_chars} characters for this chunk.
+- The final script must be shorter than the subtitle text, but still complete enough for a movie recap voice-over.{chunk_note}
+""".strip()
+
+    if style_norm == "concise_summary":
+        style_rules = """
+STYLE: Concise Myanmar movie recap voice-over
+- Write as polished spoken Myanmar narration, not subtitles.
+- Reduce length strongly: keep the main plot only, remove repeated details and filler.
+- Use short natural paragraphs with clear transitions.
+- Preserve important names and causal story order.
+- No English instructions, no notes, no headings, no bullet points.
+""".strip()
+    elif style_norm == "emotional_tts":
+        style_rules = """
+STYLE: Emotional TTS / dramatic storytelling
+- Make it vivid, cinematic, and suspenseful.
+- Use short spoken sentences with natural pauses.
+- Add emotional flow with words like ဒါပေမယ့်, ထိုအချိန်မှာ, နောက်ဆုံးမှာ, အဲဒီအခါ only when they help the narration.
+- Make it pleasant to listen to as a Myanmar voice-over.
+- Do not over-act; keep it clear and story-focused.
+""".strip()
+    elif style_norm == "movie_recap":
+        style_rules = """
+STYLE: Movie Recap narration
+- Make it concise, engaging, and easy to follow.
+- Use active voice and clear transitions between events.
+- Keep the core plot details and cause/effect relationship.
+""".strip()
+    else:
+        style_rules = """
+STYLE: Natural Accurate narration
+- Stay close to the original meaning.
+- Make the Myanmar wording fluent, concise, and natural.
+- Remove awkward literal translation while keeping the facts.
+- Prefer clear spoken prose over subtitle fragments.
+""".strip()
+
+    return f"{base_rules}\n\n{style_rules}\n\nTarget language: Myanmar (my)\n\nInput subtitle text:\n{text}"
+
+
+def get_openrouter_model_candidates() -> list[str]:
+    primary = os.getenv("OPENROUTER_MODEL", "").strip()
+    configured = os.getenv("OPENROUTER_MODELS", "").strip()
+    values: list[str] = []
+    if configured:
+        values.extend([x.strip() for x in configured.split(",") if x.strip()])
+    if primary:
+        values.insert(0, primary)
+    # Free fallback candidates. Availability changes, so failures are handled gracefully.
+    values.extend([
+        "qwen/qwen3.6-plus:free",
+        "qwen/qwen3-coder:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "openrouter/free",
+    ])
+    return _unique_ordered(values)
+
+
+def split_text_for_ai_rewrite(text: str, max_chars: int | None = None) -> list[str]:
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    if not text:
+        return []
+    max_chars = max_chars or int(os.getenv("OPENROUTER_REWRITE_CHUNK_CHARS", "4500"))
+    if len(text) <= max_chars:
+        return [text]
+    pieces = re.split(r"(?<=[။.!?])\s+", text)
+    chunks: list[str] = []
+    current = ""
+    for piece in pieces:
+        piece = piece.strip()
+        if not piece:
+            continue
+        if len(piece) > max_chars:
+            # Hard split very long machine-translated lines.
+            if current:
+                chunks.append(current.strip())
+                current = ""
+            for i in range(0, len(piece), max_chars):
+                chunks.append(piece[i:i + max_chars].strip())
+            continue
+        if current and len(current) + 1 + len(piece) > max_chars:
+            chunks.append(current.strip())
+            current = piece
+        else:
+            current = f"{current} {piece}".strip()
+    if current:
+        chunks.append(current.strip())
+    return chunks or [text]
+
+
+def strip_ai_artifacts(text: str) -> str:
+    value = (text or "").strip()
+    value = re.sub(r"^```(?:\w+)?\s*|\s*```$", "", value).strip()
+    value = re.sub(r"<think>.*?</think>", "", value, flags=re.IGNORECASE | re.DOTALL).strip()
+    value = re.sub(r"^(?:Final Script|Rewritten Script|Output|Myanmar Script)\s*[:：]\s*", "", value, flags=re.IGNORECASE).strip()
+    # Remove accidental markdown headings/bullets but keep Myanmar prose.
+    cleaned_lines = []
+    for line in value.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^[-*#>\s]+", "", line).strip()
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
+def ai_rewrite_min_chars(input_text: str, style: str = "natural_accurate") -> int:
+    input_len = len(input_text or "")
+    style_norm = normalize_rewrite_style(style)
+    if input_len < 500:
+        return max(80, int(input_len * 0.35))
+    ratio = 0.30 if style_norm == "emotional_tts" else 0.28
+    if style_norm == "movie_recap":
+        ratio = 0.20
+    if style_norm == "concise_summary":
+        ratio = float(os.getenv("REWRITE_MIN_RATIO_CONCISE", "0.12"))
+    return max(450, min(4000, int(input_len * ratio)))
+
+
+def validate_ai_rewrite(rewritten: str, input_text: str, style: str = "natural_accurate") -> tuple[bool, str]:
+    rewritten_clean = clean_srt_to_text(rewritten) or strip_ai_artifacts(rewritten)
+    if not rewritten_clean.strip():
+        return False, "empty_ai_output"
+    min_chars = ai_rewrite_min_chars(input_text, style)
+    if len(rewritten_clean) < min_chars:
+        return False, f"too_short:{len(rewritten_clean)}<{min_chars}"
+    lower = rewritten_clean.lower()
+    leaked_phrases = ["we need to", "must ", "should ", "preserve names", "return only", "the segment", "input subtitle text"]
+    if any(x in lower for x in leaked_phrases):
+        return False, "instruction_leakage"
+    if is_service_error_text(rewritten_clean):
+        return False, "service_error_text_leakage"
+    # Myanmar TTS scripts should not be mostly English, except for names.
+    if normalize_rewrite_style(style) in {"natural_accurate", "emotional_tts", "movie_recap", "concise_summary"}:
+        if len(rewritten_clean) > 500 and latin_ratio(rewritten_clean) > float(os.getenv("REWRITE_MAX_LATIN_RATIO", "0.18")):
+            return False, f"too_much_english:{latin_ratio(rewritten_clean):.2f}"
+    # If output is basically one tiny fragment for a long input, reject it.
+    if len(input_text or "") > 3000 and len(re.split(r"[။.!?]\s+|\n+", rewritten_clean)) < 6:
+        return False, "too_few_sentences_for_long_input"
+    style_norm = normalize_rewrite_style(style)
+    max_ratio = 0.65
+    if style_norm == "concise_summary":
+        max_ratio = float(os.getenv("REWRITE_MAX_RATIO_CONCISE", "0.50"))
+    elif style_norm == "movie_recap":
+        max_ratio = float(os.getenv("REWRITE_MAX_RATIO_RECAP", "0.60"))
+    if len(input_text or "") > 2000 and len(rewritten_clean) > int(len(input_text) * max_ratio):
+        return False, f"too_long:{len(rewritten_clean)}>{int(len(input_text)*max_ratio)}"
+    return True, "ok"
+
+
+def call_openrouter_rewrite(model: str, prompt: str, style: str) -> tuple[str, dict]:
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    max_tokens = int(os.getenv("OPENROUTER_MAX_TOKENS", "5000"))
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a Myanmar narration scriptwriter. "
+                    "Always return the rewritten Myanmar script only. "
+                    "Write natural, concise Myanmar voice-over narration. "
+                    "No English instructions, no markdown, no explanation."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": float(os.getenv("OPENROUTER_TEMPERATURE", "0.72" if normalize_rewrite_style(style) == "emotional_tts" else "0.55")),
+        "top_p": float(os.getenv("OPENROUTER_TOP_P", "0.9")),
+        "max_tokens": max_tokens,
+    }
+    resp = requests.post(
+        OPENROUTER_CHAT_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://video-audio-tool-production.up.railway.app"),
+            "X-Title": os.getenv("OPENROUTER_APP_TITLE", "Video2Audio Pro"),
+        },
+        json=payload,
+        timeout=int(os.getenv("OPENROUTER_TIMEOUT", "120")),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+    return strip_ai_artifacts(content), {
+        "model": model,
+        "usage": data.get("usage") or {},
+        "finish_reason": ((data.get("choices") or [{}])[0].get("finish_reason")),
     }
 
 
-# -----------------------------
-# Translation
-# -----------------------------
 
-def translate_items_google(items: List[str], source_language: str, target_language: str) -> Tuple[List[str], Dict[str, int]]:
-    from deep_translator import GoogleTranslator
-
-    target = "my" if target_language in {"my", "mm", "burmese", "myanmar"} else target_language
-    source = "auto" if not source_language or source_language == "auto" else source_language
-    translator = GoogleTranslator(source=source, target=target)
-    translated: List[str] = []
-    stats = {"failed_segments": 0, "google_error_segments_removed": 0, "possibly_untranslated_segments": 0}
-    batch_size = int(os.getenv("TRANSLATE_BATCH_ITEMS", "25"))
-    max_chars = int(os.getenv("TRANSLATE_BATCH_CHARS", "2500"))
-
-    i = 0
-    while i < len(items):
-        batch: List[str] = []
-        chars = 0
-        while i < len(items) and len(batch) < batch_size and chars + len(items[i]) <= max_chars:
-            batch.append(items[i])
-            chars += len(items[i])
-            i += 1
-        if not batch:
-            batch = [items[i]]
-            i += 1
-        try:
-            outs = translator.translate_batch(batch)
-            if not isinstance(outs, list) or len(outs) != len(batch):
-                raise ValueError("translate_batch returned unexpected result")
-        except Exception:
-            outs = []
-            for item in batch:
-                try:
-                    outs.append(translator.translate(item))
-                    time.sleep(0.05)
-                except Exception:
-                    stats["failed_segments"] += 1
-                    outs.append(item)
-        for original, out in zip(batch, outs):
-            out = sanitize_bad_service_text(out or "")
-            if not out:
-                out = original
-                stats["failed_segments"] += 1
-            if any(p.lower() in out.lower() for p in ["error 500", "server error", "that's an error", "that’s an error"]):
-                stats["google_error_segments_removed"] += 1
-                out = original
-            if target == "my" and latin_ratio(out) > 0.65 and len(out) > 20:
-                stats["possibly_untranslated_segments"] += 1
-            translated.append(out)
-    return translated, stats
+def truthy_env(name: str, default: str = "false") -> bool:
+    return (os.getenv(name, default) or default).strip().lower() in {"1", "true", "yes", "on"}
 
 
-# -----------------------------
-# IAMHC LLM integration
-# -----------------------------
+def iamhc_rewrite_enabled() -> bool:
+    return truthy_env("USE_IAMHC_REWRITE", "false") and bool((os.getenv("IAMHC_API_KEY") or "").strip())
 
-def iamhc_chat(model: str, system_prompt: str, user_prompt: str, max_tokens: Optional[int] = None) -> Tuple[Optional[str], Dict[str, object]]:
-    api_key = os.getenv("IAMHC_API_KEY", "").strip()
-    base_url = os.getenv("IAMHC_BASE_URL", "https://api.iamhc.cn/v1").rstrip("/")
+
+def get_iamhc_chat_url() -> str:
+    base_url = (os.getenv("IAMHC_BASE_URL") or IAMHC_DEFAULT_BASE_URL).strip().rstrip("/")
+    return f"{base_url}/chat/completions"
+
+
+def get_iamhc_model_candidates() -> list[str]:
+    configured = os.getenv("IAMHC_MODELS", "").strip()
+    values: list[str] = []
+    if configured:
+        values.extend([x.strip() for x in configured.split(",") if x.strip()])
+    for env_name, fallback in [
+        ("IAMHC_REWRITE_MODEL", "Qwen3.5-397B-A17B"),
+        ("IAMHC_FINAL_POLISH_MODEL", "Qwen3.5-397B-A17B"),
+        ("IAMHC_FAST_MODEL", "DeepSeek-V4-Flash"),
+        ("IAMHC_FALLBACK_MODEL", "DeepSeek-V4-Flash"),
+    ]:
+        value = (os.getenv(env_name) or fallback or "").strip()
+        if value:
+            values.append(value)
+    values.extend(["Qwen3.5-397B-A17B", "DeepSeek-V4-Flash"])
+    return _unique_ordered(values)
+
+
+def call_iamhc_rewrite(model: str, prompt: str, style: str) -> tuple[str, dict]:
+    """Call IAMHC OpenAI-compatible chat completions and use message.content only.
+
+    Some reasoning models/gateways can return reasoning_content with null content.
+    reasoning_content is intentionally never treated as final script.
+    """
+    api_key = (os.getenv("IAMHC_API_KEY") or "").strip()
     if not api_key:
-        return None, {"ok": False, "error": "IAMHC_API_KEY is not set"}
+        raise RuntimeError("IAMHC_API_KEY is not configured")
+    system_prompt = (
+        "You are a professional Myanmar voice-over script writer. "
+        "Output only the final Myanmar narration. "
+        "Do not explain. Do not include English instructions. "
+        "Do not include notes, headings, bullet points, markdown, or reasoning. "
+        "Use natural Myanmar spoken narration with complete sentences."
+    )
+    user_prompt = prompt
+    # Qwen thinking variants are more reliable with /no_think at the start.
+    if "qwen" in (model or "").lower() and not user_prompt.lstrip().startswith("/no_think"):
+        user_prompt = "/no_think\n" + user_prompt
     payload = {
         "model": model,
         "messages": [
@@ -515,755 +2864,1017 @@ def iamhc_chat(model: str, system_prompt: str, user_prompt: str, max_tokens: Opt
             {"role": "user", "content": user_prompt},
         ],
         "temperature": float(os.getenv("IAMHC_TEMPERATURE", "0.2")),
-        "max_tokens": int(max_tokens or os.getenv("IAMHC_MAX_TOKENS", "2500")),
+        "max_tokens": int(os.getenv("IAMHC_MAX_TOKENS", "2500")),
     }
-    try:
-        resp = requests.post(
-            f"{base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            timeout=int(os.getenv("IAMHC_TIMEOUT", "180")),
-        )
-        raw = resp.text
-        if not resp.ok:
-            return None, {"ok": False, "status": resp.status_code, "raw": raw[:1000]}
-        data = resp.json()
-        choice = (data.get("choices") or [{}])[0]
-        message = choice.get("message") or {}
-        content = message.get("content")
-        if not content or not str(content).strip():
-            return None, {
-                "ok": False,
-                "error": "empty_content",
-                "model_returned": data.get("model"),
-                "finish_reason": choice.get("finish_reason"),
-                "has_reasoning_content": bool(message.get("reasoning_content")),
-            }
-        content = str(content).strip()
-        meta = {
-            "ok": True,
-            "requested_model": model,
-            "model_returned": data.get("model"),
-            "finish_reason": choice.get("finish_reason"),
-            "usage": data.get("usage", {}),
-        }
-        return content, meta
-    except Exception as exc:
-        return None, {"ok": False, "error": str(exc)}
-
-
-def bad_llm_output(text: str) -> bool:
-    if not text or len(text.strip()) < 20:
-        return True
-    if contains_bad_text(text):
-        return True
-    # Reject instruction/explanation leakage.
-    leakage = [
-        "Got it", "Let's tackle", "We need", "The sentence", "Possible translation",
-        "Here is", "I will", "In Burmese", "In Myanmar", "note:", "bullet",
-    ]
-    low = text.lower()
-    if any(x.lower() in low for x in leakage):
-        return True
-    return False
-
-
-def rewrite_with_iamhc(text: str, option: str, target_ratio: float) -> Tuple[Optional[str], Dict[str, object]]:
-    if not env_bool("USE_IAMHC_REWRITE", True):
-        return None, {"ok": False, "error": "USE_IAMHC_REWRITE disabled"}
-    models = []
-    for name in [
-        os.getenv("IAMHC_REWRITE_MODEL", "Qwen3.5-397B-A17B"),
-        os.getenv("IAMHC_FINAL_POLISH_MODEL", "Qwen3.5-397B-A17B"),
-        os.getenv("IAMHC_FAST_MODEL", "DeepSeek-V4-Flash"),
-        os.getenv("IAMHC_FALLBACK_MODEL", "DeepSeek-V4-Flash"),
-    ]:
-        if name and name not in models:
-            models.append(name)
-
-    max_chunk_chars = int(os.getenv("OPENROUTER_REWRITE_CHUNK_CHARS", os.getenv("IAMHC_REWRITE_CHUNK_CHARS", "2200")))
-    chunks = split_text_chunks(text, max_chunk_chars)
-    if not chunks:
-        return None, {"ok": False, "error": "empty_text"}
-
-    if option == "emotional_tts":
-        style_desc = (
-            "စိတ်ဝင်စားစရာကောင်းတဲ့ storytelling voice-over ပုံစံ၊ စာကြောင်းတိုတို၊ pause ကောင်းကောင်း၊ "
-            "နားထောင်သူကိုဆွဲဆောင်နိုင်တဲ့ emotional Myanmar narration"
-        )
-    else:
-        style_desc = (
-            "မူရင်းအဓိပ္ပါယ်မပျောက်စေဘဲ ရှင်းလင်းပြီး သဘာဝကျတဲ့ documentary/movie recap Myanmar narration"
-        )
-
-    system_prompt = (
-        "You are a professional Myanmar voice-over script writer. "
-        "Output only final Myanmar narration. No English explanation. No notes. No bullet points. "
-        "Do not include reasoning. Do not include instructions. Use natural Burmese punctuation. "
-        "Keep names if needed, but rewrite surrounding narration in Myanmar."
+    resp = requests.post(
+        get_iamhc_chat_url(),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=int(os.getenv("IAMHC_TIMEOUT", "180")),
     )
+    resp.raise_for_status()
+    data = resp.json()
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = (message.get("content") or "").strip()
+    if not content:
+        raise RuntimeError("IAMHC returned empty message.content")
+    # Safety: never use model thinking/reasoning as user-visible script.
+    if message.get("reasoning_content") and not content:
+        raise RuntimeError("IAMHC returned reasoning_content without final content")
+    return strip_ai_artifacts(content), {
+        "provider": "iamhc",
+        "model": model,
+        "gateway_model": data.get("model"),
+        "usage": data.get("usage") or {},
+        "finish_reason": choice.get("finish_reason"),
+    }
 
-    all_model_meta = []
+
+def rewrite_with_iamhc(text: str, language: str = "my", style: str = "natural_accurate", target_length_ratio: float | None = None) -> tuple[str, str, dict]:
+    cleaned = clean_srt_to_text(text) or re.sub(r"\s+", " ", (text or "")).strip()
+    if not cleaned:
+        return "", "empty", {"ai_rewrite_configured": False, "rewrite_quality": "empty"}
+    if not iamhc_rewrite_enabled():
+        return "", "iamhc_disabled", {"ai_rewrite_configured": False, "rewrite_quality": "iamhc_disabled"}
+
+    style_norm = normalize_rewrite_style(style)
+    if target_length_ratio is None and style_norm == "concise_summary":
+        target_length_ratio = float(os.getenv("REWRITE_TARGET_RATIO_CONCISE", "0.28"))
+    chunks = split_text_for_ai_rewrite(cleaned, int(os.getenv("IAMHC_REWRITE_CHUNK_CHARS", os.getenv("OPENROUTER_REWRITE_CHUNK_CHARS", "2500"))))
+    models = get_iamhc_model_candidates()
+    attempts: list[dict] = []
+
     for model in models:
-        rewritten_chunks: List[str] = []
-        model_failed = False
-        for idx, chunk in enumerate(chunks, start=1):
-            user_prompt = (
-                f"အောက်ကစာက video subtitle/translation ထဲက အပိုင်း {idx}/{len(chunks)} ဖြစ်ပါတယ်။\n"
-                f"ဒီအပိုင်းကို {style_desc} အဖြစ် မြန်မာစကားပြေ voice-over narration ပြန်ရေးပါ။\n"
-                "မြန်မာစာတစ်ခုတည်းသာပြန်ပါ။ English explanation မထည့်ပါနဲ့။\n"
-                "SRT timestamp, numbering, arrow မထည့်ပါနဲ့။\n"
-                "ဇာတ်လမ်းအစဉ်အလိုက် အဓိကဖြစ်ရပ်တွေမပျောက်စေပါနဲ့။\n\n"
-                f"စာသား:\n{chunk}"
-            )
-            out, meta = iamhc_chat(model, system_prompt, user_prompt)
-            all_model_meta.append(meta)
-            if not out or bad_llm_output(out):
-                model_failed = True
-                break
-            rewritten_chunks.append(out.strip())
-        if model_failed or not rewritten_chunks:
-            continue
-
-        merged = "\n".join(rewritten_chunks).strip()
-        # Final polish, especially for multi-chunk stories.
-        if len(chunks) > 1 or len(merged) > int(len(text) * (target_ratio + 0.1)):
-            polish_prompt = (
-                "အောက်က အပိုင်းလိုက်ရေးထားတဲ့ မြန်မာ narration ကို ဇာတ်လမ်းအစ-အလယ်-အဆုံးမပျောက်စေဘဲ "
-                f"တစ်ပုဒ်တည်းသော concise voice-over script အဖြစ်ပြန်စီပါ။ Target length က မူရင်းစာရဲ့ {int(target_ratio*100)}% ဝန်းကျင်။\n"
-                "အဆုံးပိုင်း/ဖြေရှင်းချက် မဖြတ်ပါနဲ့။ မြန်မာစာတစ်ခုတည်းသာပြန်ပါ။ English မထည့်ပါနဲ့။\n\n"
-                f"Draft:\n{merged}"
-            )
-            polished, pmeta = iamhc_chat(model, system_prompt, polish_prompt, max_tokens=int(os.getenv("IAMHC_POLISH_MAX_TOKENS", "3000")))
-            all_model_meta.append(pmeta)
-            if polished and not bad_llm_output(polished):
-                merged = polished.strip()
-        merged = ensure_myanmar_punctuation(sanitize_bad_service_text(merged))
-        q = script_quality(text, merged, source="iamhc_ai")
-        # Allow a little flexibility; mark unsafe if too long/coverage fail but still return.
-        if bad_llm_output(merged):
-            continue
-        return merged, {"ok": True, "model": model, "meta": all_model_meta, "quality": q}
-
-    return None, {"ok": False, "error": "all_models_failed", "models_tried": models, "meta": all_model_meta[-4:]}
-
-
-def make_rewrite_option(text: str, option_id: str, title: str, target_ratio: float) -> Dict[str, object]:
-    script, meta = rewrite_with_iamhc(text, option_id, target_ratio)
-    source = "iamhc_qwen_ai"
-    quality = "ai_rewrite"
-    if not script:
-        script = distributed_fallback_summary(text, target_ratio)
-        source = "LOCAL_SANITIZED_SUMMARY_FALLBACK"
-        quality = "local_sanitized_summary_fallback"
-    q = script_quality(text, script, source=source)
-    filename = f"{option_id}_{now_stamp()}_{uid()}.txt"
-    write_text_file(SCRIPT_DIR / filename, script)
-    return {
-        "id": option_id,
-        "title": title,
-        "script": script,
-        "text": script,
-        "quality": quality,
-        "source": source,
-        "tts_safe": bool(q["tts_safe"] and quality == "ai_rewrite"),
-        "needs_retry": bool(q["needs_retry"] or quality != "ai_rewrite"),
-        "script_url": public_url("script", filename, f"{option_id}.txt"),
-        "download_url": public_url("script", filename, f"{option_id}.txt"),
-        "rewrite": {
-            "input_chars": len(text),
-            "output_chars": len(script),
-            "target_ratio": target_ratio,
-            "actual_ratio": q["ratio"],
-            "engine_meta": meta,
-        },
-        "quality_checks": q,
-    }
-
-
-# -----------------------------
-# SRT extraction / media processing
-# -----------------------------
-
-def youtube_download_audio(url: str, out_dir: Path) -> Path:
-    import yt_dlp
-
-    outtmpl = str(out_dir / f"audio_{uid()}.%(ext)s")
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": outtmpl,
-        "quiet": True,
-        "noplaylist": True,
-        "cookiefile": str(BASE_DIR / "cookies.txt") if (BASE_DIR / "cookies.txt").exists() else None,
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
-    }
-    ydl_opts = {k: v for k, v in ydl_opts.items() if v is not None}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        # yt-dlp after postprocessor may not update filepath reliably.
-        candidates = sorted(out_dir.glob("audio_*.mp3"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if candidates:
-            return candidates[0]
-        requested = info.get("requested_downloads") or []
-        for item in requested:
-            fp = item.get("filepath")
-            if fp and Path(fp).exists():
-                return Path(fp)
-    raise RuntimeError("Audio download failed")
-
-
-def try_caption_first_srt(url: str) -> Tuple[Optional[str], Dict[str, object]]:
-    import yt_dlp
-
-    with tempfile.TemporaryDirectory() as td:
-        tdir = Path(td)
-        outtmpl = str(tdir / "subtitle_%(id)s.%(ext)s")
-        ydl_opts = {
-            "skip_download": True,
-            "writesubtitles": True,
-            "writeautomaticsub": True,
-            "subtitlesformat": "srt/vtt/best",
-            "subtitleslangs": ["en", "en.*", "my", "my.*", "en-US", "en-GB"],
-            "outtmpl": outtmpl,
-            "quiet": True,
-            "noplaylist": True,
-            "cookiefile": str(BASE_DIR / "cookies.txt") if (BASE_DIR / "cookies.txt").exists() else None,
-            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
-        }
-        ydl_opts = {k: v for k, v in ydl_opts.items() if v is not None}
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+            rewritten_chunks: list[str] = []
+            model_attempt = {"provider": "iamhc", "model": model, "chunks": len(chunks), "chunk_results": []}
+            for idx, chunk in enumerate(chunks, start=1):
+                prompt = build_rewrite_prompt(
+                    chunk,
+                    language=language,
+                    style=style_norm,
+                    chunk_index=idx,
+                    chunk_total=len(chunks),
+                    target_length_ratio=target_length_ratio,
+                )
+                rewritten_chunk, call_meta = call_iamhc_rewrite(model, prompt, style_norm)
+                ok, reason = validate_ai_rewrite(rewritten_chunk, chunk, style_norm)
+                model_attempt["chunk_results"].append({
+                    "chunk": idx,
+                    "input_chars": len(chunk),
+                    "output_chars": len(rewritten_chunk),
+                    "ok": ok,
+                    "reason": reason,
+                    "finish_reason": call_meta.get("finish_reason"),
+                    "gateway_model": call_meta.get("gateway_model"),
+                })
+                if not ok:
+                    raise RuntimeError(f"IAMHC rewrite chunk {idx} unusable: {reason}")
+                rewritten_chunks.append(rewritten_chunk)
+            rewritten = "\n\n".join(x.strip() for x in rewritten_chunks if x.strip()).strip()
+            ok, reason = validate_ai_rewrite(rewritten, cleaned, style_norm)
+            model_attempt.update({"final_output_chars": len(rewritten), "final_ok": ok, "final_reason": reason})
+            attempts.append(model_attempt)
+            if ok:
+                return rewritten, "iamhc_qwen_ai", {
+                    "ai_rewrite_configured": True,
+                    "provider": "iamhc",
+                    "rewrite_quality": "ai_rewrite",
+                    "model": model,
+                    "models_tried": [a.get("model") for a in attempts],
+                    "style": style_norm,
+                    "input_chars": len(cleaned),
+                    "output_chars": len(rewritten),
+                    "chunks": len(chunks),
+                    "attempts": attempts[-3:],
+                    "tts_safe": True,
+                }
         except Exception as exc:
-            return None, {"caption_error": str(exc)}
-        files = list(tdir.glob("*.srt")) + list(tdir.glob("*.vtt"))
-        files = sorted(files, key=lambda p: (0 if p.suffix.lower() == ".srt" else 1, p.name))
-        for fp in files:
-            try:
-                raw = fp.read_text(encoding="utf-8", errors="ignore")
-                srt = raw if fp.suffix.lower() == ".srt" else vtt_to_srt(raw)
-                if parse_srt_blocks(srt) or clean_srt_to_text(srt):
-                    return srt, {
-                        "caption_source": "yt_dlp_subtitles",
-                        "subtitle_file": fp.name,
-                        "video_id": info.get("id"),
-                        "title": info.get("title"),
-                    }
-            except Exception:
-                continue
-    return None, {"caption_error": "No subtitle file returned"}
+            attempts.append({"provider": "iamhc", "model": model, "error": str(exc), "chunks": len(chunks)})
+            print(f"IAMHC rewrite failed model={model} style={style_norm}: {exc}", flush=True)
+            continue
 
-
-def transcribe_audio_to_srt(audio_path: Path, language: str = "auto") -> Tuple[str, Dict[str, object]]:
-    from faster_whisper import WhisperModel
-
-    model_name = os.getenv("WHISPER_MODEL", "tiny")
-    device = os.getenv("WHISPER_DEVICE", "cpu")
-    compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-    model = WhisperModel(model_name, device=device, compute_type=compute_type)
-    lang_arg = None if not language or language == "auto" else language
-    segments, info = model.transcribe(str(audio_path), language=lang_arg, vad_filter=True)
-    blocks = []
-    count = 0
-    for seg in segments:
-        count += 1
-        blocks.append({
-            "index": str(count),
-            "start": seconds_to_srt_time(seg.start),
-            "end": seconds_to_srt_time(seg.end),
-            "text": (seg.text or "").strip(),
-        })
-    srt = compose_srt(blocks)
-    meta = {
-        "model": model_name,
-        "device": device,
-        "compute_type": compute_type,
-        "detected_language": getattr(info, "language", None),
-        "segments": count,
+    return "", "iamhc_failed", {
+        "ai_rewrite_configured": True,
+        "provider": "iamhc",
+        "rewrite_quality": "iamhc_failed",
+        "models_tried": models,
+        "style": style_norm,
+        "input_chars": len(cleaned),
+        "chunks": len(chunks),
+        "attempts": attempts[-5:],
+        "tts_safe": False,
+        "message": "IAMHC rewrite failed validation. Falling back to the next configured engine.",
     }
-    return srt, meta
 
 
-def extract_audio_from_upload(src: Path, dest: Path) -> Path:
-    if src.suffix.lower() in {".mp3", ".wav", ".m4a", ".aac", ".ogg"}:
-        if src.suffix.lower() == ".mp3":
-            shutil.copyfile(src, dest)
-            return dest
-    if not ffmpeg_exists():
-        raise RuntimeError("ffmpeg is not available")
-    cp = run_cmd(["ffmpeg", "-y", "-i", str(src), "-vn", "-acodec", "libmp3lame", "-q:a", "4", str(dest)], timeout=600)
-    if cp.returncode != 0 or not dest.exists():
-        raise RuntimeError(f"ffmpeg failed: {cp.stderr[-1000:]}")
-    return dest
+
+def local_concise_summary_fallback(text: str, target_ratio: float = 0.22) -> str:
+    """Deterministic emergency fallback.
+
+    This is intentionally shorter and safer than the old cleanup fallback. It
+    removes service-error text and avoids carrying long subtitle-style output
+    into TTS. It is still not AI-quality; metadata marks it as not TTS-safe.
+    """
+    cleaned = local_rewrite_for_tts(text)
+    if not cleaned:
+        return ""
+    raw_sentences = [s.strip() for s in re.split(r"(?<=[။.!?])\s+|\n+", cleaned) if s.strip()]
+    sentences = []
+    for sent in raw_sentences:
+        sent = sanitize_machine_text_line(sent)
+        if not sent:
+            continue
+        # Drop mostly-English error/untranslated fragments in fallback mode.
+        if len(sent) > 40 and not has_myanmar_text(sent) and latin_ratio(sent) > 0.55:
+            continue
+        if is_service_error_text(sent):
+            continue
+        sentences.append(sent)
+    if not sentences:
+        return ""
+    target_chars = max(900, min(6500, int(len(cleaned) * target_ratio)))
+    selected: list[str] = []
+    if len(sentences) <= 14:
+        selected = sentences
+    else:
+        # Keep beginning, major middle beats, and ending.
+        selected.extend(sentences[:3])
+        middle = sentences[3:-3]
+        desired_middle = max(8, min(22, int(len(middle) * 0.22)))
+        step = max(1, len(middle) // desired_middle) if middle else 1
+        selected.extend(middle[::step])
+        selected.extend(sentences[-3:])
+    # Preserve coverage: never return only the beginning. Keep ending beats even in fallback.
+    ending_beats = sentences[-3:] if len(sentences) > 3 else []
+    out = []
+    seen = set()
+    total = 0
+    for sent in selected:
+        key = re.sub(r"\s+", " ", sent[:90]).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        # Allow middle pruning, but do not drop final ending beats.
+        if total + len(sent) > target_chars and len(out) >= 8 and sent not in ending_beats:
+            continue
+        out.append(sent)
+        total += len(sent)
+    for sent in ending_beats:
+        key = re.sub(r"\s+", " ", sent[:90]).casefold()
+        if key not in seen:
+            out.append(sent)
+            seen.add(key)
+    return "\n".join(out).strip()
+
+def rewrite_with_openrouter(text: str, language: str = "my", style: str = "natural_accurate", target_length_ratio: float | None = None) -> tuple[str, str, dict]:
+    cleaned = clean_srt_to_text(text) or re.sub(r"\s+", " ", (text or "")).strip()
+    if not cleaned:
+        return "", "empty", {"ai_rewrite_configured": False, "rewrite_quality": "empty"}
+
+    # V16: use IAMHC/Qwen first when configured. Keep OpenRouter and local fallback as safety nets.
+    if iamhc_rewrite_enabled():
+        iamhc_text, iamhc_source, iamhc_meta = rewrite_with_iamhc(cleaned, language=language, style=style, target_length_ratio=target_length_ratio)
+        if iamhc_text.strip() and iamhc_meta.get("rewrite_quality") == "ai_rewrite":
+            return iamhc_text, iamhc_source, iamhc_meta
+
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        fallback = local_concise_summary_fallback(cleaned, target_length_ratio or 0.22)
+        return fallback, "local_sanitized_summary_fallback", {
+            "ai_rewrite_configured": False,
+            "rewrite_quality": "needs_openrouter_key_sanitized_fallback",
+            "tts_safe": False,
+            "input_chars": len(cleaned),
+            "output_chars": len(fallback),
+            "message": "OPENROUTER_API_KEY is not configured. This is a shortened sanitized preview only, not a true AI rewrite.",
+        }
+
+    style_norm = normalize_rewrite_style(style)
+    if target_length_ratio is None:
+        target_length_ratio = float(os.getenv("REWRITE_TARGET_RATIO_CONCISE", "0.28")) if style_norm == "concise_summary" else None
+    models = get_openrouter_model_candidates()
+    chunks = split_text_for_ai_rewrite(cleaned)
+    attempts: list[dict] = []
+    # Never use a full subtitle cleanup as fallback for TTS; it creates long,
+    # robotic Google-Translate-like audio. Use concise sanitized fallback and
+    # mark it as not AI-rewritten.
+    fallback_text = local_concise_summary_fallback(cleaned, target_length_ratio or 0.22)
+
+    # For long scripts, chunking avoids one-sentence summaries and output truncation.
+    for model in models:
+        try:
+            rewritten_chunks: list[str] = []
+            model_attempt = {"model": model, "chunks": len(chunks), "chunk_results": []}
+            for idx, chunk in enumerate(chunks, start=1):
+                prompt = build_rewrite_prompt(chunk, language=language, style=style_norm, chunk_index=idx, chunk_total=len(chunks), target_length_ratio=target_length_ratio)
+                rewritten_chunk, call_meta = call_openrouter_rewrite(model, prompt, style_norm)
+                ok, reason = validate_ai_rewrite(rewritten_chunk, chunk, style_norm)
+                model_attempt["chunk_results"].append({
+                    "chunk": idx,
+                    "input_chars": len(chunk),
+                    "output_chars": len(rewritten_chunk),
+                    "ok": ok,
+                    "reason": reason,
+                    "finish_reason": call_meta.get("finish_reason"),
+                })
+                if not ok:
+                    raise RuntimeError(f"AI rewrite chunk {idx} unusable: {reason}")
+                rewritten_chunks.append(rewritten_chunk)
+            rewritten = "\n\n".join(x.strip() for x in rewritten_chunks if x.strip()).strip()
+            ok, reason = validate_ai_rewrite(rewritten, cleaned, style_norm)
+            model_attempt.update({"final_output_chars": len(rewritten), "final_ok": ok, "final_reason": reason})
+            attempts.append(model_attempt)
+            if ok:
+                return rewritten, "openrouter_free_ai", {
+                    "ai_rewrite_configured": True,
+                    "rewrite_quality": "ai_rewrite",
+                    "model": model,
+                    "models_tried": [a.get("model") for a in attempts],
+                    "style": style_norm,
+                    "input_chars": len(cleaned),
+                    "output_chars": len(rewritten),
+                    "chunks": len(chunks),
+                    "attempts": attempts[-3:],
+                }
+        except Exception as exc:
+            attempts.append({"model": model, "error": str(exc), "chunks": len(chunks)})
+            print(f"OpenRouter rewrite failed model={model} style={style_norm}: {exc}", flush=True)
+            continue
+
+    return fallback_text, "local_sanitized_summary_fallback", {
+        "ai_rewrite_configured": True,
+        "rewrite_quality": "needs_ai_retry_sanitized_fallback",
+        "tts_safe": False,
+        "model": models[0] if models else os.getenv("OPENROUTER_MODEL", ""),
+        "models_tried": models[:5],
+        "style": style_norm,
+        "input_chars": len(cleaned),
+        "output_chars": len(fallback_text),
+        "attempts": attempts[-5:],
+        "message": "AI rewrite was unavailable or failed validation. Returned a shortened sanitized fallback for preview only; retry AI before final TTS.",
+    }
+
+def save_srt_response(srt_text: str, base_name: str = "captions") -> tuple[str, str]:
+    safe_base = secure_filename(base_name) or "captions"
+    filename = f"{Path(safe_base).stem}_{uuid.uuid4().hex[:8]}.srt"
+    path = SRT_DIR / filename
+    path.write_text(srt_text, encoding="utf-8")
+    return filename, build_public_url(f"/srt/{filename}")
 
 
-# -----------------------------
-# Final SRT from script/audio
-# -----------------------------
+def save_text_response(text: str, base_name: str = "script") -> tuple[str, str]:
+    safe_base = secure_filename(base_name) or "script"
+    filename = f"{Path(safe_base).stem}_{uuid.uuid4().hex[:8]}.txt"
+    path = SCRIPT_DIR / filename
+    path.write_text(text or "", encoding="utf-8")
+    return filename, build_public_url(f"/script/{filename}")
 
-def script_to_final_srt(script: str, duration: Optional[float]) -> str:
-    script = ensure_myanmar_punctuation(script)
-    sentences = [s.strip() for s in re.split(r"(?<=[။.!?])\s+|\n+", script) if s.strip()]
-    # Combine short sentences into subtitle-friendly chunks.
-    chunks: List[str] = []
-    buf = ""
-    for s in sentences:
-        if len(buf) + len(s) < 115:
-            buf = f"{buf} {s}".strip()
-        else:
-            if buf:
-                chunks.append(buf)
-            buf = s
-    if buf:
-        chunks.append(buf)
-    if not chunks:
-        chunks = [script[:200] or " "]
-    total_chars = sum(max(1, len(c)) for c in chunks)
-    if not duration or duration <= 0:
-        duration = max(4.0, total_chars / 14.0)
-    cur = 0.0
+
+def get_audio_duration_seconds(path: Path) -> float | None:
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if result.returncode == 0:
+            duration = float((result.stdout or "").strip())
+            if duration > 0:
+                return duration
+    except Exception as exc:
+        print(f"ffprobe duration failed: {exc}", flush=True)
+    return None
+
+
+def split_script_into_srt_cues(script: str) -> list[str]:
+    text = local_rewrite_for_tts(script)
+    if not text:
+        return []
+    pieces = [p.strip() for p in re.split(r"(?<=[။.!?])\s+|\n+", text) if p.strip()]
+    cues: list[str] = []
+    for piece in pieces:
+        piece = sanitize_machine_text_line(piece)
+        if not piece:
+            continue
+        # Split very long sentences into readable cue lengths.
+        if len(piece) <= 95:
+            cues.append(piece)
+            continue
+        words = piece.split()
+        current = ""
+        for word in words:
+            if current and len(current) + 1 + len(word) > 85:
+                cues.append(current.strip())
+                current = word
+            else:
+                current = f"{current} {word}".strip()
+        if current:
+            cues.append(current.strip())
+    return cues
+
+
+def build_final_srt_from_script(script: str, seconds_per_line: float = 3.5, total_duration: float | None = None) -> str:
+    lines = split_script_into_srt_cues(script)
+    if not lines:
+        return ""
+    weights = [max(18, len(line)) for line in lines]
+    total_weight = sum(weights) or len(lines)
+    if not total_duration or total_duration <= 0:
+        durations = [max(2.0, min(7.0, len(line) / 18.0)) for line in lines]
+    else:
+        # Spread cues across the actual generated audio duration so the final
+        # SRT ends exactly with the MP3. Enforce readable min/max then normalize.
+        raw = [total_duration * (w / total_weight) for w in weights]
+        durations = [max(1.4, min(8.0, x)) for x in raw]
+        scale = total_duration / max(0.001, sum(durations))
+        durations = [d * scale for d in durations]
     blocks = []
-    for i, chunk in enumerate(chunks, start=1):
-        share = max(1, len(chunk)) / total_chars
-        dur = max(1.4, duration * share)
-        if i == len(chunks):
-            end = duration
-        else:
-            end = min(duration, cur + dur)
-        blocks.append({"index": str(i), "start": seconds_to_srt_time(cur), "end": seconds_to_srt_time(end), "text": chunk})
-        cur = end
-    return compose_srt(blocks)
+    start = 0.0
+    for idx, (line, duration) in enumerate(zip(lines, durations), start=1):
+        end = start + duration
+        if idx == len(lines) and total_duration and total_duration > 0:
+            end = total_duration
+        blocks.append(f"{idx}\n{srt_timestamp(start)} --> {srt_timestamp(end)}\n{line}\n")
+        start = end
+    return "\n".join(blocks).strip() + "\n" if blocks else ""
 
 
-# -----------------------------
-# Routes
-# -----------------------------
+# ---------------- Routes ----------------
 
-@app.after_request
-def add_cors_headers(resp):
-    resp.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
-    return resp
-
-
-@app.route("/", methods=["GET"])
-def root():
+@app.get("/")
+def index():
     return jsonify({
-        "success": True,
         "ok": True,
-        "name": "Video2Audio Pro Backend",
+        "service": "video-audio-tool",
+        "caption_first": True,
         "version": APP_VERSION,
         "endpoints": [
-            "GET /health",
-            "POST /download",
-            "POST /extract-srt",
-            "POST /process-upload",
-            "POST /translate-srt",
-            "POST /rewrite",
-            "POST /rewrite-options",
-            "POST /tts",
-            "GET /audio/<filename>",
-            "GET /srt/<filename>",
-            "GET /script/<filename>",
+            "POST /download", "POST /extract-srt", "POST /extract-srt mode=downsub", "POST /extract-srt mode=subdown", "POST /debug-youtube-captions", "POST /translate-srt", "POST /process-upload",
+            "POST /upload", "POST /extract-srt-upload", "POST /rewrite", "POST /rewrite-options", "POST /tts", "POST /final-srt",
+            "GET /audio/<filename>", "GET /srt/<filename>", "GET /tts/<filename>", "GET /script/<filename>",
         ],
-        "rewrite_engine": {
-            "primary": os.getenv("IAMHC_REWRITE_MODEL", "Qwen3.5-397B-A17B"),
-            "enabled": env_bool("USE_IAMHC_REWRITE", True),
-            "key_configured": bool(os.getenv("IAMHC_API_KEY")),
-        },
     })
 
 
-@app.route("/health", methods=["GET"])
+@app.get("/health")
 def health():
-    return jsonify({"success": True, "ok": True, "version": APP_VERSION, "time": now_stamp()})
+    return jsonify({"ok": True, "caption_first": True, "version": APP_VERSION})
 
 
-@app.route("/audio/<path:filename>", methods=["GET"])
-def get_audio(filename):
-    fp = DOWNLOAD_DIR / safe_name(filename)
-    if not fp.exists():
-        return json_error("Audio file not found", 404)
-    download_name = request.args.get("download_name")
-    return send_file(fp, as_attachment=bool(download_name), download_name=download_name or fp.name, mimetype="audio/mpeg")
-
-
-@app.route("/srt/<path:filename>", methods=["GET"])
-def get_srt(filename):
-    fp = SRT_DIR / safe_name(filename)
-    if not fp.exists():
-        return json_error("SRT file not found", 404)
-    download_name = request.args.get("download_name")
-    return send_file(fp, as_attachment=bool(download_name), download_name=download_name or fp.name, mimetype="text/plain; charset=utf-8")
-
-
-@app.route("/script/<path:filename>", methods=["GET"])
-def get_script(filename):
-    fp = SCRIPT_DIR / safe_name(filename)
-    if not fp.exists():
-        return json_error("Script file not found", 404)
-    download_name = request.args.get("download_name")
-    return send_file(fp, as_attachment=bool(download_name), download_name=download_name or fp.name, mimetype="text/plain; charset=utf-8")
-
-
-@app.route("/download", methods=["POST", "OPTIONS"])
-def download_audio_route():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    data = request.get_json(silent=True) or {}
-    url = (data.get("url") or request.form.get("url") or "").strip()
-    if not url:
-        return json_error("URL is required", 400)
+@app.post("/download")
+def download():
     try:
-        with tempfile.TemporaryDirectory() as td:
-            audio_tmp = youtube_download_audio(url, Path(td))
-            final_name = f"download_{now_stamp()}_{uid()}.mp3"
-            final_path = DOWNLOAD_DIR / final_name
-            shutil.copyfile(audio_tmp, final_path)
-        return send_file(final_path, as_attachment=True, download_name="audio.mp3", mimetype="audio/mpeg")
+        payload = request.get_json(silent=True) or {}
+        url = payload.get("url") or request.form.get("url") or request.values.get("url")
+        if not url:
+            return json_error("Missing 'url'", 400)
+        mp3_path, meta = download_audio_as_mp3(url)
+        download_name = f"{meta.get('video_id') or mp3_path.stem}.mp3"
+        return send_file(mp3_path, mimetype="audio/mpeg", as_attachment=True, download_name=download_name, max_age=0)
     except Exception as exc:
-        return json_error(
-            "Audio download failed. The source may be restricted. Use SRT/manual upload flow to continue.",
-            502,
-            details=str(exc)[:1000],
-            needs_manual_upload=True,
-        )
+        error_message, status_code, extra = friendly_youtube_error(exc)
+        return json_error(error_message, status_code, **extra)
 
 
-@app.route("/extract-srt", methods=["POST", "OPTIONS"])
-def extract_srt_route():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    data = request.get_json(silent=True) or {}
-    url = (data.get("url") or "").strip()
-    language = data.get("language") or "auto"
-    mode = data.get("mode") or "caption_first"
-    if not url:
-        return json_error("url is required", 400)
-
-    # Caption first for URL input. Downsub/SubDown are assisted manual fallback only.
-    caption_meta: Dict[str, object] = {}
-    if mode in {"caption_first", "auto", "subtitles"}:
-        srt_text, caption_meta = try_caption_first_srt(url)
-        if srt_text:
-            fname = f"{uid()}_captions.srt"
-            write_text_file(SRT_DIR / fname, srt_text)
-            return jsonify({
-                "success": True,
-                "ok": True,
-                "source": "caption_first",
-                "srt_text": srt_text,
-                "srt_url": public_url("srt", fname, "original.srt"),
-                "filename": fname,
-                "caption": caption_meta,
-            })
-
-    # Whisper fallback can be disabled if Railway resource is tight.
-    if env_bool("ENABLE_URL_WHISPER_FALLBACK", True):
-        try:
-            with tempfile.TemporaryDirectory() as td:
-                audio = youtube_download_audio(url, Path(td))
-                srt_text, whisper_meta = transcribe_audio_to_srt(audio, language=language)
-                fname = f"{uid()}_whisper.srt"
-                write_text_file(SRT_DIR / fname, srt_text)
-                return jsonify({
-                    "success": True,
-                    "ok": True,
-                    "source": "whisper_fallback",
-                    "srt_text": srt_text,
-                    "srt_url": public_url("srt", fname, "original.srt"),
-                    "filename": fname,
-                    "whisper": whisper_meta,
-                    "caption_attempt": caption_meta,
-                })
-        except Exception as exc:
-            whisper_error = str(exc)[:1000]
-    else:
-        whisper_error = "URL Whisper fallback disabled"
-
-    encoded = requests.utils.quote(url, safe="")
-    return jsonify({
-        "success": False,
-        "ok": False,
-        "accepted_mode": True,
-        "needs_manual_srt_upload": True,
-        "needs_upload": True,
-        "message": "Automatic extraction did not work from our server. Open Downsub/SubDown and upload the SRT here to continue.",
-        "open_downsub_url": f"https://downsub.com/?url={encoded}",
-        "open_subdown_url": f"https://subdown.org/youtube-subtitle-downloader?url={encoded}",
-        "caption_attempt": caption_meta,
-        "whisper_error": whisper_error,
-    }), 200
 
 
-@app.route("/process-upload", methods=["POST", "OPTIONS"])
-def process_upload_route():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    target_language = request.form.get("target_language") or request.form.get("language") or "my"
-    source_language = request.form.get("source_language") or "auto"
-    media = request.files.get("file")
-    srt_file = request.files.get("srt_file") or request.files.get("srt")
-
-    audio_url = ""
-    audio_filename = ""
-    srt_text = ""
-    whisper_meta = None
-
+@app.post("/debug-youtube-captions")
+def debug_youtube_captions():
+    """Debug caption-first methods without downloading video/audio."""
     try:
-        if media:
-            original_name = safe_name(media.filename, ".bin")
-            upload_path = UPLOAD_DIR / f"{uid()}_{original_name}"
-            media.save(upload_path)
-            audio_filename = f"upload_audio_{now_stamp()}_{uid()}.mp3"
-            audio_path = DOWNLOAD_DIR / audio_filename
-            extract_audio_from_upload(upload_path, audio_path)
-            audio_url = public_url("audio", audio_filename, "original-audio.mp3")
-        if srt_file:
-            raw = srt_file.read().decode("utf-8", errors="ignore")
-            srt_text = vtt_to_srt(raw) if (srt_file.filename or "").lower().endswith(".vtt") else raw
-        elif media:
-            srt_text, whisper_meta = transcribe_audio_to_srt(DOWNLOAD_DIR / audio_filename, language=source_language)
-        else:
-            return json_error("file or srt_file is required", 400)
+        payload = request.get_json(silent=True) or {}
+        url = payload.get("url") or request.form.get("url") or request.values.get("url")
+        language = payload.get("language") or request.form.get("language") or request.values.get("language") or "auto"
+        if not url:
+            return json_error("Missing 'url'", 400)
 
-        srt_name = f"upload_{uid()}.srt"
-        write_text_file(SRT_DIR / srt_name, srt_text)
-
-        translated_text = ""
-        translated_url = ""
-        translation_meta = None
-        if srt_text:
-            blocks = parse_srt_blocks(srt_text)
-            if blocks:
-                items = [b["text"] for b in blocks]
-                translated_items, stats = translate_items_google(items, source_language, target_language)
-                translated_text = compose_srt(blocks, translated_items)
-                translation_meta = {"engine": "google_translate", "source_language": source_language, "target_language": target_language, **stats}
-            else:
-                translated_items, stats = translate_items_google([clean_srt_to_text(srt_text)], source_language, target_language)
-                translated_text = translated_items[0]
-                translation_meta = {"engine": "google_translate", "source_language": source_language, "target_language": target_language, **stats}
-            translated_name = f"translated_{target_language}_{uid()}.srt"
-            write_text_file(SRT_DIR / translated_name, translated_text)
-            translated_url = public_url("srt", translated_name, "translated.srt")
-
-        return jsonify({
-            "success": True,
+        normalized_url = normalize_youtube_url(url) if is_youtube_url(url) else url
+        video_id = get_youtube_video_id(normalized_url)
+        debug = {
             "ok": True,
-            "audio_url": audio_url,
-            "audio_filename": audio_filename,
-            "srt_text": srt_text,
-            "srt_url": public_url("srt", srt_name, "original.srt"),
-            "translated_srt_text": translated_text,
-            "translated_srt_url": translated_url,
+            "success": True,
+            "caption_first": caption_first_enabled(),
+            "url": url,
+            "normalized_url": normalized_url,
+            "video_id": video_id,
+            "requested_language": language,
+            "cookie_file_exists": get_cookie_file() is not None,
+            "youtube_caption_cookie_header_env": bool(os.getenv("YOUTUBE_CAPTION_COOKIE_HEADER")),
+            "youtube_cookie_header_applied": bool(get_youtube_cookie_header()),
+            "youtube_cookie_header_bytes": len(get_youtube_cookie_header() or ""),
+            "methods": [],
+            "v5_dynamic_innertube_debug": YOUTUBE_CAPTION_DEBUG_LAST,
+        }
+
+        methods = [
+            ("innertube_caption_tracks", get_innertube_caption_tracks),
+            ("youtube_transcript_api", get_youtube_transcript_api_srt),
+            ("watch_page_caption_tracks", get_watch_page_caption_tracks),
+            ("direct_timedtext", get_direct_timedtext_caption_srt),
+            ("ytdlp_metadata", get_ytdlp_caption_srt),
+            ("external_caption_proxy", get_external_caption_proxy_srt),
+        ]
+
+        for name, fn in methods:
+            item = {"method": name, "success": False}
+            try:
+                result = fn(normalized_url, requested_language=language)
+                if result and result[0].strip():
+                    srt_text, meta = result
+                    item.update({
+                        "success": True,
+                        "chars": len(srt_text),
+                        "sample": srt_text[:500],
+                        "meta": meta,
+                    })
+                else:
+                    item.update({"success": False, "error": "no caption text returned"})
+            except Exception as exc:
+                item.update({"success": False, "error": str(exc)})
+            debug["methods"].append(item)
+
+        debug["any_success"] = any(item.get("success") for item in debug["methods"])
+        # Refresh this after method execution so the response includes detailed Innertube attempts.
+        debug["v5_dynamic_innertube_debug"] = YOUTUBE_CAPTION_DEBUG_LAST
+        debug["caption_proxy_configured"] = bool((os.getenv("CAPTION_PROXY_URL") or "").strip())
+        debug["accepted_modes"] = sorted(SUPPORTED_EXTRACT_MODES)
+        debug["downsub_api_configured"] = bool(_provider_api_urls("downsub"))
+        debug["subdown_api_configured"] = bool(_provider_api_urls("subdown"))
+        debug["downsub_open_url"] = _mode_open_url("downsub", url)
+        debug["subdown_open_url"] = _mode_open_url("subdown", url)
+        return jsonify(debug)
+    except Exception as exc:
+        print(f"debug-youtube-captions error: {exc}", flush=True)
+        return json_error(str(exc), 500)
+
+
+@app.post("/extract-srt")
+def extract_srt():
+    try:
+        payload = request.get_json(silent=True) or {}
+        url = payload.get("url") or request.form.get("url") or request.values.get("url")
+        language = payload.get("language") or request.form.get("language") or request.values.get("language") or "auto"
+        mode = normalize_extract_mode(
+            payload.get("mode") or request.form.get("mode") or request.values.get("mode") or "caption_first"
+        )
+        if not url:
+            return json_error("Missing 'url'", 400)
+
+        if mode not in SUPPORTED_EXTRACT_MODES:
+            return json_error(
+                f"Unsupported extract mode: {mode}",
+                400,
+                accepted_modes=sorted(SUPPORTED_EXTRACT_MODES),
+                caption_first=True,
+                no_media_download=True,
+            )
+
+        # Silent Downsub/SubDown mode: accept the frontend fallback request without
+        # attempting video/audio download or Whisper. If an official/user-controlled
+        # API URL is configured, normalize its output to the same /extract-srt JSON.
+        if mode in {"downsub", "subdown"}:
+            try:
+                provider_result = get_downsub_subdown_mode_srt(url, requested_language=language, provider=mode)
+                if provider_result:
+                    srt_text, meta = provider_result
+                    meta["mode"] = mode
+                    return make_srt_success_response(srt_text, meta, base_name=f"{mode}_captions")
+            except Exception as exc:
+                print(f"{mode} provider mode failed: {exc}", flush=True)
+                return downsub_subdown_manual_fallback_response(url, mode, status_code=502, errors=[str(exc)])
+
+            # Optional safety net: allow the same public-caption methods under provider mode
+            # when explicitly enabled. Default is false because the frontend usually calls
+            # mode=downsub/subdown only after caption_first already failed.
+            if (os.getenv("SILENT_PROVIDER_MODE_TRY_INTERNAL", "false") or "false").strip().lower() in {"1", "true", "yes", "on"}:
+                try:
+                    caption_result = get_youtube_caption_srt(url, requested_language=language)
+                    if caption_result:
+                        srt_text, meta = caption_result
+                        meta["mode"] = mode
+                        return make_srt_success_response(srt_text, meta, base_name=f"{mode}_captions")
+                except Exception as exc:
+                    return downsub_subdown_manual_fallback_response(url, mode, status_code=502, errors=[str(exc)])
+
+            return downsub_subdown_manual_fallback_response(url, mode, status_code=404)
+
+        caption_errors = []
+        if is_youtube_url(url) and caption_first_enabled():
+            try:
+                caption_result = get_youtube_caption_srt(url, requested_language=language)
+                if caption_result:
+                    srt_text, meta = caption_result
+                    meta["mode"] = mode
+                    return make_srt_success_response(srt_text, meta, base_name=meta.get("video_id") or "youtube_captions")
+            except Exception as exc:
+                caption_errors.append(str(exc))
+                print(f"caption-first extraction error: {exc}", flush=True)
+
+        # Whisper fallback only after all public caption methods fail.
+        if not should_whisper_fallback_for_url():
+            return json_error(
+                "No public captions were found for this link. Upload an SRT/VTT file to continue.",
+                404,
+                needs_upload=True,
+                caption_first=True,
+                no_media_download=True,
+                mode=mode,
+                accepted_modes=sorted(SUPPORTED_EXTRACT_MODES),
+                open_downsub_url=_mode_open_url("downsub", url),
+                open_subdown_url=_mode_open_url("subdown", url),
+                caption_errors=caption_errors[-5:],
+            )
+        try:
+            mp3_path, audio_meta = download_audio_as_mp3(url)
+            srt_text, whisper_meta = transcribe_mp3_to_srt(mp3_path, language=language)
+            srt_filename, srt_url = save_srt_response(srt_text, audio_meta.get("video_id") or mp3_path.stem)
+            return jsonify({
+                "ok": True,
+                "success": True,
+                "srt_text": srt_text,
+                "srt_url": srt_url,
+                "filename": srt_filename,
+                "subtitle_source": "whisper_fallback",
+                "caption_first": True,
+                "no_media_download": False,
+                "mode": mode,
+                "audio": audio_meta,
+                "whisper": whisper_meta,
+                "caption_errors": caption_errors[-5:],
+            })
+        except Exception as exc:
+            print(f"Whisper fallback failed after caption methods: {exc}", flush=True)
+            error_message, status_code, extra = friendly_youtube_error(exc)
+            extra.update({
+                "caption_first": True,
+                "no_media_download": True,
+                "needs_upload": True,
+                "mode": mode,
+                "accepted_modes": sorted(SUPPORTED_EXTRACT_MODES),
+                "open_downsub_url": _mode_open_url("downsub", url),
+                "open_subdown_url": _mode_open_url("subdown", url),
+                "caption_errors": caption_errors[-5:],
+                "media_download_error": error_message,
+            })
+            return json_error(
+                "No public captions were found and Whisper fallback could not download audio.",
+                status_code if status_code in {403, 404, 451, 502} else 502,
+                **extra,
+            )
+    except Exception as exc:
+        print(f"extract-srt error: {exc}", flush=True)
+        return json_error(str(exc), 500)
+
+
+@app.post("/translate-srt")
+def translate_srt():
+    try:
+        payload = request.get_json(silent=True) or {}
+        srt_text = payload.get("srt_text") or payload.get("srt") or ""
+        filename = payload.get("filename") or ""
+        source_language = payload.get("source_language") or payload.get("source") or "auto"
+        target_language = payload.get("target_language") or payload.get("target") or payload.get("language") or "my"
+        if not srt_text and filename:
+            safe_filename = Path(filename).name
+            srt_path = SRT_DIR / safe_filename
+            if not srt_path.exists():
+                return json_error("SRT filename not found", 404)
+            srt_text = srt_path.read_text(encoding="utf-8")
+        if not srt_text:
+            return json_error("Missing 'srt_text'", 400)
+        translated_srt_text, translation_meta = translate_srt_text(srt_text, source_language=source_language, target_language=target_language)
+        target_code = translation_meta["target_language"].replace("-", "_")
+        translated_filename = f"translated_{target_code}_{uuid.uuid4().hex[:8]}.srt"
+        (SRT_DIR / translated_filename).write_text(translated_srt_text, encoding="utf-8")
+        base_url = get_public_base_url()
+        return jsonify({
+            "ok": True,
+            "success": True,
+            "translated_srt_text": translated_srt_text,
+            "translated_srt_url": f"{base_url}/srt/{translated_filename}",
+            "filename": translated_filename,
             "translation": translation_meta,
+        })
+    except Exception as exc:
+        print(f"translate-srt error: {exc}", flush=True)
+        return json_error(str(exc), 500)
+
+
+@app.post("/upload")
+def upload_to_mp3():
+    try:
+        uploaded_file = request.files.get("file") or request.files.get("video") or request.files.get("audio")
+        input_path = save_uploaded_media(uploaded_file)
+        mp3_path = convert_media_file_to_mp3(input_path)
+        return send_file(mp3_path, mimetype="audio/mpeg", as_attachment=True, download_name=f"{input_path.stem}.mp3", max_age=0)
+    except Exception as exc:
+        print(f"upload error: {exc}", flush=True)
+        return json_error(str(exc), 500)
+
+
+@app.post("/extract-srt-upload")
+def extract_srt_upload():
+    try:
+        uploaded_srt = request.files.get("srt_file") or request.files.get("srt") or request.files.get("subtitle")
+        srt_text, srt_source_filename = read_uploaded_srt(uploaded_srt)
+        base_url = get_public_base_url()
+        if srt_text:
+            srt_filename, srt_url = save_srt_response(srt_text, Path(srt_source_filename or "manual_srt").stem)
+            return jsonify({
+                "ok": True,
+                "success": True,
+                "srt_text": srt_text,
+                "srt_url": srt_url,
+                "filename": srt_filename,
+                "subtitle_source": "manual_srt_upload",
+                "source": {"type": "manual_srt_upload", "filename": srt_source_filename},
+                "no_media_download": True,
+            })
+        uploaded_file = request.files.get("file") or request.files.get("video") or request.files.get("audio")
+        language = request.form.get("language") or request.values.get("language") or "auto"
+        input_path = save_uploaded_media(uploaded_file)
+        mp3_path = convert_media_file_to_mp3(input_path)
+        srt_text, srt_filename, whisper_meta = create_srt_from_mp3(mp3_path, language=language, base_name=input_path.stem)
+        return jsonify({
+            "ok": True,
+            "success": True,
+            "srt_text": srt_text,
+            "srt_url": f"{base_url}/srt/{srt_filename}",
+            "filename": srt_filename,
+            "audio_url": f"{base_url}/audio/{mp3_path.name}",
+            "audio_filename": mp3_path.name,
+            "subtitle_source": "whisper_upload",
+            "source": {"type": "upload", "filename": input_path.name},
             "whisper": whisper_meta,
         })
     except Exception as exc:
-        return json_error("Upload processing failed", 500, details=str(exc)[:1000])
+        print(f"extract-srt-upload error: {exc}", flush=True)
+        return json_error(str(exc), 500)
 
 
-@app.route("/translate-srt", methods=["POST", "OPTIONS"])
-def translate_srt_route():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    data = request.get_json(silent=True) or {}
-    srt_text = data.get("srt_text") or data.get("text") or ""
-    source_language = data.get("source_language") or "auto"
-    target_language = data.get("target_language") or data.get("language") or "my"
-    if not str(srt_text).strip():
-        return json_error("srt_text is required", 400)
+@app.post("/process-upload")
+def process_upload():
     try:
-        blocks = parse_srt_blocks(srt_text)
-        if blocks:
-            items = [b["text"] for b in blocks]
-            translated_items, stats = translate_items_google(items, source_language, target_language)
-            translated_srt_text = compose_srt(blocks, translated_items)
-            segments = len(blocks)
+        uploaded_srt = request.files.get("srt_file") or request.files.get("srt") or request.files.get("subtitle")
+        language = request.form.get("language") or request.values.get("language") or "auto"
+        target_language = request.form.get("target_language") or request.values.get("target_language") or ""
+        source_language = request.form.get("source_language") or request.values.get("source_language") or "auto"
+        base_url = get_public_base_url()
+        srt_text, srt_source_filename = read_uploaded_srt(uploaded_srt)
+        response_payload = {}
+        if srt_text:
+            srt_filename, srt_url = save_srt_response(srt_text, Path(srt_source_filename or "manual_srt").stem)
+            response_payload.update({
+                "ok": True,
+                "success": True,
+                "srt_text": srt_text,
+                "srt_url": srt_url,
+                "filename": srt_filename,
+                "subtitle_source": "manual_srt_upload",
+                "source": {"type": "manual_srt_upload", "filename": srt_source_filename},
+                "no_media_download": True,
+            })
         else:
-            plain = clean_srt_to_text(srt_text)
-            translated_items, stats = translate_items_google([plain], source_language, target_language)
-            translated_srt_text = translated_items[0]
-            segments = 1
-        fname = f"translated_{target_language}_{now_stamp()}_{uid()}.srt"
-        write_text_file(SRT_DIR / fname, translated_srt_text)
-        warning = stats.get("google_error_segments_removed", 0) > 0 or stats.get("possibly_untranslated_segments", 0) > 0
+            uploaded_file = request.files.get("file") or request.files.get("video") or request.files.get("audio")
+            input_path = save_uploaded_media(uploaded_file)
+            mp3_path = convert_media_file_to_mp3(input_path)
+            srt_text, srt_filename, whisper_meta = create_srt_from_mp3(mp3_path, language=language, base_name=input_path.stem)
+            response_payload.update({
+                "ok": True,
+                "success": True,
+                "audio_url": f"{base_url}/audio/{mp3_path.name}",
+                "audio_filename": mp3_path.name,
+                "srt_text": srt_text,
+                "srt_url": f"{base_url}/srt/{srt_filename}",
+                "filename": srt_filename,
+                "subtitle_source": "whisper_upload",
+                "source": {"type": "upload", "filename": input_path.name},
+                "whisper": whisper_meta,
+            })
+        if target_language:
+            translated_srt_text, translation_meta = translate_srt_text(srt_text, source_language=source_language, target_language=target_language)
+            target_code = translation_meta["target_language"].replace("-", "_")
+            translated_filename = f"translated_{target_code}_{uuid.uuid4().hex[:8]}.srt"
+            (SRT_DIR / translated_filename).write_text(translated_srt_text, encoding="utf-8")
+            response_payload.update({
+                "translated_srt_text": translated_srt_text,
+                "translated_srt_url": f"{base_url}/srt/{translated_filename}",
+                "translated_filename": translated_filename,
+                "translation": translation_meta,
+            })
+        return jsonify(response_payload)
+    except Exception as exc:
+        print(f"process-upload error: {exc}", flush=True)
+        return json_error(str(exc), 500)
+
+
+@app.post("/rewrite")
+def rewrite():
+    try:
+        payload = request.get_json(silent=True) or {}
+        text = payload.get("text") or payload.get("srt_text") or payload.get("translated_srt_text") or ""
+        language = payload.get("language") or "my"
+        style = payload.get("style") or "natural_accurate"
+        target_length_ratio = payload.get("target_length_ratio") or payload.get("targetLengthRatio")
+        if not text.strip():
+            return json_error("Missing text to rewrite", 400)
+        cleaned = clean_srt_to_text(text) or text
+        try:
+            target_length_ratio = float(target_length_ratio) if target_length_ratio is not None else None
+        except Exception:
+            target_length_ratio = None
+        rewritten, source, rewrite_meta = rewrite_with_openrouter(cleaned, language=language, style=style, target_length_ratio=target_length_ratio)
+        if not rewritten.strip():
+            return json_error("Rewrite returned no text", 502, source=source, rewrite=rewrite_meta)
         return jsonify({
-            "success": True,
             "ok": True,
-            "translated_srt_text": translated_srt_text,
-            "translatedSrtText": translated_srt_text,
-            "translated_srt_url": public_url("srt", fname, "translated.srt"),
-            "filename": fname,
-            "translation": {
-                "engine": "google_translate",
-                "source_language": source_language,
-                "target_language": target_language,
-                "segments": segments,
-                "quality_warning": warning,
-                **stats,
-            },
+            "success": True,
+            "script": rewritten,
+            "rewrittenScript": rewritten,
+            "rewritten_script": rewritten,
+            "rewritten_text": rewritten,
+            "source": source,
+            "cleaned_text": cleaned,
+            "rewrite": rewrite_meta,
+            "ai_rewrite_configured": bool(rewrite_meta.get("ai_rewrite_configured")),
+            "rewrite_quality": rewrite_meta.get("rewrite_quality"),
+            "style": normalize_rewrite_style(style),
         })
     except Exception as exc:
-        return json_error("Translation failed", 500, details=str(exc)[:1000])
+        print(f"rewrite error: {exc}", flush=True)
+        return json_error(str(exc), 500)
 
 
-@app.route("/rewrite", methods=["POST", "OPTIONS"])
-def rewrite_route():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    data = request.get_json(silent=True) or {}
-    text = data.get("text") or data.get("srt_text") or ""
-    language = data.get("language") or "my"
-    style = data.get("style") or "concise_natural_tts"
-    cleaned = clean_srt_to_text(text)
+@app.post("/rewrite-options")
+def rewrite_options():
+    try:
+        payload = request.get_json(silent=True) or {}
+        text = payload.get("text") or payload.get("srt_text") or payload.get("translated_srt_text") or ""
+        language = payload.get("language") or "my"
+        requested_style = payload.get("style") or "concise_narrative_summary"
+        try:
+            target_length_ratio = float(payload.get("target_length_ratio") or payload.get("targetLengthRatio") or os.getenv("REWRITE_TARGET_RATIO_CONCISE", "0.28"))
+        except Exception:
+            target_length_ratio = 0.28
+        if not text.strip():
+            return json_error("Missing text to rewrite", 400)
+        cleaned = clean_srt_to_text(text) or text
+        # User wants concise spoken prose, not a full line-by-line retelling.
+        natural, natural_source, natural_meta = rewrite_with_openrouter(cleaned, language=language, style=requested_style, target_length_ratio=target_length_ratio)
+        emotional, emotional_source, emotional_meta = rewrite_with_openrouter(cleaned, language=language, style="emotional_tts", target_length_ratio=min(0.38, max(0.22, target_length_ratio + 0.05)))
+        natural_filename, natural_url = save_text_response(natural or emotional or "", "natural_rewrite")
+        emotional_filename, emotional_url = save_text_response(emotional or natural or "", "emotional_rewrite")
+        natural_url = add_download_name(natural_url, "natural-accurate.txt")
+        emotional_url = add_download_name(emotional_url, "emotional-tts.txt")
+        if not natural.strip() and not emotional.strip():
+            return json_error("Rewrite returned no text", 502)
+        # V11 compatibility: keep the correct structured `options` response,
+        # but also expose flat aliases because some frontend builds still look
+        # for top-level script/text fields and incorrectly show “no usable script”.
+        natural_script = (natural or emotional or "").strip()
+        emotional_script = (emotional or natural or "").strip()
+        primary_script = natural_script or emotional_script
+        response_payload = {
+            "ok": True,
+            "success": True,
+            "cleaned_text": cleaned,
+            "script": primary_script,
+            "text": primary_script,
+            "result": primary_script,
+            "output": primary_script,
+            "message": primary_script,
+            "rewrittenScript": primary_script,
+            "rewritten_script": primary_script,
+            "rewrittenText": primary_script,
+            "rewritten_text": primary_script,
+            "naturalScript": natural_script,
+            "natural_script": natural_script,
+            "natural_script_url": natural_url,
+            "naturalScriptUrl": natural_url,
+            "emotionalScript": emotional_script,
+            "emotional_script": emotional_script,
+            "emotional_script_url": emotional_url,
+            "emotionalScriptUrl": emotional_url,
+            "source": natural_source or emotional_source,
+            "quality": natural_meta.get("rewrite_quality") or emotional_meta.get("rewrite_quality"),
+            "rewrite_quality": natural_meta.get("rewrite_quality") or emotional_meta.get("rewrite_quality"),
+            "rewrite": natural_meta or emotional_meta,
+            "options": [
+                {
+                    "id": "natural_accurate",
+                    "title": "Natural Accurate",
+                    "script": natural_script,
+                    "text": natural_script,
+                    "script_url": natural_url,
+                    "download_url": natural_url,
+                    "result": natural_script,
+                    "source": natural_source,
+                    "rewrite": natural_meta,
+                    "quality": natural_meta.get("rewrite_quality"),
+                    "tts_safe": bool(natural_meta.get("tts_safe", natural_meta.get("rewrite_quality") == "ai_rewrite")),
+                    "needs_retry": natural_meta.get("rewrite_quality") != "ai_rewrite",
+                },
+                {
+                    "id": "emotional_tts",
+                    "title": "Emotional TTS",
+                    "script": emotional_script,
+                    "text": emotional_script,
+                    "script_url": emotional_url,
+                    "download_url": emotional_url,
+                    "result": emotional_script,
+                    "source": emotional_source,
+                    "rewrite": emotional_meta,
+                    "quality": emotional_meta.get("rewrite_quality"),
+                    "tts_safe": bool(emotional_meta.get("tts_safe", emotional_meta.get("rewrite_quality") == "ai_rewrite")),
+                    "needs_retry": emotional_meta.get("rewrite_quality") != "ai_rewrite",
+                },
+            ],
+            "rewrites": {
+                "natural_accurate": natural_script,
+                "emotional_tts": emotional_script,
+            },
+            "ai_rewrite_configured": bool(natural_meta.get("ai_rewrite_configured") or emotional_meta.get("ai_rewrite_configured")),
+            "compatibility": "v11-flat-aliases-for-lovable",
+        }
+        return jsonify(response_payload)
+    except Exception as exc:
+        print(f"rewrite-options error: {exc}", flush=True)
+        return json_error(str(exc), 500)
+
+
+def polish_tts_script(text: str, style: str = "natural_accurate") -> str:
+    cleaned = local_rewrite_for_tts(text, style=style)
     if not cleaned:
-        return json_error("No subtitle text available to rewrite", 400)
-    target_ratio = float(data.get("target_length_ratio") or os.getenv("REWRITE_TARGET_RATIO_CONCISE", "0.28"))
-    option_id = "emotional_tts" if "emotion" in style else "natural_accurate"
-    opt = make_rewrite_option(cleaned, option_id, "Rewritten Script", target_ratio)
-    script = opt["script"]
-    return jsonify({
-        "success": True,
-        "ok": True,
-        "script": script,
-        "text": script,
-        "rewrittenScript": script,
-        "rewritten_script": script,
-        "rewrittenText": script,
-        "source": opt["source"],
-        "quality": opt["quality"],
-        "tts_safe": opt["tts_safe"],
-        "needs_retry": opt["needs_retry"],
-        "script_url": opt["script_url"],
-        "language": language,
-    })
+        return ""
+    # Add readable pauses for Myanmar TTS. This improves rhythm without changing meaning.
+    cleaned = tts_pause_friendly_text(cleaned)
+    cleaned = re.sub(r"\s*။\s*", "။\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
-@app.route("/rewrite-options", methods=["POST", "OPTIONS"])
-def rewrite_options_route():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    data = request.get_json(silent=True) or {}
-    text = data.get("text") or data.get("translated_srt_text") or data.get("srt_text") or ""
-    cleaned = clean_srt_to_text(text)
-    if not cleaned or len(cleaned) < 20:
-        return json_error("No usable text available for rewrite", 400)
-    target_ratio = float(data.get("target_length_ratio") or os.getenv("REWRITE_TARGET_RATIO_CONCISE", "0.28"))
-    natural = make_rewrite_option(cleaned, "natural_accurate", "Natural Accurate", target_ratio)
-    emotional = make_rewrite_option(cleaned, "emotional_tts", "Emotional TTS", target_ratio)
-    # If model returned duplicate scripts, mark for retry.
-    if natural["script"].strip() == emotional["script"].strip():
-        natural["duplicate_warning"] = True
-        emotional["duplicate_warning"] = True
-        emotional["needs_retry"] = True
-        emotional["tts_safe"] = False
-    return jsonify({
-        "success": True,
-        "ok": True,
-        "version": APP_VERSION,
-        "options": [natural, emotional],
-        "naturalScript": natural["script"],
-        "emotionalScript": emotional["script"],
-        "naturalOption": natural,
-        "emotionalOption": emotional,
-        # Flat aliases for older Lovable code.
-        "script": natural["script"],
-        "text": natural["script"],
-        "rewrittenScript": natural["script"],
-        "quality": natural["quality"],
-        "source": natural["source"],
-        "cleaned_input_chars": len(cleaned),
-        "quality_gate": {
-            "fallback_is_preview_only": True,
-            "final_tts_requires_tts_safe": True,
-            "must_include_ending": True,
-        },
-    })
-
-
-async def edge_tts_save(text: str, voice: str, output_path: Path, rate: str = "-10%", pitch: str = "-1Hz") -> None:
+async def _edge_tts_generate(text: str, voice: str, output_path: Path, rate: str = "+0%", pitch: str = "+0Hz", volume: str = "+0%"):
     import edge_tts
-    communicate = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
+    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch, volume=volume)
     await communicate.save(str(output_path))
 
 
-@app.route("/tts", methods=["POST", "OPTIONS"])
-def tts_route():
-    if request.method == "OPTIONS":
-        return ("", 204)
-    data = request.get_json(silent=True) or {}
-    text = data.get("text") or data.get("script") or ""
-    if not str(text).strip():
-        return json_error("text is required", 400)
-    if contains_bad_text(text):
-        return json_error("This script contains translation or AI instruction errors. Please retry rewrite.", 400)
+def select_tts_voice(language: str | None = None, gender: str | None = None, requested_voice: str | None = None) -> str:
+    if requested_voice:
+        return requested_voice
+    language_norm = normalize_translate_language(language or "my", default="my")
+    gender_norm = (gender or "female").lower()
+    if language_norm == "my":
+        if gender_norm.startswith("m"):
+            return os.getenv("TTS_VOICE_MY_MALE", "my-MM-ThihaNeural")
+        return os.getenv("TTS_VOICE_MY_FEMALE", "my-MM-NilarNeural")
+    if language_norm == "en":
+        return os.getenv("TTS_VOICE_EN_MALE" if gender_norm.startswith("m") else "TTS_VOICE_EN_FEMALE", "en-US-AriaNeural")
+    return os.getenv("TTS_VOICE_DEFAULT", "en-US-AriaNeural")
 
-    engine = data.get("engine") or "edge_tts"
-    language = data.get("language") or "my"
-    gender = (data.get("gender") or "male").lower()
-    style = data.get("style") or "concise_narrative_summary"
 
-    final_script = ensure_myanmar_punctuation(text)
-    script_name = f"final_script_{now_stamp()}_{uid()}.txt"
-    write_text_file(SCRIPT_DIR / script_name, final_script)
+def tts_voice_params(style: str | None = None) -> tuple[str, str, str]:
+    style_norm = normalize_rewrite_style(style)
+    if style_norm == "emotional_tts":
+        return os.getenv("TTS_RATE_EMOTIONAL", "-6%"), os.getenv("TTS_PITCH_EMOTIONAL", "+2Hz"), os.getenv("TTS_VOLUME", "+0%")
+    if style_norm == "movie_recap":
+        return os.getenv("TTS_RATE_RECAP", "-3%"), os.getenv("TTS_PITCH_RECAP", "+0Hz"), os.getenv("TTS_VOLUME", "+0%")
+    if style_norm == "concise_summary":
+        return os.getenv("TTS_RATE_CONCISE", "-8%"), os.getenv("TTS_PITCH_CONCISE", "-1Hz"), os.getenv("TTS_VOLUME", "+0%")
+    return os.getenv("TTS_RATE", "-4%"), os.getenv("TTS_PITCH", "+0Hz"), os.getenv("TTS_VOLUME", "+0%")
 
-    if engine in {"gemini_tts_app", "gemini_tts_user_key", "gemini_tts"}:
-        return json_error(
-            "Gemini TTS is not enabled in this backend package yet. Use Edge TTS or deploy the Gemini TTS extension later.",
-            501,
-            final_script_url=public_url("script", script_name, "final-script.txt"),
-            engine=engine,
-        )
 
-    if language in {"my", "mm", "myanmar", "burmese"}:
-        male_voice = os.getenv("TTS_VOICE_MY_MALE", "my-MM-ThihaNeural")
-        female_voice = os.getenv("TTS_VOICE_MY_FEMALE", "my-MM-NilarNeural")
-    else:
-        male_voice = os.getenv("TTS_VOICE_EN_MALE", "en-US-GuyNeural")
-        female_voice = os.getenv("TTS_VOICE_EN_FEMALE", "en-US-JennyNeural")
-    voice = data.get("voice") or (female_voice if gender == "female" else male_voice)
-    rate = data.get("rate") or (os.getenv("TTS_RATE_EMOTIONAL", "-10%") if "emotion" in style else os.getenv("TTS_RATE_CONCISE", "-10%"))
-    pitch = data.get("pitch") or (os.getenv("TTS_PITCH_EMOTIONAL", "-1Hz") if "emotion" in style else os.getenv("TTS_PITCH_CONCISE", "-1Hz"))
-
-    audio_name = f"final_audio_{now_stamp()}_{uid()}.mp3"
-    audio_path = DOWNLOAD_DIR / audio_name
+@app.post("/tts")
+def tts():
     try:
-        asyncio.run(edge_tts_save(final_script, voice, audio_path, rate=rate, pitch=pitch))
+        payload = request.get_json(silent=True) or {}
+        text = payload.get("text") or payload.get("script") or payload.get("rewrittenScript") or ""
+        language = payload.get("language") or "my"
+        gender = payload.get("gender") or payload.get("voice_gender") or "female"
+        style = payload.get("style") or payload.get("content_style") or payload.get("rewrite_style") or "natural_accurate"
+        requested_voice = payload.get("voice") or payload.get("voice_id")
+        text = polish_tts_script(text, style=style)
+        if not text:
+            return json_error("Missing text for TTS", 400)
+        voice = select_tts_voice(language, gender, requested_voice)
+        rate = payload.get("rate") or None
+        pitch = payload.get("pitch") or None
+        volume = payload.get("volume") or None
+        default_rate, default_pitch, default_volume = tts_voice_params(style)
+        rate = rate or default_rate
+        pitch = pitch or default_pitch
+        volume = volume or default_volume
+        output_filename = f"tts_{uuid.uuid4().hex[:8]}.mp3"
+        output_path = TTS_DIR / output_filename
+        try:
+            asyncio.run(_edge_tts_generate(text, voice, output_path, rate=rate, pitch=pitch, volume=volume))
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(_edge_tts_generate(text, voice, output_path, rate=rate, pitch=pitch, volume=volume))
+            loop.close()
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise RuntimeError("TTS audio file was not created")
+        final_script_filename, final_script_url = save_text_response(text, "final_script")
+        audio_duration_seconds = get_audio_duration_seconds(output_path)
+        final_srt_text = build_final_srt_from_script(text, total_duration=audio_duration_seconds)
+        final_srt_filename = f"final_tts_{uuid.uuid4().hex[:8]}.srt"
+        (SRT_DIR / final_srt_filename).write_text(final_srt_text, encoding="utf-8")
+        base_url = get_public_base_url()
+        return jsonify({
+            "ok": True,
+            "success": True,
+            "audio_url": f"{base_url}/tts/{output_filename}",
+            "tts_audio_url": f"{base_url}/tts/{output_filename}",
+            "audio_filename": output_filename,
+            "audio_download_url": add_download_name(f"{base_url}/tts/{output_filename}", "final-audio.mp3"),
+            "download_url": add_download_name(f"{base_url}/tts/{output_filename}", "final-audio.mp3"),
+            "audio_duration_seconds": audio_duration_seconds,
+            "voice": voice,
+            "engine": "edge_tts",
+            "style": normalize_rewrite_style(style),
+            "rate": rate,
+            "pitch": pitch,
+            "volume": volume,
+            "tts_input_text": text,
+            "final_script_text": text,
+            "final_script_url": add_download_name(final_script_url, "final-script.txt"),
+            "final_script_filename": final_script_filename,
+            "final_srt_text": final_srt_text,
+            "final_srt_url": add_download_name(f"{base_url}/srt/{final_srt_filename}", "final.srt"),
+            "final_srt_filename": final_srt_filename,
+        })
     except Exception as exc:
-        return json_error("TTS generation failed", 500, details=str(exc)[:1000])
+        print(f"tts error: {exc}", flush=True)
+        return json_error(str(exc), 500)
 
-    duration = audio_duration_seconds(audio_path)
-    final_srt_text = script_to_final_srt(final_script, duration)
-    srt_name = f"final_{now_stamp()}_{uid()}.srt"
-    write_text_file(SRT_DIR / srt_name, final_srt_text)
 
-    return jsonify({
-        "success": True,
-        "ok": True,
-        "engine": "edge_tts",
-        "voice": voice,
-        "rate": rate,
-        "pitch": pitch,
-        "audio_url": public_url("audio", audio_name),
-        "download_url": public_url("audio", audio_name, "final-audio.mp3"),
-        "audio_download_url": public_url("audio", audio_name, "final-audio.mp3"),
-        "filename": audio_name,
-        "final_srt_text": final_srt_text,
-        "final_srt_url": public_url("srt", srt_name, "final.srt"),
-        "final_script_text": final_script,
-        "final_script_url": public_url("script", script_name, "final-script.txt"),
-        "audio_duration_seconds": duration,
-    })
+@app.post("/final-srt")
+def final_srt():
+    try:
+        payload = request.get_json(silent=True) or {}
+        script = payload.get("script") or payload.get("text") or payload.get("rewrittenScript") or ""
+        if not script.strip():
+            return json_error("Missing script/text", 400)
+        duration = payload.get("duration_seconds") or payload.get("audio_duration_seconds")
+        try:
+            duration = float(duration) if duration is not None else None
+        except Exception:
+            duration = None
+        final_srt_text = build_final_srt_from_script(script, total_duration=duration)
+        filename, url = save_srt_response(final_srt_text, "final_srt")
+        return jsonify({"ok": True, "success": True, "final_srt_text": final_srt_text, "final_srt_url": add_download_name(url, "final.srt"), "filename": filename})
+    except Exception as exc:
+        print(f"final-srt error: {exc}", flush=True)
+        return json_error(str(exc), 500)
+
+
+@app.get("/audio/<path:filename>")
+def serve_audio(filename):
+    safe_filename = Path(filename).name
+    download_name = requested_download_name(safe_filename, ".mp3")
+    return send_from_directory(AUDIO_DIR, safe_filename, mimetype="audio/mpeg", as_attachment=True, download_name=download_name, max_age=0)
+
+
+@app.get("/srt/<path:filename>")
+def serve_srt(filename):
+    safe_filename = Path(filename).name
+    download_name = requested_download_name(safe_filename, ".srt")
+    return send_from_directory(SRT_DIR, safe_filename, mimetype="text/plain; charset=utf-8", as_attachment=True, download_name=download_name, max_age=0)
+
+
+@app.get("/tts/<path:filename>")
+def serve_tts(filename):
+    safe_filename = Path(filename).name
+    download_name = requested_download_name(safe_filename, ".mp3")
+    return send_from_directory(TTS_DIR, safe_filename, mimetype="audio/mpeg", as_attachment=True, download_name=download_name, max_age=0)
+
+
+
+@app.get("/script/<path:filename>")
+def serve_script(filename):
+    safe_filename = Path(filename).name
+    download_name = requested_download_name(safe_filename, ".txt")
+    return send_from_directory(SCRIPT_DIR, safe_filename, mimetype="text/plain; charset=utf-8", as_attachment=True, download_name=download_name, max_age=0)
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_large_file(exc):
+    return json_error(f"Upload too large. Limit is {app.config['MAX_CONTENT_LENGTH'] // (1024 * 1024)} MB.", 413)
+
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(exc):
+    return json_error(exc.description or exc.name, exc.code or 500)
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_exception(exc):
+    print(f"Unhandled error: {exc}", flush=True)
+    return json_error(str(exc), 500)
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
