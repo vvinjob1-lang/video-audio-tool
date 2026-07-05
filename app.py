@@ -18,7 +18,7 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
-APP_VERSION = "v17.1-premium-rewrite-repair-gate"
+APP_VERSION = "v17.3-youtube-srt-reliability-fix"
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -77,6 +77,171 @@ def public_url(prefix: str, filename: str, download_name: Optional[str] = None) 
     if download_name:
         url += f"?download_name={requests.utils.quote(download_name)}"
     return url
+
+
+# -----------------------------
+# YouTube / SRT reliability helpers
+# -----------------------------
+
+def youtube_cookiefile() -> Optional[str]:
+    """Return a cookie file path for yt-dlp if available.
+
+    Supported sources:
+    1) YOUTUBE_COOKIES_B64 / YT_COOKIES_B64: base64 encoded Netscape cookies.txt
+    2) YOUTUBE_COOKIES_TXT / YT_COOKIES_TXT: raw Netscape cookies.txt text
+    3) cookies.txt committed next to app.py
+    """
+    env_b64 = os.getenv("YOUTUBE_COOKIES_B64") or os.getenv("YT_COOKIES_B64")
+    env_txt = os.getenv("YOUTUBE_COOKIES_TXT") or os.getenv("YT_COOKIES_TXT")
+    fp = BASE_DIR / "cookies.txt"
+    try:
+        if env_b64:
+            raw = base64.b64decode(env_b64.strip()).decode("utf-8", errors="ignore")
+            if raw.strip():
+                fp.write_text(raw, encoding="utf-8")
+        elif env_txt:
+            raw = env_txt.replace("\\n", "\n")
+            if raw.strip():
+                fp.write_text(raw, encoding="utf-8")
+    except Exception:
+        pass
+    if fp.exists() and fp.stat().st_size > 20:
+        return str(fp)
+    return None
+
+
+def is_youtube_bot_check_error(text: object) -> bool:
+    lower = str(text or "").lower()
+    markers = [
+        "sign in to confirm",
+        "not a bot",
+        "confirm you're not a bot",
+        "confirm you’re not a bot",
+        "use --cookies",
+        "cookies-from-browser",
+        "bot check",
+        "verify that you are not a bot",
+    ]
+    return any(m in lower for m in markers)
+
+
+def extract_youtube_video_id(url: str) -> Optional[str]:
+    url = (url or "").strip()
+    patterns = [
+        r"youtu\.be/([A-Za-z0-9_-]{6,})",
+        r"youtube\.com/shorts/([A-Za-z0-9_-]{6,})",
+        r"youtube\.com/watch\?[^#]*v=([A-Za-z0-9_-]{6,})",
+        r"youtube\.com/embed/([A-Za-z0-9_-]{6,})",
+        r"youtube\.com/live/([A-Za-z0-9_-]{6,})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
+    # Last resort: plain 11-char video id.
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", url):
+        return url
+    return None
+
+
+def transcript_items_to_srt(items: List[Dict[str, object]]) -> str:
+    blocks: List[Dict[str, str]] = []
+    for i, it in enumerate(items, start=1):
+        txt = remove_html_tags(str(it.get("text") or "")).replace("\n", " ")
+        txt = re.sub(r"\s+", " ", txt).strip()
+        if not txt:
+            continue
+        start = float(it.get("start") or 0.0)
+        duration = float(it.get("duration") or 2.5)
+        end = max(start + 0.5, start + duration)
+        blocks.append({"index": str(len(blocks) + 1), "start": seconds_to_srt_time(start), "end": seconds_to_srt_time(end), "text": txt})
+    return compose_srt(blocks) if blocks else ""
+
+
+def try_youtube_transcript_api_srt(url: str, language: str = "auto") -> Tuple[Optional[str], Dict[str, object]]:
+    """Try YouTubeTranscriptApi before yt-dlp.
+
+    This often works when yt-dlp metadata extraction is blocked by YouTube bot checks.
+    It is optional; if the dependency is unavailable or YouTube blocks it, we fall back.
+    """
+    video_id = extract_youtube_video_id(url)
+    if not video_id:
+        return None, {"transcript_error": "not_youtube_or_video_id_not_found"}
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi  # type: ignore
+    except Exception as exc:
+        return None, {"transcript_error": f"youtube_transcript_api_unavailable: {exc}"}
+
+    preferred = []
+    if language and language not in {"auto", "best"}:
+        preferred.append(language)
+    preferred += ["en", "en-US", "en-GB", "my"]
+
+    attempts: List[Dict[str, object]] = []
+    try:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript = None
+        try:
+            transcript = transcript_list.find_manually_created_transcript(preferred)
+        except Exception as exc:
+            attempts.append({"manual_error": str(exc)[:300]})
+        if transcript is None:
+            try:
+                transcript = transcript_list.find_generated_transcript(preferred)
+            except Exception as exc:
+                attempts.append({"generated_error": str(exc)[:300]})
+        if transcript is None:
+            # Use the first available transcript if language preference did not match.
+            for tr in transcript_list:
+                transcript = tr
+                break
+        if transcript is None:
+            return None, {"transcript_error": "no_transcript_found", "attempts": attempts, "video_id": video_id}
+        fetched = transcript.fetch()
+        # youtube-transcript-api may return dataclass-like objects in newer versions.
+        items: List[Dict[str, object]] = []
+        for item in fetched:
+            if isinstance(item, dict):
+                items.append(item)
+            else:
+                items.append({
+                    "text": getattr(item, "text", ""),
+                    "start": getattr(item, "start", 0.0),
+                    "duration": getattr(item, "duration", 2.5),
+                })
+        srt = transcript_items_to_srt(items)
+        if parse_srt_blocks(srt) or clean_srt_to_text(srt):
+            return srt, {
+                "caption_source": "youtube_transcript_api",
+                "video_id": video_id,
+                "language_code": getattr(transcript, "language_code", None),
+                "is_generated": getattr(transcript, "is_generated", None),
+                "segments": len(items),
+                "attempts": attempts,
+            }
+        return None, {"transcript_error": "transcript_returned_empty", "video_id": video_id, "attempts": attempts}
+    except Exception as exc:
+        return None, {"transcript_error": str(exc)[:1000], "video_id": video_id, "is_bot_check": is_youtube_bot_check_error(exc)}
+
+
+def manual_srt_fallback_response(url: str, caption_meta: Optional[Dict[str, object]] = None, whisper_error: str = "", reason: str = "auto_extract_failed"):
+    encoded = requests.utils.quote(url, safe="")
+    return jsonify({
+        "success": False,
+        "ok": False,
+        "accepted_mode": True,
+        "needs_manual_srt_upload": True,
+        "needs_upload": True,
+        "reason": reason,
+        "message": "Automatic extraction did not work from our server. Open Downsub/SubDown and upload the SRT here to continue.",
+        "user_message": "YouTube blocked server subtitle extraction. Open Downsub/SubDown, download the SRT/VTT file, then upload it here to continue.",
+        "open_downsub_url": f"https://downsub.com/?url={encoded}",
+        "open_subdown_url": f"https://subdown.org/youtube-subtitle-downloader?url={encoded}",
+        "caption_attempt": caption_meta or {},
+        "whisper_error": whisper_error,
+        "bot_check": is_youtube_bot_check_error(caption_meta) or is_youtube_bot_check_error(whisper_error),
+        "cookie_configured": bool(youtube_cookiefile()),
+    }), 200
 
 
 def json_error(message: str, status: int = 400, **extra):
@@ -968,7 +1133,7 @@ def youtube_download_audio(url: str, out_dir: Path) -> Path:
         "outtmpl": outtmpl,
         "quiet": True,
         "noplaylist": True,
-        "cookiefile": str(BASE_DIR / "cookies.txt") if (BASE_DIR / "cookies.txt").exists() else None,
+        "cookiefile": youtube_cookiefile(),
         "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
         "postprocessors": [{
             "key": "FFmpegExtractAudio",
@@ -991,7 +1156,23 @@ def youtube_download_audio(url: str, out_dir: Path) -> Path:
     raise RuntimeError("Audio download failed")
 
 
-def try_caption_first_srt(url: str) -> Tuple[Optional[str], Dict[str, object]]:
+def try_caption_first_srt(url: str, language: str = "auto") -> Tuple[Optional[str], Dict[str, object]]:
+    """Caption-first SRT extraction.
+
+    Order:
+    1) youtube-transcript-api, which can avoid yt-dlp bot-check metadata extraction.
+    2) yt-dlp subtitle-only with cookiefile support.
+    This function never downloads audio/video.
+    """
+    attempts: Dict[str, object] = {}
+
+    transcript_srt, transcript_meta = try_youtube_transcript_api_srt(url, language=language)
+    attempts["youtube_transcript_api"] = transcript_meta
+    if transcript_srt:
+        transcript_meta = dict(transcript_meta or {})
+        transcript_meta["attempts"] = attempts
+        return transcript_srt, transcript_meta
+
     import yt_dlp
 
     with tempfile.TemporaryDirectory() as td:
@@ -1005,16 +1186,27 @@ def try_caption_first_srt(url: str) -> Tuple[Optional[str], Dict[str, object]]:
             "subtitleslangs": ["en", "en.*", "my", "my.*", "en-US", "en-GB"],
             "outtmpl": outtmpl,
             "quiet": True,
+            "no_warnings": True,
             "noplaylist": True,
-            "cookiefile": str(BASE_DIR / "cookies.txt") if (BASE_DIR / "cookies.txt").exists() else None,
-            "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+            "cookiefile": youtube_cookiefile(),
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            "extractor_args": {"youtube": {"player_client": ["ios", "android", "web_creator", "web"]}},
         }
         ydl_opts = {k: v for k, v in ydl_opts.items() if v is not None}
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
         except Exception as exc:
-            return None, {"caption_error": str(exc)}
+            err = str(exc)
+            return None, {
+                "caption_error": err,
+                "is_bot_check": is_youtube_bot_check_error(err),
+                "cookie_configured": bool(youtube_cookiefile()),
+                "attempts": attempts,
+            }
         files = list(tdir.glob("*.srt")) + list(tdir.glob("*.vtt"))
         files = sorted(files, key=lambda p: (0 if p.suffix.lower() == ".srt" else 1, p.name))
         for fp in files:
@@ -1027,11 +1219,12 @@ def try_caption_first_srt(url: str) -> Tuple[Optional[str], Dict[str, object]]:
                         "subtitle_file": fp.name,
                         "video_id": info.get("id"),
                         "title": info.get("title"),
+                        "cookie_configured": bool(youtube_cookiefile()),
+                        "attempts": attempts,
                     }
             except Exception:
                 continue
-    return None, {"caption_error": "No subtitle file returned"}
-
+    return None, {"caption_error": "No subtitle file returned", "cookie_configured": bool(youtube_cookiefile()), "attempts": attempts}
 
 def transcribe_audio_to_srt(audio_path: Path, language: str = "auto") -> Tuple[str, Dict[str, object]]:
     from faster_whisper import WhisperModel
@@ -1236,7 +1429,7 @@ def extract_srt_route():
     # Caption first for URL input. Downsub/SubDown are assisted manual fallback only.
     caption_meta: Dict[str, object] = {}
     if mode in {"caption_first", "auto", "subtitles"}:
-        srt_text, caption_meta = try_caption_first_srt(url)
+        srt_text, caption_meta = try_caption_first_srt(url, language=language)
         if srt_text:
             fname = f"{uid()}_captions.srt"
             write_text_file(SRT_DIR / fname, srt_text)
@@ -1249,6 +1442,11 @@ def extract_srt_route():
                 "filename": fname,
                 "caption": caption_meta,
             })
+
+    # If YouTube already returned an anti-bot/cookies error during caption-first,
+    # do not waste time downloading audio for Whisper. Return assisted manual fallback.
+    if is_youtube_bot_check_error(caption_meta):
+        return manual_srt_fallback_response(url, caption_meta, reason="youtube_bot_check")
 
     # Whisper fallback can be disabled if Railway resource is tight.
     if env_bool("ENABLE_URL_WHISPER_FALLBACK", True):
@@ -1270,22 +1468,12 @@ def extract_srt_route():
                 })
         except Exception as exc:
             whisper_error = str(exc)[:1000]
+            if is_youtube_bot_check_error(whisper_error):
+                return manual_srt_fallback_response(url, caption_meta, whisper_error=whisper_error, reason="youtube_bot_check")
     else:
         whisper_error = "URL Whisper fallback disabled"
 
-    encoded = requests.utils.quote(url, safe="")
-    return jsonify({
-        "success": False,
-        "ok": False,
-        "accepted_mode": True,
-        "needs_manual_srt_upload": True,
-        "needs_upload": True,
-        "message": "Automatic extraction did not work from our server. Open Downsub/SubDown and upload the SRT here to continue.",
-        "open_downsub_url": f"https://downsub.com/?url={encoded}",
-        "open_subdown_url": f"https://subdown.org/youtube-subtitle-downloader?url={encoded}",
-        "caption_attempt": caption_meta,
-        "whisper_error": whisper_error,
-    }), 200
+    return manual_srt_fallback_response(url, caption_meta, whisper_error=whisper_error, reason="auto_extract_failed")
 
 
 @app.route("/process-upload", methods=["POST", "OPTIONS"])
