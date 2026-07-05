@@ -18,7 +18,7 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
-APP_VERSION = "v17-output-quality-basic-premium-ai-router"
+APP_VERSION = "v17.1-premium-rewrite-repair-gate"
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -409,7 +409,7 @@ def coverage_score(source: str, script: str) -> Dict[str, object]:
     source = source or ""
     script_lower = (script or "").lower()
     n = len(source)
-    if n < 300:
+    if n < 800:
         return {"start": True, "middle": True, "end": True, "end_tokens": [], "missing_end": []}
     zones = {
         "start": source[: int(n * 0.2)],
@@ -439,9 +439,16 @@ def script_quality(source_text: str, script: str, source: str = "") -> Dict[str,
     cov = coverage_score(source_text, script)
     punctuation_count = script.count("။") + script.count(".") + script.count("!") + script.count("?")
     tts_safe = bool(script.strip()) and not contains_bad_text(script) and not bad_quality
-    if ratio > 0.55 or ratio < 0.12:
+    source_len = len(source_text)
+    if source_len < 800:
+        min_ratio = float(os.getenv("REWRITE_SHORT_MIN_RATIO", "0.18"))
+        max_ratio = float(os.getenv("REWRITE_SHORT_MAX_RATIO", "1.45"))
+    else:
+        min_ratio = float(os.getenv("REWRITE_MIN_RATIO_CONCISE", "0.12"))
+        max_ratio = float(os.getenv("REWRITE_MAX_RATIO_CONCISE", "0.55"))
+    if ratio > max_ratio or ratio < min_ratio:
         tts_safe = False
-    if cov.get("end") is False:
+    if source_len >= 800 and cov.get("end") is False:
         tts_safe = False
     if len(script) > 600 and punctuation_count < max(1, len(script) // 450):
         tts_safe = False
@@ -769,9 +776,10 @@ def rewrite_with_iamhc(text: str, option: str, target_ratio: float, quality_mode
             user_prompt = (
                 f"အောက်ကစာက video subtitle/translation ထဲက အပိုင်း {idx}/{len(chunks)} ဖြစ်ပါတယ်။\n"
                 f"ဒီအပိုင်းကို {style_desc} အဖြစ် မြန်မာစကားပြေ voice-over narration ပြန်ရေးပါ။\n"
+                f"အရေးကြီး: မူရင်းအပိုင်းထက် မရှည်စေရ။ ဒီအပိုင်းကို အကြမ်းဖျင်း {max(180, int(len(chunk) * max(0.18, min(target_ratio, 0.45))))} စာလုံးခန့်ဖြစ်အောင် ကျစ်လစ်ပါ။\n"
                 "မြန်မာစာတစ်ခုတည်းသာပြန်ပါ။ English explanation မထည့်ပါနဲ့။\n"
                 "SRT timestamp, numbering, arrow မထည့်ပါနဲ့။\n"
-                "ဇာတ်လမ်းအစဉ်အလိုက် အဓိကဖြစ်ရပ်တွေမပျောက်စေပါနဲ့။\n\n"
+                "ဇာတ်လမ်းအစဉ်အလိုက် အဓိကဖြစ်ရပ်တွေမပျောက်စေပါနဲ့။ စာကြောင်းအဆုံးတိုင်း ‘။’ သုံးပါ။\n\n"
                 f"စာသား:\n{chunk}"
             )
             out, meta = iamhc_chat(model, system_prompt, user_prompt)
@@ -848,6 +856,61 @@ def rewrite_with_iamhc(text: str, option: str, target_ratio: float, quality_mode
     return None, {"ok": False, "error": "all_models_failed", "models_tried": models, "meta": all_model_meta[-4:]}
 
 
+def repair_rewrite_with_iamhc(source_text: str, draft: str, option_id: str, target_ratio: float, quality_mode: str = "premium") -> Tuple[Optional[str], Dict[str, object]]:
+    """Second-pass Premium repair when the first AI rewrite is too long/short/unsafe."""
+    if normalize_quality_mode(quality_mode) != "premium" and not env_bool("IAMHC_REPAIR_IN_BASIC", False):
+        return None, {"ok": False, "error": "repair_disabled_for_basic"}
+    models = []
+    for m in [
+        os.getenv("IAMHC_FINAL_POLISH_MODEL", os.getenv("IAMHC_REWRITE_MODEL", "Qwen3.5-397B-A17B")),
+        os.getenv("IAMHC_PRO_MODEL", os.getenv("IAMHC_REWRITE_MODEL", "Qwen3.5-397B-A17B")),
+        os.getenv("IAMHC_REWRITE_MODEL", "Qwen3.5-397B-A17B"),
+        os.getenv("IAMHC_FAST_MODEL", "DeepSeek-V4-Flash"),
+    ]:
+        if m and m not in models:
+            models.append(m)
+    source_len = len(source_text or "")
+    if source_len < 800:
+        target_chars = max(180, min(int(os.getenv("REWRITE_SHORT_TARGET_CHARS", "320")), 520))
+        min_chars = int(os.getenv("REWRITE_SHORT_MIN_CHARS", "120"))
+        max_chars = int(os.getenv("REWRITE_SHORT_MAX_CHARS", "520"))
+    else:
+        target_chars = max(400, int(source_len * target_ratio))
+        min_chars = max(300, int(source_len * float(os.getenv("REWRITE_MIN_RATIO_CONCISE", "0.12"))))
+        max_chars = max(target_chars + 500, int(source_len * float(os.getenv("REWRITE_MAX_RATIO_CONCISE", "0.55"))))
+    tone = "dramatic emotional storytelling" if option_id == "emotional_tts" else "natural accurate documentary recap"
+    system_prompt = (
+        "You are a senior Myanmar voice-over editor. Return ONLY final Myanmar narration. "
+        "No English explanation, no notes, no bullets, no labels, no markdown. "
+        "Use Burmese punctuation and short TTS-friendly sentences."
+    )
+    user_prompt = (
+        f"အောက်က Draft ကို Premium final {tone} script အဖြစ် ပြန်ပြင်ပါ။\n"
+        f"Target: {target_chars} စာလုံးခန့်။ အနည်းဆုံး {min_chars}၊ အများဆုံး {max_chars} စာလုံး။\n"
+        "အဓိကအချက်: မူရင်းဇာတ်လမ်းအဓိပ္ပါယ်၊ အစ-အလယ်-အဆုံး မပျောက်စေပါနဲ့။\n"
+        "Draft ကရှည်လွန်းရင် အဓိကဇာတ်လမ်းကိုပဲ ကျစ်လစ်အောင်ချုံ့ပါ။\n"
+        "Draft ကတိုလွန်းရင် မူရင်းအဓိပ္ပါယ်အပြည့်ပြန်ဖြည့်ပါ။\n"
+        "မြန်မာစာတစ်ခုတည်းသာပြန်ပါ။ English word/explanation မပါရ။ Timestamp/SRT မပါရ။\n\n"
+        f"မူရင်းအချက်အလက်:\n{source_text[:9000]}\n\n"
+        f"Draft:\n{draft[:9000]}"
+    )
+    attempts = []
+    for model in models:
+        out, meta = iamhc_chat(model, system_prompt, user_prompt, max_tokens=int(os.getenv("IAMHC_REPAIR_MAX_TOKENS", os.getenv("IAMHC_POLISH_MAX_TOKENS", "4000"))))
+        meta = dict(meta or {})
+        meta["repair_model"] = model
+        attempts.append(meta)
+        if not out or bad_llm_output(out):
+            continue
+        candidate = ensure_myanmar_punctuation(sanitize_bad_service_text(out.strip()))
+        q = script_quality(source_text, candidate, source="iamhc_repair")
+        if not q.get("needs_retry"):
+            return candidate, {"ok": True, "repair_model": model, "attempts": attempts, "quality": q}
+        if source_len < 800 and len(candidate) <= max_chars and not contains_bad_text(candidate) and latin_ratio(candidate) <= float(os.getenv("REWRITE_MAX_LATIN_RATIO", "0.25")):
+            return candidate, {"ok": True, "repair_model": model, "attempts": attempts, "quality": q, "accepted_short_repair": True}
+    return None, {"ok": False, "error": "repair_failed", "attempts": attempts}
+
+
 def make_rewrite_option(text: str, option_id: str, title: str, target_ratio: float, quality_mode: str = "basic") -> Dict[str, object]:
     script, meta = rewrite_with_iamhc(text, option_id, target_ratio, quality_mode=quality_mode)
     source = "iamhc_qwen_ai"
@@ -857,6 +920,16 @@ def make_rewrite_option(text: str, option_id: str, title: str, target_ratio: flo
         source = "LOCAL_SANITIZED_SUMMARY_FALLBACK"
         quality = "local_sanitized_summary_fallback"
     q = script_quality(text, script, source=source)
+    repaired_meta = None
+    if quality == "ai_rewrite" and q.get("needs_retry") and env_bool("USE_IAMHC_REWRITE_REPAIR", normalize_quality_mode(quality_mode) == "premium"):
+        repaired, repaired_meta = repair_rewrite_with_iamhc(text, script, option_id, target_ratio, quality_mode=quality_mode)
+        if repaired:
+            repaired_q = script_quality(text, repaired, source="iamhc_repair")
+            if not repaired_q.get("needs_retry") or (len(text) < 800 and len(repaired) < len(script)):
+                script = repaired
+                source = "iamhc_qwen_ai_repaired"
+                q = repaired_q
+                meta = {**(meta or {}), "repair": repaired_meta}
     filename = f"{option_id}_{now_stamp()}_{uid()}.txt"
     write_text_file(SCRIPT_DIR / filename, script)
     return {
@@ -1423,6 +1496,8 @@ def rewrite_options_route():
         "rewrittenScript": natural["script"],
         "quality": natural["quality"],
         "source": natural["source"],
+        "tts_safe": natural.get("tts_safe"),
+        "needs_retry": natural.get("needs_retry"),
         "cleaned_input_chars": len(cleaned),
         "quality_gate": {
             "fallback_is_preview_only": True,
