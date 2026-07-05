@@ -18,7 +18,7 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
-APP_VERSION = "v17.3-youtube-srt-reliability-fix"
+APP_VERSION = "v17.3.1-download-route-fix"
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -259,6 +259,56 @@ def safe_name(name: str, fallback_ext: str = "") -> str:
 def write_text_file(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text or "", encoding="utf-8")
+
+
+def resolve_existing_file(folder: Path, filename: str) -> Optional[Path]:
+    """Resolve a generated file safely without breaking existing filenames.
+
+    Generated filenames are already controlled by the backend, but download
+    routes still receive URL path text from the browser.  Older routes used
+    only safe_name(filename), which can change the name and make an existing
+    file look missing.  Try the raw basename first, then Flask/Werkzeug-safe
+    variants.
+    """
+    raw_name = os.path.basename(str(filename or "")).strip()
+    if not raw_name:
+        return None
+
+    candidates = [
+        folder / raw_name,
+        folder / secure_filename(raw_name),
+        folder / safe_name(raw_name),
+    ]
+
+    seen = set()
+    for fp in candidates:
+        key = str(fp)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if fp.exists() and fp.is_file():
+                return fp
+        except Exception:
+            continue
+    return None
+
+
+def file_not_found_error(kind: str, folder: Path, filename: str):
+    raw_name = os.path.basename(str(filename or "")).strip()
+    candidates = [
+        str(folder / raw_name) if raw_name else str(folder),
+        str(folder / secure_filename(raw_name)) if raw_name else str(folder),
+        str(folder / safe_name(raw_name)) if raw_name else str(folder),
+    ]
+    return json_error(
+        f"{kind} file not found",
+        404,
+        filename=filename,
+        raw_name=raw_name,
+        checked_dir=str(folder),
+        checked_paths=list(dict.fromkeys(candidates)),
+    )
 
 
 def run_cmd(cmd: List[str], timeout: int = 240) -> subprocess.CompletedProcess:
@@ -1366,27 +1416,27 @@ def health():
 
 @app.route("/audio/<path:filename>", methods=["GET"])
 def get_audio(filename):
-    fp = DOWNLOAD_DIR / safe_name(filename)
-    if not fp.exists():
-        return json_error("Audio file not found", 404)
+    fp = resolve_existing_file(DOWNLOAD_DIR, filename)
+    if not fp:
+        return file_not_found_error("Audio", DOWNLOAD_DIR, filename)
     download_name = request.args.get("download_name")
     return send_file(fp, as_attachment=bool(download_name), download_name=download_name or fp.name, mimetype="audio/mpeg")
 
 
 @app.route("/srt/<path:filename>", methods=["GET"])
 def get_srt(filename):
-    fp = SRT_DIR / safe_name(filename)
-    if not fp.exists():
-        return json_error("SRT file not found", 404)
+    fp = resolve_existing_file(SRT_DIR, filename)
+    if not fp:
+        return file_not_found_error("SRT", SRT_DIR, filename)
     download_name = request.args.get("download_name")
     return send_file(fp, as_attachment=bool(download_name), download_name=download_name or fp.name, mimetype="text/plain; charset=utf-8")
 
 
 @app.route("/script/<path:filename>", methods=["GET"])
 def get_script(filename):
-    fp = SCRIPT_DIR / safe_name(filename)
-    if not fp.exists():
-        return json_error("Script file not found", 404)
+    fp = resolve_existing_file(SCRIPT_DIR, filename)
+    if not fp:
+        return file_not_found_error("Script", SCRIPT_DIR, filename)
     download_name = request.args.get("download_name")
     return send_file(fp, as_attachment=bool(download_name), download_name=download_name or fp.name, mimetype="text/plain; charset=utf-8")
 
