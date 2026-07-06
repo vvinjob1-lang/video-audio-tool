@@ -21,7 +21,7 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
-APP_VERSION = "v17.4-v14-caption-restore-fast-rewrite"
+APP_VERSION = "v17.5-tiktok-short-url-resolve"
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -147,6 +147,69 @@ def extract_youtube_video_id(url: str) -> Optional[str]:
     return None
 
 
+
+def url_host(url: str) -> str:
+    try:
+        return urlparse((url or "").strip()).hostname.lower() if urlparse((url or "").strip()).hostname else ""
+    except Exception:
+        return ""
+
+
+def is_tiktok_url(url: str) -> bool:
+    host = url_host(url)
+    return host in {"tiktok.com", "www.tiktok.com", "m.tiktok.com", "vt.tiktok.com", "vm.tiktok.com"} or host.endswith(".tiktok.com")
+
+
+def is_tiktok_short_url(url: str) -> bool:
+    return url_host(url) in {"vt.tiktok.com", "vm.tiktok.com"}
+
+
+def resolve_public_redirect_url(url: str) -> Tuple[str, Dict[str, object]]:
+    """Resolve short public redirect URLs such as vt.tiktok.com/vm.tiktok.com.
+
+    This keeps frontend and fallback links useful because some third-party subtitle
+    sites reject short redirect URLs but accept the canonical destination URL.
+    """
+    original = (url or "").strip()
+    meta: Dict[str, object] = {
+        "input_url": original,
+        "resolved": False,
+        "resolver": "none",
+    }
+    if not original:
+        return original, meta
+
+    # Only resolve known short redirect hosts by default to avoid wasting time.
+    if not is_tiktok_short_url(original):
+        return original, meta
+
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        # TikTok often does not handle HEAD consistently, so use a streamed GET
+        # and close immediately after following redirects.
+        resp = requests.get(original, headers=headers, allow_redirects=True, timeout=12, stream=True)
+        final_url = str(resp.url or "").strip()
+        try:
+            resp.close()
+        except Exception:
+            pass
+        if final_url and final_url != original:
+            meta.update({
+                "resolved": True,
+                "resolver": "requests_get_redirect",
+                "resolved_url": final_url,
+                "status_code": getattr(resp, "status_code", None),
+            })
+            return final_url, meta
+        meta.update({"resolver": "requests_get_redirect", "status_code": getattr(resp, "status_code", None), "resolved_url": final_url or ""})
+    except Exception as exc:
+        meta.update({"resolver": "requests_get_redirect", "resolve_error": str(exc)[:500]})
+    return original, meta
+
+
 def transcript_items_to_srt(items: List[Dict[str, object]]) -> str:
     blocks: List[Dict[str, str]] = []
     for i, it in enumerate(items, start=1):
@@ -227,8 +290,19 @@ def try_youtube_transcript_api_srt(url: str, language: str = "auto") -> Tuple[Op
         return None, {"transcript_error": str(exc)[:1000], "video_id": video_id, "is_bot_check": is_youtube_bot_check_error(exc)}
 
 
-def manual_srt_fallback_response(url: str, caption_meta: Optional[Dict[str, object]] = None, whisper_error: str = "", reason: str = "auto_extract_failed"):
-    encoded = requests.utils.quote(url, safe="")
+def manual_srt_fallback_response(url: str, caption_meta: Optional[Dict[str, object]] = None, whisper_error: str = "", reason: str = "auto_extract_failed", resolved_url: str = ""):
+    caption_meta = caption_meta or {}
+    fallback_url = (resolved_url or str(caption_meta.get("resolved_url") or "") or url or "").strip()
+    encoded = requests.utils.quote(fallback_url, safe="")
+    original_encoded = requests.utils.quote((url or "").strip(), safe="")
+    is_tiktok = is_tiktok_url(fallback_url) or is_tiktok_url(url)
+    open_subdown_url = "" if is_tiktok else f"https://subdown.org/youtube-subtitle-downloader?url={encoded}"
+    if is_tiktok:
+        user_message = "TikTok subtitles could not be extracted automatically from our server. If Downsub does not support this TikTok link, upload the TikTok video file or an SRT/VTT file here to continue."
+        message = "Automatic TikTok subtitle extraction did not work. Try Downsub with the resolved URL, or upload video/SRT here to continue."
+    else:
+        user_message = "YouTube blocked server subtitle extraction. Open Downsub/SubDown, download the SRT/VTT file, then upload it here to continue."
+        message = "Automatic extraction did not work from our server. Open Downsub/SubDown and upload the SRT here to continue."
     return jsonify({
         "success": False,
         "ok": False,
@@ -236,11 +310,16 @@ def manual_srt_fallback_response(url: str, caption_meta: Optional[Dict[str, obje
         "needs_manual_srt_upload": True,
         "needs_upload": True,
         "reason": reason,
-        "message": "Automatic extraction did not work from our server. Open Downsub/SubDown and upload the SRT here to continue.",
-        "user_message": "YouTube blocked server subtitle extraction. Open Downsub/SubDown, download the SRT/VTT file, then upload it here to continue.",
+        "message": message,
+        "user_message": user_message,
+        "input_url": url,
+        "resolved_url": fallback_url,
+        "url_resolved": bool(fallback_url and fallback_url != (url or "").strip()),
+        "is_tiktok": is_tiktok,
         "open_downsub_url": f"https://downsub.com/?url={encoded}",
-        "open_subdown_url": f"https://subdown.org/youtube-subtitle-downloader?url={encoded}",
-        "caption_attempt": caption_meta or {},
+        "open_downsub_original_url": f"https://downsub.com/?url={original_encoded}",
+        "open_subdown_url": open_subdown_url,
+        "caption_attempt": caption_meta,
         "whisper_error": whisper_error,
         "bot_check": is_youtube_bot_check_error(caption_meta) or is_youtube_bot_check_error(whisper_error),
         "cookie_configured": bool(youtube_cookiefile()),
@@ -1930,10 +2009,15 @@ def extract_srt_route():
     if not url:
         return json_error("url is required", 400)
 
+    input_url = url
+    url_for_extract, resolve_meta = resolve_public_redirect_url(input_url)
+    url = url_for_extract or input_url
+
     # Caption first for URL input. Downsub/SubDown are assisted manual fallback only.
-    caption_meta: Dict[str, object] = {}
+    caption_meta: Dict[str, object] = {"url_resolution": resolve_meta, "input_url": input_url, "resolved_url": url}
     if mode in {"caption_first", "auto", "subtitles"}:
-        srt_text, caption_meta = try_caption_first_srt(url, language=language)
+        srt_text, cap_result = try_caption_first_srt(url, language=language)
+        caption_meta.update(cap_result or {})
         if srt_text:
             fname = f"{uid()}_captions.srt"
             write_text_file(SRT_DIR / fname, srt_text)
@@ -1950,7 +2034,7 @@ def extract_srt_route():
     # If YouTube already returned an anti-bot/cookies error during caption-first,
     # do not waste time downloading audio for Whisper. Return assisted manual fallback.
     if is_youtube_bot_check_error(caption_meta):
-        return manual_srt_fallback_response(url, caption_meta, reason="youtube_bot_check")
+        return manual_srt_fallback_response(input_url, caption_meta, reason="youtube_bot_check", resolved_url=url)
 
     # Whisper fallback can be disabled if Railway resource is tight.
     if env_bool("ENABLE_URL_WHISPER_FALLBACK", True):
@@ -1973,11 +2057,11 @@ def extract_srt_route():
         except Exception as exc:
             whisper_error = str(exc)[:1000]
             if is_youtube_bot_check_error(whisper_error):
-                return manual_srt_fallback_response(url, caption_meta, whisper_error=whisper_error, reason="youtube_bot_check")
+                return manual_srt_fallback_response(input_url, caption_meta, whisper_error=whisper_error, reason="youtube_bot_check", resolved_url=url)
     else:
         whisper_error = "URL Whisper fallback disabled"
 
-    return manual_srt_fallback_response(url, caption_meta, whisper_error=whisper_error, reason="auto_extract_failed")
+    return manual_srt_fallback_response(input_url, caption_meta, whisper_error=whisper_error, reason="auto_extract_failed", resolved_url=url)
 
 
 @app.route("/process-upload", methods=["POST", "OPTIONS"])
