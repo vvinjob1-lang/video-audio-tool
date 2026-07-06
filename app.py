@@ -21,7 +21,7 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
-APP_VERSION = "v18.8-caption-innertube-fast-narrative-repair"
+APP_VERSION = "v18.9-youtube-cookies-b64-ytdlp-cli-fallback"
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -86,31 +86,154 @@ def public_url(prefix: str, filename: str, download_name: Optional[str] = None) 
 # YouTube / SRT reliability helpers
 # -----------------------------
 
-def youtube_cookiefile() -> Optional[str]:
-    """Return a cookie file path for yt-dlp if available.
+def _normalize_netscape_cookie_text(raw: str) -> str:
+    """Normalize a Netscape cookies.txt payload without exposing secrets.
 
-    Supported sources:
-    1) YOUTUBE_COOKIES_B64 / YT_COOKIES_B64: base64 encoded Netscape cookies.txt
-    2) YOUTUBE_COOKIES_TXT / YT_COOKIES_TXT: raw Netscape cookies.txt text
-    3) cookies.txt committed next to app.py
+    This protects the app from the two most common project issues:
+    - literal \t strings instead of real tab characters
+    - GitHub web-editor copy/paste converting tabs to spaces
     """
-    env_b64 = os.getenv("YOUTUBE_COOKIES_B64") or os.getenv("YT_COOKIES_B64")
+    text = (raw or "").replace("\r\n", "\n").replace("\r", "\n")
+    # If the file contains literal backslash-t sequences, convert them to real tabs.
+    if "\\t" in text:
+        text = text.replace("\\t", "\t")
+
+    fixed = [
+        "# Netscape HTTP Cookie File",
+        "# https://curl.haxx.se/rfc/cookie_spec.html",
+        "# This is a generated file! Do not edit.",
+        "",
+    ]
+
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+
+        parts = s.split("\t")
+        if len(parts) != 7:
+            # Fallback for copy/pasted lines where tabs became spaces.
+            parts = s.split(maxsplit=6)
+        if len(parts) != 7:
+            continue
+
+        domain, flag, path, secure, expires, name, value = parts
+        domain = domain.strip()
+        flag = "TRUE" if str(flag).strip().upper() == "TRUE" else "FALSE"
+        path = path.strip() or "/"
+        secure = "TRUE" if str(secure).strip().upper() == "TRUE" else "FALSE"
+        expires = str(expires).strip()
+        name = name.strip()
+        value = str(value).strip()
+
+        if not domain or not name or not expires.isdigit():
+            continue
+        if not path.startswith("/"):
+            path = "/"
+
+        fixed.append("\t".join([domain, flag, path, secure, expires, name, value]))
+
+    return "\n".join(fixed) + "\n"
+
+
+def _validate_netscape_cookie_file(path: Path) -> Tuple[bool, Dict[str, object]]:
+    diag: Dict[str, object] = {"path": str(path), "exists": path.exists()}
+    if not path.exists():
+        return False, diag
+    try:
+        text = path.read_text(errors="replace")
+        lines = text.splitlines()
+        diag["size"] = path.stat().st_size
+        diag["first_line_ok"] = bool(lines and lines[0] == "# Netscape HTTP Cookie File")
+        cookie_lines = 0
+        bad_lines = 0
+        youtube_lines = 0
+        for line in lines:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            cookie_lines += 1
+            if "youtube.com" in line.lower():
+                youtube_lines += 1
+            if len(parts) != 7 or not parts[4].isdigit():
+                bad_lines += 1
+        diag["cookie_lines"] = cookie_lines
+        diag["youtube_cookie_lines"] = youtube_lines
+        diag["bad_lines"] = bad_lines
+        ok = bool(diag["first_line_ok"] and cookie_lines > 0 and youtube_lines > 0 and bad_lines == 0)
+        diag["valid"] = ok
+        return ok, diag
+    except Exception as exc:
+        diag["error"] = str(exc)[:300]
+        diag["valid"] = False
+        return False, diag
+
+
+def youtube_cookiefile() -> Optional[str]:
+    """Return a validated cookie file path for yt-dlp if available.
+
+    Preferred production source:
+    - YOUTUBE_COOKIES_B64 / YT_COOKIES_B64: base64 encoded Netscape cookies.txt.
+
+    We intentionally write environment cookies to /tmp, not /app/cookies.txt, so
+    a corrupted committed file can never overwrite the good Railway variable.
+    """
+    env_b64 = (os.getenv("YOUTUBE_COOKIES_B64") or os.getenv("YT_COOKIES_B64") or "").strip()
     env_txt = os.getenv("YOUTUBE_COOKIES_TXT") or os.getenv("YT_COOKIES_TXT")
-    fp = BASE_DIR / "cookies.txt"
+
+    candidates: List[Tuple[str, Path, str]] = []
     try:
         if env_b64:
-            raw = base64.b64decode(env_b64.strip()).decode("utf-8", errors="ignore")
-            if raw.strip():
-                fp.write_text(raw, encoding="utf-8")
-        elif env_txt:
-            raw = env_txt.replace("\\n", "\n")
-            if raw.strip():
-                fp.write_text(raw, encoding="utf-8")
+            # Accept plain base64 with optional whitespace/newlines.
+            compact = re.sub(r"\s+", "", env_b64)
+            raw = base64.b64decode(compact + "=" * (-len(compact) % 4)).decode("utf-8", errors="replace")
+            fp = Path("/tmp/youtube_cookies_from_b64.txt")
+            fp.write_text(_normalize_netscape_cookie_text(raw), encoding="utf-8")
+            candidates.append(("YOUTUBE_COOKIES_B64", fp, raw))
+        if env_txt:
+            raw = str(env_txt).replace("\\n", "\n")
+            fp = Path("/tmp/youtube_cookies_from_text.txt")
+            fp.write_text(_normalize_netscape_cookie_text(raw), encoding="utf-8")
+            candidates.append(("YOUTUBE_COOKIES_TXT", fp, raw))
     except Exception:
+        # Do not fail the whole app if a secret is malformed. Fall back to file.
         pass
-    if fp.exists() and fp.stat().st_size > 20:
-        return str(fp)
+
+    # Last resort: committed file. Normalize it into /tmp, but do not mutate /app.
+    committed = BASE_DIR / "cookies.txt"
+    if committed.exists() and committed.stat().st_size > 20:
+        try:
+            raw = committed.read_text(errors="replace")
+            fp = Path("/tmp/youtube_cookies_from_file.txt")
+            fp.write_text(_normalize_netscape_cookie_text(raw), encoding="utf-8")
+            candidates.append(("cookies.txt", fp, raw))
+        except Exception:
+            pass
+
+    for source, fp, _raw in candidates:
+        ok, _diag = _validate_netscape_cookie_file(fp)
+        if ok:
+            return str(fp)
     return None
+
+
+def youtube_cookie_diagnostics() -> Dict[str, object]:
+    """Safe diagnostics: does not return cookie values."""
+    env_b64 = (os.getenv("YOUTUBE_COOKIES_B64") or os.getenv("YT_COOKIES_B64") or "").strip()
+    diag: Dict[str, object] = {
+        "env_b64_configured": bool(env_b64),
+        "env_txt_configured": bool(os.getenv("YOUTUBE_COOKIES_TXT") or os.getenv("YT_COOKIES_TXT")),
+        "committed_file_exists": (BASE_DIR / "cookies.txt").exists(),
+        "selected_cookiefile": youtube_cookiefile() or "",
+    }
+    selected = diag.get("selected_cookiefile")
+    if selected:
+        ok, file_diag = _validate_netscape_cookie_file(Path(str(selected)))
+        diag["selected_valid"] = ok
+        diag["selected_diag"] = file_diag
+    else:
+        diag["selected_valid"] = False
+    return diag
 
 
 def is_youtube_bot_check_error(text: object) -> bool:
@@ -1951,6 +2074,113 @@ def youtube_download_audio(url: str, out_dir: Path) -> Path:
     raise RuntimeError("Audio download failed")
 
 
+def ytdlp_cli_path() -> Optional[str]:
+    candidates = [
+        os.getenv("YTDLP_BIN"),
+        "/opt/venv/bin/yt-dlp",
+        shutil.which("yt-dlp"),
+        "yt-dlp",
+    ]
+    for item in candidates:
+        if not item:
+            continue
+        if item == "yt-dlp":
+            found = shutil.which(item)
+            if found:
+                return found
+            continue
+        try:
+            if Path(item).exists():
+                return item
+        except Exception:
+            pass
+    return None
+
+
+def try_yt_dlp_cli_caption_srt(url: str, language: str = "auto") -> Tuple[Optional[str], Dict[str, object]]:
+    """Subtitle-only extraction using yt-dlp CLI.
+
+    This avoids Python import path issues on Railway where /opt/venv has yt-dlp
+    but the interactive shell's default python may not. It never downloads video.
+    """
+    bin_path = ytdlp_cli_path()
+    cookie_path = youtube_cookiefile()
+    meta: Dict[str, object] = {
+        "source": "yt_dlp_cli_subtitle_only",
+        "yt_dlp_cli_found": bool(bin_path),
+        "yt_dlp_bin": bin_path or "",
+        "cookie_configured": bool(cookie_path),
+        "cookie_diagnostics": youtube_cookie_diagnostics(),
+    }
+    if not bin_path:
+        meta["caption_error"] = "yt-dlp CLI not found"
+        return None, meta
+
+    langs = "en,en.*,my,my.*,en-US,en-GB"
+    if language and language not in {"auto", "en", "my"}:
+        langs = f"{language},{language}.*," + langs
+
+    with tempfile.TemporaryDirectory() as td:
+        tdir = Path(td)
+        outtmpl = str(tdir / "subtitle_%(id)s.%(ext)s")
+        cmd = [
+            bin_path,
+            "--skip-download",
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-langs", langs,
+            "--sub-format", "srt/vtt/best",
+            "--output", outtmpl,
+            "--no-playlist",
+            "--ignore-no-formats-error",
+            "--no-warnings",
+            url,
+        ]
+        if cookie_path:
+            cmd[1:1] = ["--cookies", cookie_path]
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(tdir),
+                capture_output=True,
+                text=True,
+                timeout=int(os.getenv("YTDLP_SUBTITLE_TIMEOUT", "120")),
+            )
+        except subprocess.TimeoutExpired as exc:
+            meta["caption_error"] = f"yt-dlp CLI timeout after {exc.timeout}s"
+            return None, meta
+        except Exception as exc:
+            meta["caption_error"] = str(exc)[:1000]
+            return None, meta
+
+        meta["returncode"] = proc.returncode
+        meta["stderr_tail"] = (proc.stderr or "")[-1500:]
+        meta["stdout_tail"] = (proc.stdout or "")[-1500:]
+        meta["is_bot_check"] = is_youtube_bot_check_error(proc.stderr or proc.stdout)
+
+        subtitle_files = [p for p in tdir.glob("subtitle_*.*") if p.suffix.lower() in {".srt", ".vtt"} and p.exists()]
+        if subtitle_files:
+            subtitle_files.sort(key=lambda p: (0 if p.suffix.lower() == ".srt" else 1, -p.stat().st_size))
+            fp = subtitle_files[0]
+            raw = read_text_file(fp)
+            srt = raw if fp.suffix.lower() == ".srt" else vtt_to_srt(raw)
+            if srt.strip():
+                meta.update({
+                    "ok": True,
+                    "filename": fp.name,
+                    "subtitle_file_count": len(subtitle_files),
+                    "caption_first": True,
+                })
+                return srt, meta
+
+        if proc.returncode != 0:
+            meta["caption_error"] = (proc.stderr or proc.stdout or "yt-dlp CLI failed")[-2000:]
+        else:
+            meta["caption_error"] = "yt-dlp CLI returned no subtitle file"
+        return None, meta
+
+
 def try_caption_first_srt(url: str, language: str = "auto") -> Tuple[Optional[str], Dict[str, object]]:
     """Caption-first SRT extraction.
 
@@ -1977,7 +2207,25 @@ def try_caption_first_srt(url: str, language: str = "auto") -> Tuple[Optional[st
         transcript_meta["attempts"] = attempts
         return transcript_srt, transcript_meta
 
-    import yt_dlp
+    # V18.9: Prefer CLI fallback because Railway runtime may have yt-dlp in
+    # /opt/venv/bin even when the interactive default python cannot import it.
+    cli_srt, cli_meta = try_yt_dlp_cli_caption_srt(url, language=language)
+    attempts["yt_dlp_cli_subtitle_only"] = cli_meta
+    if cli_srt:
+        cli_meta = dict(cli_meta or {})
+        cli_meta["attempts"] = attempts
+        return cli_srt, cli_meta
+
+    try:
+        import yt_dlp
+    except Exception as exc:
+        return None, {
+            "caption_error": f"yt-dlp Python import failed: {exc}",
+            "cookie_configured": bool(youtube_cookiefile()),
+            "cookie_diagnostics": youtube_cookie_diagnostics(),
+            "yt_dlp_cli_found": bool(ytdlp_cli_path()),
+            "attempts": attempts,
+        }
 
     with tempfile.TemporaryDirectory() as td:
         tdir = Path(td)
@@ -2009,6 +2257,8 @@ def try_caption_first_srt(url: str, language: str = "auto") -> Tuple[Optional[st
                 "caption_error": err,
                 "is_bot_check": is_youtube_bot_check_error(err),
                 "cookie_configured": bool(youtube_cookiefile()),
+                "cookie_diagnostics": youtube_cookie_diagnostics(),
+                "yt_dlp_cli_found": bool(ytdlp_cli_path()),
                 "attempts": attempts,
             }
 
@@ -2027,11 +2277,15 @@ def try_caption_first_srt(url: str, language: str = "auto") -> Tuple[Optional[st
                     "video_id": (info or {}).get("id"),
                     "title": (info or {}).get("title"),
                     "cookie_configured": bool(youtube_cookiefile()),
+                    "cookie_diagnostics": youtube_cookie_diagnostics(),
+                    "yt_dlp_cli_found": bool(ytdlp_cli_path()),
                     "attempts": attempts,
                 }
         return None, {
             "caption_error": "No subtitle file returned",
             "cookie_configured": bool(youtube_cookiefile()),
+            "cookie_diagnostics": youtube_cookie_diagnostics(),
+            "yt_dlp_cli_found": bool(ytdlp_cli_path()),
             "attempts": attempts,
         }
 
@@ -2253,6 +2507,9 @@ def debug_youtube_captions_route():
         "srt_preview": (srt_text or "")[:1000],
         "caption_meta": meta,
         "cookie_configured": bool(youtube_cookiefile()),
+        "cookie_diagnostics": youtube_cookie_diagnostics(),
+        "yt_dlp_cli_found": bool(ytdlp_cli_path()),
+        "yt_dlp_cli_path": ytdlp_cli_path() or "",
     })
 
 @app.route("/extract-srt", methods=["POST", "OPTIONS"])
