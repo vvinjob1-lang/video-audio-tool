@@ -21,7 +21,7 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
-APP_VERSION = "v19-final-safe-narrative-rewrite"
+APP_VERSION = "v19.2-narrative-repair-expansion-gate"
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -860,6 +860,9 @@ def transliterate_common_story_names(text: str) -> str:
         r"\bwifi\b": "ဝိုင်ဖိုင်",
         r"\bWiFi\b": "ဝိုင်ဖိုင်",
         r"\bYouTube\b": "ယူထူး",
+        r"\bfumigator\b": "ပိုးသတ်မီးခိုး",
+        r"\bmessage\b": "အချက်ပြစာ",
+        r"\bOh\b": "",
         r"\bCTA\b": "",
     }
     out = text
@@ -933,7 +936,7 @@ def script_quality(source_text: str, script: str, source: str = "") -> Dict[str,
         min_ratio = float(os.getenv("REWRITE_SHORT_MIN_RATIO", "0.18"))
         max_ratio = float(os.getenv("REWRITE_SHORT_MAX_RATIO", "1.45"))
     else:
-        min_ratio = float(os.getenv("REWRITE_MIN_RATIO_CONCISE", "0.12"))
+        min_ratio = float(os.getenv("REWRITE_MIN_RATIO_CONCISE", "0.18"))
         max_ratio = float(os.getenv("REWRITE_MAX_RATIO_CONCISE", "0.55"))
     if ratio > max_ratio or ratio < min_ratio:
         tts_safe = False
@@ -2822,7 +2825,7 @@ def rewrite_route():
 
 
 
-def build_v18_fast_full_story_source(text: str, max_chars: int = 7200) -> str:
+def build_v18_fast_full_story_source(text: str, max_chars: int = 9000) -> str:
     cleaned = clean_srt_to_text(text)
     cleaned = re.sub(r"(?i)\b(subscribe|notification|thanks for watching|like and share|channel)\b", "", cleaned)
     cleaned = re.sub(r"(?i)\berror\s*500|server error|that['’]s an error|please try again later", "", cleaned)
@@ -2836,6 +2839,61 @@ def build_v18_fast_full_story_source(text: str, max_chars: int = 7200) -> str:
     end = cleaned[max(0, n - each):]
     return ("BEGINNING:\n" + start.strip() + "\n\nMIDDLE:\n" + middle.strip() + "\n\nENDING:\n" + end.strip())[:max_chars]
 
+
+
+def expand_final_narrative_with_iamhc(source_text: str, draft: str, style: str, rewrite_mode: str, min_chars: int, target_chars: int, max_chars: int, models: List[str]) -> Tuple[Optional[str], Dict[str, object]]:
+    """V19.2 second-pass expansion for drafts that are AI-written but too short for final-safe narration.
+    This keeps the same backend endpoint while forcing the model to expand with beginning/middle/ending coverage.
+    """
+    is_emotional = "emotion" in (style or "").lower() or "story" in (style or "").lower()
+    style_name = "Emotional Storytelling" if is_emotional else "Movie Recap / Documentary"
+    style_rule = (
+        "cinematic, emotional, suspenseful but not exaggerated Myanmar storytelling narration"
+        if is_emotional else
+        "clear, stable, professional documentary/movie recap Myanmar narration"
+    )
+    system_prompt = (
+        "You are a senior Myanmar movie recap editor. Return ONLY final Myanmar narration. "
+        "No English explanation. No notes. No markdown. No bullet points. "
+        "Use only Burmese/Myanmar script except unavoidable globally-known titles. "
+        "Use natural Myanmar punctuation '။' and TTS-friendly paragraph rhythm. "
+        "Transliterate character names into Myanmar script. Remove CTA, subscribe, music markers, and service text."
+    )
+    user_prompt = (
+        f"The draft below is too short for final voice-over. Expand and repair it into {style_name}.\n"
+        f"Style rule: {style_rule}.\n"
+        f"Strict length: minimum {min_chars} Myanmar characters, target {target_chars}, maximum {max_chars}.\n"
+        "Do not make a short summary. Do not output cleaned subtitles. Write polished narrative prose.\n"
+        "Mandatory coverage: beginning/setup, family infiltration, secret basement/hidden person, disaster/rain consequence if present, climax, ending/resolution.\n"
+        "If the source is a movie recap, include the emotional setup before the climax and the final resolution.\n"
+        "Translate or transliterate Roman names such as Moon-Gwang, Geun-Sae, Park, Kim, Ki-Woo. Do not leave fumigator/message/Oh in English.\n"
+        "Structure 5 to 8 short paragraphs. Myanmar narration only.\n\n"
+        f"SOURCE ZONES:\n{source_text[:9000]}\n\n"
+        f"TOO-SHORT DRAFT TO REPAIR:\n{draft[:5000]}"
+    )
+    attempts: List[Dict[str, object]] = []
+    for model in models:
+        out, meta = iamhc_chat(model, system_prompt, user_prompt, max_tokens=int(os.getenv("FAST_REWRITE_EXPAND_MAX_TOKENS", "7500")))
+        meta = dict(meta or {})
+        meta["expand_model"] = model
+        attempts.append(meta)
+        if not out or bad_llm_output(out):
+            continue
+        candidate = post_process_final_narration(out.strip())
+        candidate = re.sub(r"(?im)^\s*(here is|note:|possible translation|we need|let['’]s).*?$", "", candidate).strip()
+        if contains_bad_text(candidate):
+            continue
+        if latin_ratio(candidate) > float(os.getenv("FAST_REWRITE_MAX_LATIN_RATIO", "0.08")):
+            continue
+        # The expansion pass exists specifically because the first draft was too short.
+        if len(candidate) < min_chars:
+            continue
+        if len(candidate) > max_chars:
+            # Prefer over-long complete narration to too-short incomplete output, but cap very excessive answers.
+            if len(candidate) > int(max_chars * 1.35):
+                continue
+        return candidate, {"ok": True, "attempts": attempts, "expanded": True, "model": model}
+    return None, {"ok": False, "error": "expansion_failed", "attempts": attempts}
 
 def fast_narrative_rewrite_with_iamhc(source_text: str, style: str, rewrite_mode: str, target_chars: int) -> Tuple[Optional[str], Dict[str, object]]:
     models: List[str] = []
@@ -2860,12 +2918,13 @@ def fast_narrative_rewrite_with_iamhc(source_text: str, style: str, rewrite_mode
         mode_rule = "Cover the complete story: beginning, setup, middle conflict, climax, and ending. Do not only rewrite the beginning."
     # Long movie recap/storytelling needs enough length for beginning, middle and ending coverage.
     source_len_for_target = len(source_text or "")
-    if source_len_for_target >= 5000:
-        target_chars = max(3800, min(int(target_chars or 4800), int(os.getenv("FAST_REWRITE_MAX_TARGET_CHARS", "6500"))))
+    has_story_zones = any(label in (source_text or "") for label in ["BEGINNING:", "MIDDLE:", "ENDING:"])
+    if source_len_for_target >= 5000 or has_story_zones:
+        target_chars = max(4800, min(int(target_chars or 5600), int(os.getenv("FAST_REWRITE_MAX_TARGET_CHARS", "8000"))))
     else:
-        target_chars = max(1600, min(int(target_chars or 3200), int(os.getenv("FAST_REWRITE_MAX_TARGET_CHARS", "6500"))))
-    min_chars = max(1300 if source_len_for_target < 5000 else 3200, int(target_chars * 0.78))
-    max_chars = max(target_chars + 500, int(target_chars * 1.35))
+        target_chars = max(2200, min(int(target_chars or 3400), int(os.getenv("FAST_REWRITE_MAX_TARGET_CHARS", "8000"))))
+    min_chars = max(1800 if source_len_for_target < 3000 and not has_story_zones else 3200, int(target_chars * 0.72))
+    max_chars = max(target_chars + 700, int(target_chars * 1.35))
     system_prompt = (
         "You are a senior Myanmar movie recap and voice-over script writer. "
         "Return ONLY the final Myanmar narration in Burmese/Myanmar script. No English explanation. No notes. No markdown. "
@@ -2897,9 +2956,18 @@ def fast_narrative_rewrite_with_iamhc(source_text: str, style: str, rewrite_mode
         candidate = post_process_final_narration(out.strip())
         # Remove obvious leakage lines.
         candidate = re.sub(r"(?im)^\s*(here is|note:|possible translation|we need|let['’]s).*?$", "", candidate).strip()
-        if len(candidate) < min_chars or len(candidate) > max_chars:
-            # Do not fail too hard for max length; fail only if very short.
-            if len(candidate) < min_chars:
+        if len(candidate) < min_chars:
+            expanded, expand_meta = expand_final_narrative_with_iamhc(
+                source_text, candidate, style, rewrite_mode, min_chars, target_chars, max_chars, models
+            )
+            meta["expansion_attempt"] = expand_meta
+            if expanded:
+                candidate = expanded
+            else:
+                continue
+        elif len(candidate) > max_chars:
+            # Do not fail too hard for max length; prefer complete narration unless extremely excessive.
+            if len(candidate) > int(max_chars * 1.35):
                 continue
         if contains_bad_text(candidate):
             continue
@@ -2922,7 +2990,8 @@ def make_fast_narrative_option(source_text: str, style: str, rewrite_mode: str, 
     q = script_quality(source_text, script, source=source)
     # Fast repair is specifically used to unblock long-source final narration.
     # It is AI-safe only when it is not fallback and basic bad-text/Latin checks pass.
-    min_fast_safe_chars = int(os.getenv("FAST_REWRITE_MIN_SAFE_CHARS", "3000" if len(source_text or "") >= 5000 else "1200"))
+    has_story_zones = any(label in (source_text or "") for label in ["BEGINNING:", "MIDDLE:", "ENDING:"])
+    min_fast_safe_chars = int(os.getenv("FAST_REWRITE_MIN_SAFE_CHARS", "3200" if len(source_text or "") >= 3000 or has_story_zones else "1500"))
     safe = bool(quality == "ai_rewrite" and not contains_bad_text(script) and latin_ratio(script) <= float(os.getenv("FAST_REWRITE_MAX_LATIN_RATIO", "0.08")) and len(script) >= min_fast_safe_chars)
     filename = f"{option_id}_{now_stamp()}_{uid()}.txt"
     write_text_file(SCRIPT_DIR / filename, script)
@@ -2957,12 +3026,12 @@ def rewrite_options_route():
     style = str(data.get("style") or "").lower()
     fast_requested = any(x in rewrite_mode for x in ["fast", "repair", "emergency", "full_story", "full-story", "narrative"]) or bool(data.get("fast_rewrite"))
     if fast_requested:
-        compact_source = build_v18_fast_full_story_source(cleaned, int(os.getenv("FAST_REWRITE_SOURCE_CHARS", "7600")))
+        compact_source = build_v18_fast_full_story_source(cleaned, int(os.getenv("FAST_REWRITE_SOURCE_CHARS", "9000")))
         explicit_target = data.get("target_chars") or data.get("target_characters") or data.get("desired_chars")
         try:
-            target_chars = int(explicit_target) if explicit_target else int(max(4200 if len(compact_source) >= 5000 else 1800, min(6200, len(compact_source) * float(data.get("target_length_ratio") or 0.82))))
+            target_chars = int(explicit_target) if explicit_target else int(max(5200 if len(compact_source) >= 3000 else 2400, min(7800, len(compact_source) * float(data.get("target_length_ratio") or 1.05))))
         except Exception:
-            target_chars = int(max(4200 if len(compact_source) >= 5000 else 1800, min(6200, len(compact_source) * 0.82)))
+            target_chars = int(max(5200 if len(compact_source) >= 3000 else 2400, min(7800, len(compact_source) * 1.05)))
         option_title = "Emotional Storytelling" if ("emotion" in style or "story" in style) else "Movie Recap / Documentary"
         option_id = "emotional_storytelling" if ("emotion" in style or "story" in style) else "movie_recap_documentary"
         fast_option = make_fast_narrative_option(compact_source, style, rewrite_mode or "fast_narrative_repair", option_title, option_id, target_chars)
