@@ -21,7 +21,7 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
-APP_VERSION = "v18.9-youtube-cookies-b64-ytdlp-cli-fallback"
+APP_VERSION = "v19-final-safe-narrative-rewrite"
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -825,6 +825,75 @@ def important_tokens(text: str, max_tokens: int = 28) -> List[str]:
     return [k for k, _ in sorted(freq.items(), key=lambda x: (-x[1], x[0]))[:max_tokens]]
 
 
+
+
+def transliterate_common_story_names(text: str) -> str:
+    """Reduce Roman-letter tokens in final Myanmar narration by transliterating common movie recap names.
+    This is intentionally conservative and runs only on generated scripts, not source SRT.
+    """
+    if not text:
+        return ""
+    replacements = {
+        r"\bMoon[-\s]?Gwang\b": "မွန်ဂွမ်",
+        r"\bGeun[-\s]?Sae\b": "ဂွန်းဆဲ",
+        r"\bOh[-\s]?Geun[-\s]?Sae\b": "အိုဂွန်းဆဲ",
+        r"\bKi[-\s]?Woo\b": "ကီဝူး",
+        r"\bKi[-\s]?Taek\b": "ကီထက်",
+        r"\bKi[-\s]?Jung\b": "ကီဂျောင်",
+        r"\bChung[-\s]?Sook\b": "ချုံဆွတ်",
+        r"\bDa[-\s]?Hye\b": "ဒါဟေး",
+        r"\bDa[-\s]?Song\b": "ဒါဆောင်",
+        r"\bMin[-\s]?Hyuk\b": "မင်ဟျော့",
+        r"\bYon[-\s]?Kyo\b": "ယွန်ကျို",
+        r"\bYeon[-\s]?Kyo\b": "ယွန်ကျို",
+        r"\bDong[-\s]?Ik\b": "ဒုံအစ်",
+        r"\bMr\.\s*Park\b": "မစ္စတာ ပါ့ခ်",
+        r"\bMrs\.\s*Park\b": "မစ္စစ် ပါ့ခ်",
+        r"\bPark\b": "ပါ့ခ်",
+        r"\bParks\b": "ပါ့ခ်မိသားစု",
+        r"\bKim\b": "ကင်",
+        r"\bKims\b": "ကင်မိသားစု",
+        r"\bJessica\b": "ဂျက်စီကာ",
+        r"\bKevin\b": "ကဲဗင်",
+        r"\bMorse\b": "မို့စ်",
+        r"\bWi[-\s]?Fi\b": "ဝိုင်ဖိုင်",
+        r"\bwifi\b": "ဝိုင်ဖိုင်",
+        r"\bWiFi\b": "ဝိုင်ဖိုင်",
+        r"\bYouTube\b": "ယူထူး",
+        r"\bCTA\b": "",
+    }
+    out = text
+    for pat, repl in replacements.items():
+        out = re.sub(pat, repl, out, flags=re.IGNORECASE)
+    # Remove common Roman-only labels that sometimes leak into prompts.
+    out = re.sub(r"(?im)^\s*(BEGINNING|MIDDLE|ENDING|SOURCE|DRAFT|FINAL|NARRATION)\s*:?\s*$", "", out)
+    return out
+
+
+def post_process_final_narration(text: str) -> str:
+    """Final script cleanup before returning to frontend/TTS."""
+    cleaned = sanitize_bad_service_text(text or "")
+    cleaned = transliterate_common_story_names(cleaned)
+    cleaned = re.sub(r"(?i)\b(subscribe|notification|thanks for watching|like and share|channel)\b.*", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*(here is|note:|possible translation|we need|let['’]s|in burmese|in myanmar).*?$", "", cleaned)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    cleaned = ensure_myanmar_punctuation(cleaned)
+    # Make very long one-paragraph output easier for TTS and frontend readability.
+    if len(cleaned) > 1800 and cleaned.count("\n") < 2:
+        sentences = [x.strip() for x in re.split(r"(?<=။)\s+", cleaned) if x.strip()]
+        paras = []
+        cur = []
+        for sent in sentences:
+            cur.append(sent)
+            if len(" ".join(cur)) >= 650:
+                paras.append(" ".join(cur))
+                cur = []
+        if cur:
+            paras.append(" ".join(cur))
+        cleaned = "\n\n".join(paras)
+    return cleaned.strip()
+
 def coverage_score(source: str, script: str) -> Dict[str, object]:
     source = source or ""
     script_lower = (script or "").lower()
@@ -1363,6 +1432,7 @@ def make_rewrite_option(text: str, option_id: str, title: str, target_ratio: flo
         script = distributed_fallback_summary(text, target_ratio)
         source = "LOCAL_SANITIZED_SUMMARY_FALLBACK"
         quality = "local_sanitized_summary_fallback"
+    script = post_process_final_narration(script)
     q = script_quality(text, script, source=source)
     repaired_meta = None
     if quality == "ai_rewrite" and q.get("needs_retry") and env_bool("USE_IAMHC_REWRITE_REPAIR", normalize_quality_mode(quality_mode) == "premium"):
@@ -1370,7 +1440,7 @@ def make_rewrite_option(text: str, option_id: str, title: str, target_ratio: flo
         if repaired:
             repaired_q = script_quality(text, repaired, source="iamhc_repair")
             if not repaired_q.get("needs_retry") or (len(text) < 800 and len(repaired) < len(script)):
-                script = repaired
+                script = post_process_final_narration(repaired)
                 source = "iamhc_qwen_ai_repaired"
                 q = repaired_q
                 meta = {**(meta or {}), "repair": repaired_meta}
@@ -2788,23 +2858,31 @@ def fast_narrative_rewrite_with_iamhc(source_text: str, style: str, rewrite_mode
         mode_rule = "This is a short source. Do NOT summarize aggressively. Preserve full meaning and rewrite as natural narration."
     else:
         mode_rule = "Cover the complete story: beginning, setup, middle conflict, climax, and ending. Do not only rewrite the beginning."
-    target_chars = max(1200, min(int(target_chars or 3600), int(os.getenv("FAST_REWRITE_MAX_TARGET_CHARS", "6500"))))
-    min_chars = max(900, int(target_chars * 0.72))
-    max_chars = max(target_chars + 400, int(target_chars * 1.28))
+    # Long movie recap/storytelling needs enough length for beginning, middle and ending coverage.
+    source_len_for_target = len(source_text or "")
+    if source_len_for_target >= 5000:
+        target_chars = max(3800, min(int(target_chars or 4800), int(os.getenv("FAST_REWRITE_MAX_TARGET_CHARS", "6500"))))
+    else:
+        target_chars = max(1600, min(int(target_chars or 3200), int(os.getenv("FAST_REWRITE_MAX_TARGET_CHARS", "6500"))))
+    min_chars = max(1300 if source_len_for_target < 5000 else 3200, int(target_chars * 0.78))
+    max_chars = max(target_chars + 500, int(target_chars * 1.35))
     system_prompt = (
         "You are a senior Myanmar movie recap and voice-over script writer. "
-        "Return ONLY the final Myanmar narration. No English explanation. No notes. No markdown. "
+        "Return ONLY the final Myanmar narration in Burmese/Myanmar script. No English explanation. No notes. No markdown. "
         "Do not include SRT timestamps, numbering, labels, or instructions. "
         "Use natural Myanmar punctuation '။' and short TTS-friendly sentences. "
-        "Remove CTA phrases, subscribe messages, music markers, and service error text."
+        "Remove CTA phrases, subscribe messages, music markers, and service error text. "
+        "Do not output Roman letters except unavoidable globally-known titles. Transliterate character names into Myanmar script."
     )
     user_prompt = (
         f"Rewrite the source into {style_name}.\n"
         f"Style: {style_rule}.\n"
         f"Mode: {rewrite_mode or 'fast_narrative_repair'}. {mode_rule}\n"
         f"Length: about {target_chars} Myanmar characters. Minimum {min_chars}, maximum {max_chars}.\n"
-        "Must include the ending/resolution from the ENDING section.\n"
-        "Myanmar narration only. Convert English/common words into natural Myanmar when possible; keep only necessary proper names.\n"
+        "Structure the script into 4 to 6 natural paragraphs: hook, setup, conflict, twist/climax, ending.\n"
+        "Must cover BEGINNING, MIDDLE, and ENDING. The ending/resolution from the ENDING section is mandatory.\n"
+        "Myanmar narration only. Translate or transliterate character names into Myanmar script. Do not leave Roman-letter names such as Moon-Gwang, Park, Kim, Geun-Sae, Ki-Woo.\n"
+        "Do not copy subtitle lines. Rewrite as complete human narration with smooth transitions.\n"
         "Every paragraph should sound like a human narrator, not translated subtitles.\n\n"
         f"SOURCE:\n{source_text[:7600]}"
     )
@@ -2816,7 +2894,7 @@ def fast_narrative_rewrite_with_iamhc(source_text: str, style: str, rewrite_mode
         attempts.append(meta)
         if not out or bad_llm_output(out):
             continue
-        candidate = ensure_myanmar_punctuation(sanitize_bad_service_text(out.strip()))
+        candidate = post_process_final_narration(out.strip())
         # Remove obvious leakage lines.
         candidate = re.sub(r"(?im)^\s*(here is|note:|possible translation|we need|let['’]s).*?$", "", candidate).strip()
         if len(candidate) < min_chars or len(candidate) > max_chars:
@@ -2826,7 +2904,7 @@ def fast_narrative_rewrite_with_iamhc(source_text: str, style: str, rewrite_mode
         if contains_bad_text(candidate):
             continue
         # Names can remain, but block mostly-English outputs.
-        if latin_ratio(candidate) > float(os.getenv("FAST_REWRITE_MAX_LATIN_RATIO", "0.20")):
+        if latin_ratio(candidate) > float(os.getenv("FAST_REWRITE_MAX_LATIN_RATIO", "0.08")):
             continue
         return candidate, {"ok": True, "model": model, "attempts": attempts, "target_chars": target_chars, "style": style_name}
     return None, {"ok": False, "error": "fast_narrative_rewrite_failed", "attempts": attempts, "target_chars": target_chars, "style": style_name}
@@ -2840,10 +2918,12 @@ def make_fast_narrative_option(source_text: str, style: str, rewrite_mode: str, 
         script = distributed_fallback_summary(source_text, 0.65)
         source = "LOCAL_FAST_NARRATIVE_PREVIEW_FALLBACK"
         quality = "local_preview_only"
+    script = post_process_final_narration(script)
     q = script_quality(source_text, script, source=source)
     # Fast repair is specifically used to unblock long-source final narration.
     # It is AI-safe only when it is not fallback and basic bad-text/Latin checks pass.
-    safe = bool(quality == "ai_rewrite" and not contains_bad_text(script) and latin_ratio(script) <= float(os.getenv("FAST_REWRITE_MAX_LATIN_RATIO", "0.20")) and len(script) >= 900)
+    min_fast_safe_chars = int(os.getenv("FAST_REWRITE_MIN_SAFE_CHARS", "3000" if len(source_text or "") >= 5000 else "1200"))
+    safe = bool(quality == "ai_rewrite" and not contains_bad_text(script) and latin_ratio(script) <= float(os.getenv("FAST_REWRITE_MAX_LATIN_RATIO", "0.08")) and len(script) >= min_fast_safe_chars)
     filename = f"{option_id}_{now_stamp()}_{uid()}.txt"
     write_text_file(SCRIPT_DIR / filename, script)
     return {
@@ -2877,12 +2957,12 @@ def rewrite_options_route():
     style = str(data.get("style") or "").lower()
     fast_requested = any(x in rewrite_mode for x in ["fast", "repair", "emergency", "full_story", "full-story", "narrative"]) or bool(data.get("fast_rewrite"))
     if fast_requested:
-        compact_source = build_v18_fast_full_story_source(cleaned, int(os.getenv("FAST_REWRITE_SOURCE_CHARS", "7200")))
+        compact_source = build_v18_fast_full_story_source(cleaned, int(os.getenv("FAST_REWRITE_SOURCE_CHARS", "7600")))
         explicit_target = data.get("target_chars") or data.get("target_characters") or data.get("desired_chars")
         try:
-            target_chars = int(explicit_target) if explicit_target else int(max(1800, min(6200, len(compact_source) * float(data.get("target_length_ratio") or 0.82))))
+            target_chars = int(explicit_target) if explicit_target else int(max(4200 if len(compact_source) >= 5000 else 1800, min(6200, len(compact_source) * float(data.get("target_length_ratio") or 0.82))))
         except Exception:
-            target_chars = int(max(1800, min(6200, len(compact_source) * 0.82)))
+            target_chars = int(max(4200 if len(compact_source) >= 5000 else 1800, min(6200, len(compact_source) * 0.82)))
         option_title = "Emotional Storytelling" if ("emotion" in style or "story" in style) else "Movie Recap / Documentary"
         option_id = "emotional_storytelling" if ("emotion" in style or "story" in style) else "movie_recap_documentary"
         fast_option = make_fast_narrative_option(compact_source, style, rewrite_mode or "fast_narrative_repair", option_title, option_id, target_chars)
