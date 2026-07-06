@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import html
 import json
 import math
 import os
@@ -8,17 +9,19 @@ import shutil
 import subprocess
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import requests
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
-APP_VERSION = "v17.3.1-download-route-fix"
+APP_VERSION = "v17.4-v14-caption-restore-fast-rewrite"
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -932,6 +935,25 @@ def bad_llm_output(text: str) -> bool:
     return False
 
 
+
+def build_story_skeleton_for_ai(text: str, max_chars: int = 9000) -> str:
+    """Build a beginning/middle/end source brief to avoid 20+ sequential LLM calls on long SRT."""
+    cleaned = clean_srt_to_text(text)
+    if len(cleaned) <= max_chars:
+        return cleaned
+    n = len(cleaned)
+    part = max(1200, max_chars // 3)
+    start = cleaned[:part]
+    mid_start = max(0, n // 2 - part // 2)
+    middle = cleaned[mid_start: mid_start + part]
+    end = cleaned[max(0, n - part):]
+    return (
+        "ဇာတ်လမ်းအစပိုင်း:\n" + start.strip() +
+        "\n\nဇာတ်လမ်းအလယ်ပိုင်း:\n" + middle.strip() +
+        "\n\nဇာတ်လမ်းအဆုံးပိုင်း:\n" + end.strip()
+    )
+
+
 def rewrite_with_iamhc(text: str, option: str, target_ratio: float, quality_mode: str = "basic") -> Tuple[Optional[str], Dict[str, object]]:
     if not env_bool("USE_IAMHC_REWRITE", True):
         return None, {"ok": False, "error": "USE_IAMHC_REWRITE disabled"}
@@ -961,8 +983,13 @@ def rewrite_with_iamhc(text: str, option: str, target_ratio: float, quality_mode
         if name and name not in models:
             models.append(name)
 
-    max_chunk_chars = int(os.getenv("OPENROUTER_REWRITE_CHUNK_CHARS", os.getenv("IAMHC_REWRITE_CHUNK_CHARS", "2200")))
-    chunks = split_text_chunks(text, max_chunk_chars)
+    max_chunk_chars = int(os.getenv("OPENROUTER_REWRITE_CHUNK_CHARS", os.getenv("IAMHC_REWRITE_CHUNK_CHARS", "4500")))
+    fast_story_threshold = int(os.getenv("REWRITE_FAST_STORY_THRESHOLD", "14000"))
+    use_fast_story = env_bool("REWRITE_USE_FAST_STORY_SKELETON", True) and len(text or "") >= fast_story_threshold
+    if use_fast_story:
+        chunks = [build_story_skeleton_for_ai(text, int(os.getenv("REWRITE_FAST_STORY_SOURCE_CHARS", "9000")))]
+    else:
+        chunks = split_text_chunks(text, max_chunk_chars)
     if not chunks:
         return None, {"ok": False, "error": "empty_text"}
 
@@ -989,7 +1016,7 @@ def rewrite_with_iamhc(text: str, option: str, target_ratio: float, quality_mode
         model_failed = False
         for idx, chunk in enumerate(chunks, start=1):
             user_prompt = (
-                f"အောက်ကစာက video subtitle/translation ထဲက အပိုင်း {idx}/{len(chunks)} ဖြစ်ပါတယ်။\n"
+                (f"အောက်ကစာက video subtitle/translation ထဲက ဇာတ်လမ်းအစ-အလယ်-အဆုံး source brief ဖြစ်ပါတယ်။\n" if use_fast_story else f"အောက်ကစာက video subtitle/translation ထဲက အပိုင်း {idx}/{len(chunks)} ဖြစ်ပါတယ်။\n") +
                 f"ဒီအပိုင်းကို {style_desc} အဖြစ် မြန်မာစကားပြေ voice-over narration ပြန်ရေးပါ။\n"
                 f"အရေးကြီး: မူရင်းအပိုင်းထက် မရှည်စေရ။ ဒီအပိုင်းကို အကြမ်းဖျင်း {max(180, int(len(chunk) * max(0.18, min(target_ratio, 0.45))))} စာလုံးခန့်ဖြစ်အောင် ကျစ်လစ်ပါ။\n"
                 "မြန်မာစာတစ်ခုတည်းသာပြန်ပါ။ English explanation မထည့်ပါနဲ့။\n"
@@ -1170,6 +1197,419 @@ def make_rewrite_option(text: str, option_id: str, title: str, target_ratio: flo
     }
 
 
+
+# -----------------------------
+# V17.4 restored V14 public-caption extraction helpers
+# -----------------------------
+
+def _v14_cookie_header_from_file() -> str:
+    """Best-effort Netscape cookies.txt -> Cookie header for direct caption/watch requests."""
+    cookie_path = youtube_cookiefile()
+    if not cookie_path:
+        return ""
+    try:
+        fp = Path(cookie_path)
+        if not fp.exists():
+            return ""
+        pairs = []
+        for line in fp.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if line.startswith("#HttpOnly_"):
+                line = line.replace("#HttpOnly_", "", 1)
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                name, value = parts[-2], parts[-1]
+                if name and value:
+                    pairs.append(f"{name}={value}")
+        return "; ".join(pairs[:80])
+    except Exception:
+        return ""
+
+
+def _v14_youtube_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    headers = {
+        "User-Agent": os.getenv(
+            "YOUTUBE_CAPTION_USER_AGENT",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        ),
+        "Accept-Language": os.getenv("YOUTUBE_ACCEPT_LANGUAGE", "en-US,en;q=0.9,my;q=0.8"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": "https://www.youtube.com/",
+        "Origin": "https://www.youtube.com",
+        "Cookie": os.getenv("YOUTUBE_CAPTION_COOKIE_HEADER", "CONSENT=YES+cb"),
+    }
+    file_cookie = _v14_cookie_header_from_file()
+    if file_cookie:
+        headers["Cookie"] = (headers.get("Cookie") + "; " + file_cookie).strip("; ")
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _v14_normalize_youtube_url(url: str) -> str:
+    vid = extract_youtube_video_id(url)
+    return f"https://www.youtube.com/watch?v={vid}" if vid else url
+
+
+def _v14_caption_lang_candidates(requested_language: Optional[str] = None) -> List[str]:
+    requested = (requested_language or "auto").strip()
+    base = []
+    if requested and requested.lower() not in {"auto", "best", "default"}:
+        base.append(requested)
+        if requested == "my":
+            base.extend(["my-MM", "my.*"])
+        if requested.startswith("en"):
+            base.extend(["en", "en-US", "en-GB", "en.*"])
+    base.extend(["en", "en-US", "en-GB", "en.*", "my", "my-MM", "my.*"])
+    out = []
+    for x in base:
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def _v14_key_matches(key: str, cand: str) -> bool:
+    key = (key or "").lower()
+    cand = (cand or "").lower()
+    if not key or not cand:
+        return False
+    if cand.endswith(".*"):
+        return key.startswith(cand[:-2])
+    return key == cand or key.startswith(cand + "-")
+
+
+def _v14_pick_track(tracks: List[Dict[str, object]], requested_language: Optional[str] = None) -> Optional[Tuple[str, Dict[str, object]]]:
+    if not tracks:
+        return None
+    candidates = _v14_caption_lang_candidates(requested_language)
+    manual = [t for t in tracks if (t.get("kind") or "") != "asr"]
+    auto = [t for t in tracks if (t.get("kind") or "") == "asr"]
+    for pool_name, pool in [("manual", manual), ("auto", auto), ("any", tracks)]:
+        for cand in candidates:
+            for t in pool:
+                lang = str(t.get("languageCode") or t.get("lang") or "")
+                if _v14_key_matches(lang, cand):
+                    return (f"youtube_{pool_name}_caption", t)
+    return ("youtube_caption", tracks[0])
+
+
+def _v14_set_query_param(url: str, **params) -> str:
+    parsed = urlparse(url)
+    q = dict(parse_qs(parsed.query, keep_blank_values=True))
+    for k, v in params.items():
+        q[k] = [str(v)]
+    return urlunparse(parsed._replace(query=urlencode(q, doseq=True)))
+
+
+def _v14_clean_caption_line(line: str) -> str:
+    line = re.sub(r"<[^>]+>", "", line or "")
+    line = html.unescape(line)
+    return re.sub(r"\s+", " ", line).strip()
+
+
+def _v14_srt_ts(seconds: float) -> str:
+    return seconds_to_srt_time(float(seconds or 0.0))
+
+
+def _v14_vtt_time_to_seconds(ts: str) -> float:
+    ts = (ts or "").strip().replace(",", ".")
+    parts = ts.split(":")
+    try:
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s)
+        if len(parts) == 2:
+            m, s = parts
+            return int(m) * 60 + float(s)
+    except Exception:
+        return 0.0
+    return 0.0
+
+
+def _v14_vtt_to_srt(vtt_text: str) -> str:
+    text = (vtt_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"^\ufeff?WEBVTT[^\n]*\n+", "", text, flags=re.I).strip()
+    blocks = []
+    cur_time = ""
+    cur_lines = []
+    for line in text.splitlines() + [""]:
+        raw = line.strip()
+        if not raw:
+            if cur_time and cur_lines:
+                try:
+                    start_raw, end_raw = re.split(r"\s+-->\s+", cur_time, maxsplit=1)
+                    end_raw = end_raw.split()[0]
+                    start = _v14_srt_ts(_v14_vtt_time_to_seconds(start_raw))
+                    end = _v14_srt_ts(_v14_vtt_time_to_seconds(end_raw))
+                    body = " ".join(_v14_clean_caption_line(x) for x in cur_lines)
+                    body = re.sub(r"\s+", " ", body).strip()
+                    if body:
+                        blocks.append({"start": start, "end": end, "text": body})
+                except Exception:
+                    pass
+            cur_time = ""
+            cur_lines = []
+            continue
+        if "-->" in raw:
+            cur_time = raw.replace(".", ",")
+            cur_lines = []
+            continue
+        if raw.upper().startswith(("NOTE", "STYLE", "REGION")):
+            continue
+        if cur_time:
+            cur_lines.append(raw)
+    return compose_srt([{"index": str(i), **b} for i, b in enumerate(blocks, start=1)]) if blocks else ""
+
+
+def _v14_json3_to_srt(json_text: str) -> str:
+    try:
+        data = json.loads(json_text or "{}")
+    except Exception:
+        return ""
+    blocks = []
+    for ev in data.get("events") or []:
+        if "segs" not in ev:
+            continue
+        text = "".join(seg.get("utf8", "") for seg in ev.get("segs") or [])
+        text = _v14_clean_caption_line(text)
+        if not text:
+            continue
+        start = float(ev.get("tStartMs") or 0) / 1000.0
+        dur = float(ev.get("dDurationMs") or 2500) / 1000.0
+        blocks.append({"start": _v14_srt_ts(start), "end": _v14_srt_ts(start + max(0.5, dur)), "text": text})
+    return compose_srt([{"index": str(i), **b} for i, b in enumerate(blocks, start=1)]) if blocks else ""
+
+
+def _v14_xml_caption_to_srt(xml_text: str) -> str:
+    try:
+        root = ET.fromstring(xml_text or "")
+    except Exception:
+        return ""
+    blocks = []
+    for node in list(root.iter()):
+        tag = node.tag.split("}")[-1].lower()
+        text = "".join(node.itertext()).strip()
+        if tag in {"text", "p"} and text:
+            start_raw = node.attrib.get("start") or node.attrib.get("begin") or "0"
+            dur_raw = node.attrib.get("dur") or node.attrib.get("duration") or "2.5"
+            try:
+                start = _v14_vtt_time_to_seconds(start_raw) if ":" in str(start_raw) else float(str(start_raw).rstrip("s"))
+            except Exception:
+                start = 0.0
+            try:
+                if ":" in str(dur_raw):
+                    end = _v14_vtt_time_to_seconds(str(dur_raw))
+                    if end <= start:
+                        end = start + 2.5
+                else:
+                    end = start + float(str(dur_raw).rstrip("s"))
+            except Exception:
+                end = start + 2.5
+            body = _v14_clean_caption_line(text)
+            if body:
+                blocks.append({"start": _v14_srt_ts(start), "end": _v14_srt_ts(end), "text": body})
+    return compose_srt([{"index": str(i), **b} for i, b in enumerate(blocks, start=1)]) if blocks else ""
+
+
+def _v14_normalize_caption_to_srt(caption_text: str, fmt: Optional[str] = None) -> str:
+    raw = caption_text or ""
+    fmt = (fmt or "").lower()
+    if not raw.strip():
+        return ""
+    if fmt == "json3" or raw.lstrip().startswith("{"):
+        out = _v14_json3_to_srt(raw)
+    elif fmt in {"srv3", "ttml", "xml"} or raw.lstrip().startswith("<"):
+        out = _v14_xml_caption_to_srt(raw)
+    else:
+        out = _v14_vtt_to_srt(raw)
+    if out.strip():
+        return out
+    blocks = parse_srt_blocks(raw)
+    return compose_srt(blocks) if blocks else ""
+
+
+def _v14_extract_json_after_marker(text: str, marker: str) -> Optional[dict]:
+    idx = (text or "").find(marker)
+    if idx < 0:
+        return None
+    start = (text or "").find("{", idx)
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except Exception:
+                    return None
+    return None
+
+
+def _v14_caption_tracks_from_player_response(player: dict) -> List[Dict[str, object]]:
+    return (((player.get("captions") or {}).get("playerCaptionsTracklistRenderer") or {}).get("captionTracks") or []) if isinstance(player, dict) else []
+
+
+def _v14_fetch_track(base_url: str) -> Tuple[Optional[str], Optional[str], List[str]]:
+    errors = []
+    for fmt in ["vtt", "json3", "srv3", "ttml"]:
+        try:
+            caption_url = _v14_set_query_param(base_url, fmt=fmt)
+            resp = requests.get(caption_url, headers=_v14_youtube_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+            if resp.status_code >= 400 or not resp.text.strip():
+                errors.append(f"{fmt}: http {resp.status_code}")
+                continue
+            srt = _v14_normalize_caption_to_srt(resp.text, fmt)
+            if srt.strip():
+                return srt, fmt, errors
+            errors.append(f"{fmt}: empty_after_convert")
+        except Exception as exc:
+            errors.append(f"{fmt}: {str(exc)[:160]}")
+    return None, None, errors
+
+
+def _v14_watch_page_caption_srt(url: str, requested_language: Optional[str] = None) -> Optional[Tuple[str, Dict[str, object]]]:
+    video_id = extract_youtube_video_id(url)
+    if not video_id:
+        return None
+    watch_url = _v14_normalize_youtube_url(url)
+    errors = []
+    try:
+        resp = requests.get(watch_url, headers=_v14_youtube_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+        if resp.status_code >= 400:
+            return None
+        player = _v14_extract_json_after_marker(resp.text or "", "ytInitialPlayerResponse") or {}
+        tracks = _v14_caption_tracks_from_player_response(player)
+        if not tracks:
+            errors.append("watch_page_no_captionTracks")
+            return None
+        selected = _v14_pick_track(tracks, requested_language)
+        if not selected:
+            errors.append("watch_page_no_selected_track")
+            return None
+        source_name, track = selected
+        base_url = str(track.get("baseUrl") or "")
+        if not base_url:
+            return None
+        srt, used_fmt, fetch_errors = _v14_fetch_track(base_url)
+        if srt and srt.strip():
+            return srt, {
+                "source": "v14_watch_page_caption_tracks",
+                "subtitle_source": source_name if track.get("kind") != "asr" else "youtube_auto_caption",
+                "language": track.get("languageCode") or "",
+                "format": used_fmt,
+                "title": ((player.get("videoDetails") or {}).get("title") or "YouTube captions"),
+                "video_id": video_id,
+                "source_url": watch_url,
+                "manual_languages": sorted({t.get("languageCode") for t in tracks if t.get("languageCode") and t.get("kind") != "asr"}),
+                "auto_languages": sorted({t.get("languageCode") for t in tracks if t.get("languageCode") and t.get("kind") == "asr"}),
+                "caption_track_count": len(tracks),
+                "no_media_download": True,
+                "caption_first": True,
+                "restored_from": "v14",
+                "errors": (errors + fetch_errors)[-8:],
+            }
+    except Exception as exc:
+        errors.append(str(exc)[:160])
+    return None
+
+
+def _v14_direct_timedtext_srt(url: str, requested_language: Optional[str] = None) -> Optional[Tuple[str, Dict[str, object]]]:
+    video_id = extract_youtube_video_id(url)
+    if not video_id:
+        return None
+    tracks = []
+    errors = []
+    for host in ["www.youtube.com", "video.google.com"]:
+        list_url = f"https://{host}/timedtext?{urlencode({'type':'list','v':video_id})}"
+        try:
+            resp = requests.get(list_url, headers=_v14_youtube_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+            if resp.status_code >= 400:
+                errors.append(f"list_http_{resp.status_code}")
+                continue
+            root = ET.fromstring(resp.text or "")
+            for track in root.findall(".//track"):
+                lang = track.attrib.get("lang_code") or track.attrib.get("lang") or ""
+                if lang:
+                    tracks.append({"languageCode": lang, "lang": lang, "kind": track.attrib.get("kind") or "", "name": track.attrib.get("name") or ""})
+        except Exception as exc:
+            errors.append(str(exc)[:160])
+    if not tracks:
+        return None
+    selected = _v14_pick_track(tracks, requested_language)
+    if not selected:
+        return None
+    source_name, track = selected
+    for fmt in ["vtt", "srv3", "ttml"]:
+        try:
+            params = {"v": video_id, "lang": track.get("languageCode") or track.get("lang") or "en", "fmt": fmt}
+            if track.get("name"):
+                params["name"] = track.get("name")
+            caption_url = f"https://www.youtube.com/api/timedtext?{urlencode(params)}"
+            resp = requests.get(caption_url, headers=_v14_youtube_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+            if resp.status_code >= 400 or not resp.text.strip():
+                errors.append(f"{fmt}_http_{resp.status_code}")
+                continue
+            srt = _v14_normalize_caption_to_srt(resp.text, fmt)
+            if srt.strip():
+                return srt, {
+                    "source": "v14_direct_timedtext",
+                    "subtitle_source": source_name if track.get("kind") != "asr" else "youtube_auto_caption",
+                    "language": track.get("languageCode") or track.get("lang") or "",
+                    "format": fmt,
+                    "video_id": video_id,
+                    "manual_languages": sorted({t.get("languageCode") for t in tracks if t.get("kind") != "asr"}),
+                    "auto_languages": sorted({t.get("languageCode") for t in tracks if t.get("kind") == "asr"}),
+                    "caption_track_count": len(tracks),
+                    "no_media_download": True,
+                    "caption_first": True,
+                    "restored_from": "v14",
+                    "errors": errors[-8:],
+                }
+        except Exception as exc:
+            errors.append(str(exc)[:160])
+    return None
+
+
+def try_v14_public_caption_srt(url: str, language: str = "auto") -> Tuple[Optional[str], Dict[str, object]]:
+    """Restored V14-style public caption extraction before youtube-transcript-api/yt-dlp."""
+    attempts: Dict[str, object] = {}
+    for name, fn in [
+        ("v14_watch_page_caption_tracks", _v14_watch_page_caption_srt),
+        ("v14_direct_timedtext", _v14_direct_timedtext_srt),
+    ]:
+        try:
+            result = fn(url, requested_language=language)
+            attempts[name] = {"ok": bool(result)}
+            if result and result[0].strip():
+                srt, meta = result
+                meta = dict(meta or {})
+                meta["attempts"] = attempts
+                return srt, meta
+        except Exception as exc:
+            attempts[name] = {"ok": False, "error": str(exc)[:500]}
+    return None, {"caption_error": "v14_public_caption_methods_failed", "attempts": attempts, "restored_from": "v14"}
+
+
 # -----------------------------
 # SRT extraction / media processing
 # -----------------------------
@@ -1209,12 +1649,21 @@ def youtube_download_audio(url: str, out_dir: Path) -> Path:
 def try_caption_first_srt(url: str, language: str = "auto") -> Tuple[Optional[str], Dict[str, object]]:
     """Caption-first SRT extraction.
 
-    Order:
-    1) youtube-transcript-api, which can avoid yt-dlp bot-check metadata extraction.
+    V17.4 order:
+    0) Restored V14 public caption methods:
+       watch-page captionTracks and direct timedtext.
+       These never download media and often work when youtube-transcript-api/yt-dlp hits 429.
+    1) youtube-transcript-api.
     2) yt-dlp subtitle-only with cookiefile support.
-    This function never downloads audio/video.
     """
     attempts: Dict[str, object] = {}
+
+    v14_srt, v14_meta = try_v14_public_caption_srt(url, language=language)
+    attempts["v14_public_caption_restore"] = v14_meta
+    if v14_srt:
+        v14_meta = dict(v14_meta or {})
+        v14_meta["attempts"] = attempts
+        return v14_srt, v14_meta
 
     transcript_srt, transcript_meta = try_youtube_transcript_api_srt(url, language=language)
     attempts["youtube_transcript_api"] = transcript_meta
@@ -1257,24 +1706,29 @@ def try_caption_first_srt(url: str, language: str = "auto") -> Tuple[Optional[st
                 "cookie_configured": bool(youtube_cookiefile()),
                 "attempts": attempts,
             }
-        files = list(tdir.glob("*.srt")) + list(tdir.glob("*.vtt"))
-        files = sorted(files, key=lambda p: (0 if p.suffix.lower() == ".srt" else 1, p.name))
-        for fp in files:
-            try:
-                raw = fp.read_text(encoding="utf-8", errors="ignore")
-                srt = raw if fp.suffix.lower() == ".srt" else vtt_to_srt(raw)
-                if parse_srt_blocks(srt) or clean_srt_to_text(srt):
-                    return srt, {
-                        "caption_source": "yt_dlp_subtitles",
-                        "subtitle_file": fp.name,
-                        "video_id": info.get("id"),
-                        "title": info.get("title"),
-                        "cookie_configured": bool(youtube_cookiefile()),
-                        "attempts": attempts,
-                    }
-            except Exception:
-                continue
-    return None, {"caption_error": "No subtitle file returned", "cookie_configured": bool(youtube_cookiefile()), "attempts": attempts}
+
+        candidates = list(tdir.glob("subtitle_*.*"))
+        subtitle_files = [p for p in candidates if p.suffix.lower() in {".srt", ".vtt"} and p.exists()]
+        if subtitle_files:
+            subtitle_files.sort(key=lambda p: (0 if p.suffix.lower() == ".srt" else 1, -p.stat().st_size))
+            fp = subtitle_files[0]
+            raw = read_text_file(fp)
+            srt = raw if fp.suffix.lower() == ".srt" else vtt_to_srt(raw)
+            if srt.strip():
+                return srt, {
+                    "source": "yt_dlp_subtitle_only",
+                    "subtitle_source": "yt_dlp_captions",
+                    "filename": fp.name,
+                    "video_id": (info or {}).get("id"),
+                    "title": (info or {}).get("title"),
+                    "cookie_configured": bool(youtube_cookiefile()),
+                    "attempts": attempts,
+                }
+        return None, {
+            "caption_error": "No subtitle file returned",
+            "cookie_configured": bool(youtube_cookiefile()),
+            "attempts": attempts,
+        }
 
 def transcribe_audio_to_srt(audio_path: Path, language: str = "auto") -> Tuple[str, Dict[str, object]]:
     from faster_whisper import WhisperModel
