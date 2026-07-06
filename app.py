@@ -21,7 +21,7 @@ from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
-APP_VERSION = "v17.5-tiktok-short-url-resolve"
+APP_VERSION = "v18.8-caption-innertube-fast-narrative-repair"
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -1566,6 +1566,231 @@ def _v14_fetch_track(base_url: str) -> Tuple[Optional[str], Optional[str], List[
     return None, None, errors
 
 
+
+# V18.8: Restore the missing V14/V5 Downsub-style Innertube captionTracks path.
+# V17.5 had watch-page captionTracks + direct timedtext, but the tested YouTube
+# short link fell through to fallback quickly. V14's stronger path also queried
+# YouTube's public Innertube player API and could get caption baseUrl without
+# downloading media. This is caption-first and does not bypass protected videos.
+YOUTUBE_INNERTUBE_DEFAULT_API_KEY = os.getenv(
+    "YOUTUBE_INNERTUBE_API_KEY",
+    "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+)
+
+
+def _v18_extract_ytcfg_from_html(html_text: str) -> Dict[str, object]:
+    """Best-effort extraction of ytcfg.set({...}) from a YouTube page."""
+    try:
+        m = re.search(r"ytcfg\.set\s*\(\s*({[\s\S]+?})\s*\)\s*;", html_text or "")
+        if m:
+            return json.loads(m.group(1))
+    except Exception:
+        pass
+    return {}
+
+
+def _v18_fetch_youtube_bootstrap(url: str) -> Dict[str, object]:
+    video_id = extract_youtube_video_id(url)
+    watch_url = _v14_normalize_youtube_url(url)
+    urls = [
+        watch_url + "&hl=en&persist_hl=1&bpctr=9999999999&has_verified=1",
+        f"https://m.youtube.com/watch?v={video_id}&hl=en&persist_hl=1&bpctr=9999999999&has_verified=1" if video_id else watch_url,
+    ]
+    errors: List[object] = []
+    for u in urls:
+        try:
+            resp = requests.get(u, headers=_v14_youtube_headers(), timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")))
+            html = resp.text or ""
+            info = {
+                "watch_url": u,
+                "status_code": resp.status_code,
+                "html_chars": len(html),
+                "consent_page": "consent.youtube" in html.lower() or "before you continue" in html.lower(),
+                "signin_page": "sign in to confirm" in html.lower() or "not a bot" in html.lower(),
+            }
+            if resp.status_code >= 400 or not html.strip():
+                errors.append({**info, "error": f"watch page HTTP {resp.status_code}"})
+                continue
+            ytcfg = _v18_extract_ytcfg_from_html(html)
+            player = _v14_extract_json_after_marker(html, "ytInitialPlayerResponse") or {}
+            client_cfg = (((ytcfg.get("INNERTUBE_CONTEXT") or {}) if isinstance(ytcfg, dict) else {}).get("client") or {})
+            return {
+                "ok": True,
+                "video_id": video_id,
+                "normalized_url": watch_url,
+                "ytcfg": ytcfg if isinstance(ytcfg, dict) else {},
+                "player_response": player if isinstance(player, dict) else {},
+                "innertube_api_key": (ytcfg.get("INNERTUBE_API_KEY") if isinstance(ytcfg, dict) else None) or os.getenv("YOUTUBE_INNERTUBE_API_KEY") or YOUTUBE_INNERTUBE_DEFAULT_API_KEY,
+                "web_client_version": client_cfg.get("clientVersion") or (ytcfg.get("INNERTUBE_CLIENT_VERSION") if isinstance(ytcfg, dict) else None) or os.getenv("YOUTUBE_WEB_CLIENT_VERSION") or "2.20240726.00.00",
+                "visitor_data": client_cfg.get("visitorData") or (ytcfg.get("VISITOR_DATA") if isinstance(ytcfg, dict) else None) or "",
+                "watch": info,
+                "dynamic_innertube_api_key_found": bool(isinstance(ytcfg, dict) and ytcfg.get("INNERTUBE_API_KEY")),
+                "dynamic_web_client_version_found": True,
+                "visitor_data_found": bool(client_cfg.get("visitorData") or (ytcfg.get("VISITOR_DATA") if isinstance(ytcfg, dict) else None)),
+                "errors": errors[-4:],
+            }
+        except Exception as exc:
+            errors.append({"watch_url": u, "error": str(exc)[:300]})
+    return {"ok": False, "video_id": video_id, "normalized_url": watch_url, "errors": errors[-6:]}
+
+
+def _v18_innertube_client_profiles(bootstrap: Dict[str, object], video_id: str) -> List[Dict[str, object]]:
+    web_version = str(bootstrap.get("web_client_version") or os.getenv("YOUTUBE_WEB_CLIENT_VERSION") or "2.20240726.00.00")
+    return [
+        {"label": "WEB_DYNAMIC", "clientName": "WEB", "clientNameHeader": "1", "clientVersion": web_version, "hl": "en", "gl": "US"},
+        {"label": "MWEB_DYNAMIC", "clientName": "MWEB", "clientNameHeader": "2", "clientVersion": web_version, "hl": "en", "gl": "US"},
+        {"label": "WEB_EMBEDDED_PLAYER", "clientName": "WEB_EMBEDDED_PLAYER", "clientNameHeader": "56", "clientVersion": os.getenv("YOUTUBE_WEB_EMBEDDED_CLIENT_VERSION", "1.20240723.01.00"), "hl": "en", "gl": "US", "thirdParty": {"embedUrl": f"https://www.youtube.com/embed/{video_id}"}},
+        {"label": "TVHTML5_SIMPLY_EMBEDDED_PLAYER", "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER", "clientNameHeader": "85", "clientVersion": os.getenv("YOUTUBE_TVHTML5_CLIENT_VERSION", "2.0"), "hl": "en", "gl": "US", "thirdParty": {"embedUrl": f"https://www.youtube.com/embed/{video_id}"}},
+        {"label": "ANDROID", "clientName": "ANDROID", "clientNameHeader": "3", "clientVersion": os.getenv("YOUTUBE_ANDROID_CLIENT_VERSION", "19.09.37"), "androidSdkVersion": 30, "hl": "en", "gl": "US", "userAgent": os.getenv("YOUTUBE_ANDROID_UA", "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip")},
+        {"label": "IOS", "clientName": "IOS", "clientNameHeader": "5", "clientVersion": os.getenv("YOUTUBE_IOS_CLIENT_VERSION", "19.09.3"), "deviceMake": "Apple", "deviceModel": "iPhone16,2", "hl": "en", "gl": "US", "userAgent": os.getenv("YOUTUBE_IOS_UA", "com.google.ios.youtube/19.09.3 (iPhone16,2; U; CPU iOS 17_2 like Mac OS X;)")},
+    ]
+
+
+def _v18_innertube_context(client: Dict[str, object], bootstrap: Dict[str, object]) -> Dict[str, object]:
+    ctx = {
+        "clientName": client.get("clientName") or "WEB",
+        "clientVersion": client.get("clientVersion") or bootstrap.get("web_client_version") or "2.20240726.00.00",
+        "hl": client.get("hl") or "en",
+        "gl": client.get("gl") or "US",
+    }
+    for k in ["androidSdkVersion", "deviceMake", "deviceModel", "userAgent"]:
+        if client.get(k) is not None:
+            ctx[k] = client[k]
+    if bootstrap.get("visitor_data"):
+        ctx["visitorData"] = bootstrap["visitor_data"]
+    if client.get("thirdParty"):
+        ctx["thirdParty"] = client["thirdParty"]
+    return {"client": ctx}
+
+
+def _v18_innertube_headers(client: Dict[str, object], bootstrap: Dict[str, object]) -> Dict[str, str]:
+    headers = _v14_youtube_headers({"Content-Type": "application/json", "Accept": "application/json"})
+    headers["X-Youtube-Client-Name"] = str(client.get("clientNameHeader") or client.get("clientName") or "1")
+    headers["X-Youtube-Client-Version"] = str(client.get("clientVersion") or bootstrap.get("web_client_version") or "")
+    if bootstrap.get("visitor_data"):
+        headers["X-Goog-Visitor-Id"] = str(bootstrap["visitor_data"])
+    if client.get("userAgent"):
+        headers["User-Agent"] = str(client["userAgent"])
+    return headers
+
+
+def _v18_try_player_response_caption_tracks(player_response: Dict[str, object], requested_language: Optional[str], meta_base: Dict[str, object]) -> Optional[Tuple[str, Dict[str, object]]]:
+    tracks = _v14_caption_tracks_from_player_response(player_response or {})
+    if not tracks:
+        return None
+    selected = _v14_pick_track(tracks, requested_language)
+    if not selected:
+        return None
+    source_name, track = selected
+    srt, used_fmt, fetch_errors = _v14_fetch_track(str(track.get("baseUrl") or ""))
+    if srt and srt.strip():
+        manual_languages = sorted({t.get("languageCode") for t in tracks if t.get("languageCode") and t.get("kind") != "asr"})
+        auto_languages = sorted({t.get("languageCode") for t in tracks if t.get("languageCode") and t.get("kind") == "asr"})
+        subtitle_source = source_name if track.get("kind") != "asr" else "youtube_auto_caption"
+        return srt, {
+            **meta_base,
+            "source": meta_base.get("source") or "v18_player_response_caption_tracks",
+            "subtitle_source": subtitle_source,
+            "language": track.get("languageCode") or "",
+            "format": used_fmt,
+            "manual_languages": manual_languages,
+            "auto_languages": auto_languages,
+            "caption_track_count": len(tracks),
+            "no_media_download": True,
+            "caption_first": True,
+            "restored_from": "v18_innertube_v14_v5",
+            "errors": fetch_errors[-5:],
+        }
+    return None
+
+
+def _v18_innertube_caption_srt(url: str, requested_language: Optional[str] = None) -> Optional[Tuple[str, Dict[str, object]]]:
+    video_id = extract_youtube_video_id(url)
+    if not video_id:
+        return None
+    bootstrap = _v18_fetch_youtube_bootstrap(url)
+    errors: List[str] = []
+    debug: Dict[str, object] = {
+        "bootstrap_ok": bool(bootstrap.get("ok")),
+        "dynamic_innertube_api_key_found": bool(bootstrap.get("dynamic_innertube_api_key_found")),
+        "dynamic_web_client_version_found": bool(bootstrap.get("dynamic_web_client_version_found")),
+        "visitor_data_found": bool(bootstrap.get("visitor_data_found")),
+        "watch": bootstrap.get("watch") or {},
+        "bootstrap_errors": bootstrap.get("errors") or [],
+        "attempts": [],
+    }
+    try:
+        direct = _v18_try_player_response_caption_tracks(bootstrap.get("player_response") or {}, requested_language, {
+            "source": "v18_watch_page_ytInitialPlayerResponse",
+            "video_id": video_id,
+            "source_url": bootstrap.get("normalized_url") or _v14_normalize_youtube_url(url),
+            "innertube_client": "watch_page",
+            "title": (((bootstrap.get("player_response") or {}).get("videoDetails") or {}).get("title") or "YouTube captions") if isinstance(bootstrap.get("player_response"), dict) else "YouTube captions",
+        })
+        debug["attempts"].append({"client": "watch_page", "success": bool(direct)})
+        if direct:
+            direct[1]["debug"] = debug
+            return direct
+    except Exception as exc:
+        errors.append(f"watch_page_player: {exc}")
+        debug["attempts"].append({"client": "watch_page", "success": False, "error": str(exc)[:300]})
+
+    api_keys = []
+    for k in [bootstrap.get("innertube_api_key"), os.getenv("YOUTUBE_INNERTUBE_API_KEY"), YOUTUBE_INNERTUBE_DEFAULT_API_KEY]:
+        if k and k not in api_keys:
+            api_keys.append(str(k))
+    for api_key in api_keys:
+        for client in _v18_innertube_client_profiles(bootstrap, video_id):
+            label = str(client.get("label") or client.get("clientName") or "WEB")
+            attempt: Dict[str, object] = {"client": label, "success": False}
+            try:
+                payload = {
+                    "context": _v18_innertube_context(client, bootstrap),
+                    "videoId": video_id,
+                    "contentCheckOk": True,
+                    "racyCheckOk": True,
+                    "playbackContext": {"contentPlaybackContext": {"html5Preference": "HTML5_PREF_WANTS"}},
+                }
+                resp = requests.post(
+                    f"https://www.youtube.com/youtubei/v1/player?key={api_key}&prettyPrint=false",
+                    headers=_v18_innertube_headers(client, bootstrap),
+                    data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                    timeout=int(os.getenv("YOUTUBE_CAPTION_TIMEOUT", "30")),
+                )
+                attempt["http_status"] = resp.status_code
+                if resp.status_code >= 400:
+                    attempt["error"] = f"player http {resp.status_code}"
+                    debug["attempts"].append(attempt)
+                    continue
+                player_response = resp.json()
+                playability = (player_response.get("playabilityStatus") or {}) if isinstance(player_response, dict) else {}
+                attempt["playability_status"] = playability.get("status")
+                attempt["playability_reason"] = str(playability.get("reason") or "")[:140]
+                tracks = _v14_caption_tracks_from_player_response(player_response)
+                attempt["caption_track_count"] = len(tracks)
+                if not tracks:
+                    debug["attempts"].append(attempt)
+                    errors.append(f"{label}: no captionTracks status={attempt.get('playability_status')} reason={attempt.get('playability_reason')}")
+                    continue
+                result = _v18_try_player_response_caption_tracks(player_response, requested_language, {
+                    "source": "v18_innertube_caption_tracks",
+                    "video_id": video_id,
+                    "source_url": bootstrap.get("normalized_url") or _v14_normalize_youtube_url(url),
+                    "innertube_client": label,
+                    "title": ((player_response.get("videoDetails") or {}).get("title") or "YouTube captions"),
+                })
+                attempt["success"] = bool(result)
+                debug["attempts"].append(attempt)
+                if result:
+                    result[1]["debug"] = debug
+                    return result
+            except Exception as exc:
+                attempt["error"] = str(exc)[:300]
+                debug["attempts"].append(attempt)
+                errors.append(f"{label}: {exc}")
+    debug["errors"] = errors[-12:]
+    return None
+
 def _v14_watch_page_caption_srt(url: str, requested_language: Optional[str] = None) -> Optional[Tuple[str, Dict[str, object]]]:
     video_id = extract_youtube_video_id(url)
     if not video_id:
@@ -1673,6 +1898,7 @@ def try_v14_public_caption_srt(url: str, language: str = "auto") -> Tuple[Option
     """Restored V14-style public caption extraction before youtube-transcript-api/yt-dlp."""
     attempts: Dict[str, object] = {}
     for name, fn in [
+        ("v18_innertube_caption_tracks", _v18_innertube_caption_srt),
         ("v14_watch_page_caption_tracks", _v14_watch_page_caption_srt),
         ("v14_direct_timedtext", _v14_direct_timedtext_srt),
     ]:
@@ -1998,6 +2224,37 @@ def download_audio_route():
         )
 
 
+
+
+@app.route("/debug-youtube-captions", methods=["POST", "OPTIONS"])
+def debug_youtube_captions_route():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    if not env_bool("ENABLE_AI_DEBUG_ROUTES", False):
+        return json_error("Debug routes are disabled", 403)
+    expected = os.getenv("DEBUG_AI_TEST_TOKEN", "").strip()
+    if expected and request.headers.get("X-Debug-Token") != expected:
+        return json_error("Invalid debug token", 403)
+    data = request.get_json(silent=True) or {}
+    input_url = (data.get("url") or "").strip()
+    language = data.get("language") or "auto"
+    if not input_url:
+        return json_error("url is required", 400)
+    resolved_url, resolve_meta = resolve_public_redirect_url(input_url)
+    srt_text, meta = try_caption_first_srt(resolved_url or input_url, language=language)
+    return jsonify({
+        "success": bool(srt_text),
+        "ok": bool(srt_text),
+        "version": APP_VERSION,
+        "input_url": input_url,
+        "resolved_url": resolved_url,
+        "url_resolution": resolve_meta,
+        "srt_chars": len(srt_text or ""),
+        "srt_preview": (srt_text or "")[:1000],
+        "caption_meta": meta,
+        "cookie_configured": bool(youtube_cookiefile()),
+    })
+
 @app.route("/extract-srt", methods=["POST", "OPTIONS"])
 def extract_srt_route():
     if request.method == "OPTIONS":
@@ -2236,6 +2493,117 @@ def rewrite_route():
     })
 
 
+
+
+def build_v18_fast_full_story_source(text: str, max_chars: int = 7200) -> str:
+    cleaned = clean_srt_to_text(text)
+    cleaned = re.sub(r"(?i)\b(subscribe|notification|thanks for watching|like and share|channel)\b", "", cleaned)
+    cleaned = re.sub(r"(?i)\berror\s*500|server error|that['’]s an error|please try again later", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    n = len(cleaned)
+    each = max(1000, max_chars // 3)
+    start = cleaned[:each]
+    middle = cleaned[max(0, int(n * 0.48) - each // 2): max(0, int(n * 0.48) - each // 2) + each]
+    end = cleaned[max(0, n - each):]
+    return ("BEGINNING:\n" + start.strip() + "\n\nMIDDLE:\n" + middle.strip() + "\n\nENDING:\n" + end.strip())[:max_chars]
+
+
+def fast_narrative_rewrite_with_iamhc(source_text: str, style: str, rewrite_mode: str, target_chars: int) -> Tuple[Optional[str], Dict[str, object]]:
+    models: List[str] = []
+    for m in [
+        os.getenv("IAMHC_REWRITE_MODEL", "Qwen3.5-397B-A17B"),
+        os.getenv("IAMHC_FINAL_POLISH_MODEL", os.getenv("IAMHC_REWRITE_MODEL", "Qwen3.5-397B-A17B")),
+        os.getenv("IAMHC_FAST_MODEL", "DeepSeek-V4-Flash"),
+    ]:
+        if m and m not in models:
+            models.append(m)
+    is_emotional = "emotion" in (style or "").lower() or "story" in (style or "").lower()
+    style_name = "Emotional Storytelling" if is_emotional else "Movie Recap / Documentary"
+    style_rule = (
+        "cinematic, emotional, suspenseful but not exaggerated Myanmar storytelling narration"
+        if is_emotional else
+        "clear, stable, professional documentary/movie recap Myanmar narration"
+    )
+    mode_rule = ""
+    if "full_narrative" in (rewrite_mode or ""):
+        mode_rule = "This is a short source. Do NOT summarize aggressively. Preserve full meaning and rewrite as natural narration."
+    else:
+        mode_rule = "Cover the complete story: beginning, setup, middle conflict, climax, and ending. Do not only rewrite the beginning."
+    target_chars = max(1200, min(int(target_chars or 3600), int(os.getenv("FAST_REWRITE_MAX_TARGET_CHARS", "6500"))))
+    min_chars = max(900, int(target_chars * 0.72))
+    max_chars = max(target_chars + 400, int(target_chars * 1.28))
+    system_prompt = (
+        "You are a senior Myanmar movie recap and voice-over script writer. "
+        "Return ONLY the final Myanmar narration. No English explanation. No notes. No markdown. "
+        "Do not include SRT timestamps, numbering, labels, or instructions. "
+        "Use natural Myanmar punctuation '။' and short TTS-friendly sentences. "
+        "Remove CTA phrases, subscribe messages, music markers, and service error text."
+    )
+    user_prompt = (
+        f"Rewrite the source into {style_name}.\n"
+        f"Style: {style_rule}.\n"
+        f"Mode: {rewrite_mode or 'fast_narrative_repair'}. {mode_rule}\n"
+        f"Length: about {target_chars} Myanmar characters. Minimum {min_chars}, maximum {max_chars}.\n"
+        "Must include the ending/resolution from the ENDING section.\n"
+        "Myanmar narration only. Convert English/common words into natural Myanmar when possible; keep only necessary proper names.\n"
+        "Every paragraph should sound like a human narrator, not translated subtitles.\n\n"
+        f"SOURCE:\n{source_text[:7600]}"
+    )
+    attempts = []
+    for model in models:
+        out, meta = iamhc_chat(model, system_prompt, user_prompt, max_tokens=int(os.getenv("FAST_REWRITE_MAX_TOKENS", "5500")))
+        meta = dict(meta or {})
+        meta["fast_rewrite_model"] = model
+        attempts.append(meta)
+        if not out or bad_llm_output(out):
+            continue
+        candidate = ensure_myanmar_punctuation(sanitize_bad_service_text(out.strip()))
+        # Remove obvious leakage lines.
+        candidate = re.sub(r"(?im)^\s*(here is|note:|possible translation|we need|let['’]s).*?$", "", candidate).strip()
+        if len(candidate) < min_chars or len(candidate) > max_chars:
+            # Do not fail too hard for max length; fail only if very short.
+            if len(candidate) < min_chars:
+                continue
+        if contains_bad_text(candidate):
+            continue
+        # Names can remain, but block mostly-English outputs.
+        if latin_ratio(candidate) > float(os.getenv("FAST_REWRITE_MAX_LATIN_RATIO", "0.20")):
+            continue
+        return candidate, {"ok": True, "model": model, "attempts": attempts, "target_chars": target_chars, "style": style_name}
+    return None, {"ok": False, "error": "fast_narrative_rewrite_failed", "attempts": attempts, "target_chars": target_chars, "style": style_name}
+
+
+def make_fast_narrative_option(source_text: str, style: str, rewrite_mode: str, title: str, option_id: str, target_chars: int) -> Dict[str, object]:
+    script, meta = fast_narrative_rewrite_with_iamhc(source_text, style, rewrite_mode, target_chars)
+    source = "iamhc_qwen_fast_narrative_repair"
+    quality = "ai_rewrite"
+    if not script:
+        script = distributed_fallback_summary(source_text, 0.65)
+        source = "LOCAL_FAST_NARRATIVE_PREVIEW_FALLBACK"
+        quality = "local_preview_only"
+    q = script_quality(source_text, script, source=source)
+    # Fast repair is specifically used to unblock long-source final narration.
+    # It is AI-safe only when it is not fallback and basic bad-text/Latin checks pass.
+    safe = bool(quality == "ai_rewrite" and not contains_bad_text(script) and latin_ratio(script) <= float(os.getenv("FAST_REWRITE_MAX_LATIN_RATIO", "0.20")) and len(script) >= 900)
+    filename = f"{option_id}_{now_stamp()}_{uid()}.txt"
+    write_text_file(SCRIPT_DIR / filename, script)
+    return {
+        "id": option_id,
+        "title": title,
+        "script": script,
+        "text": script,
+        "quality": quality,
+        "source": source,
+        "tts_safe": safe,
+        "needs_retry": not safe,
+        "script_url": public_url("script", filename, f"{option_id}.txt"),
+        "download_url": public_url("script", filename, f"{option_id}.txt"),
+        "rewrite": {"input_chars": len(source_text), "output_chars": len(script), "rewrite_mode": rewrite_mode, "engine_meta": meta, "target_chars": target_chars},
+        "quality_checks": {**q, "fast_gate_safe": safe, "source_is_compact_full_story": True},
+    }
+
 @app.route("/rewrite-options", methods=["POST", "OPTIONS"])
 def rewrite_options_route():
     if request.method == "OPTIONS":
@@ -2248,6 +2616,48 @@ def rewrite_options_route():
     quality_mode = normalize_quality_mode(data.get("output_quality") or data.get("quality_mode"))
     default_ratio = "0.30" if quality_mode == "premium" else os.getenv("REWRITE_TARGET_RATIO_CONCISE", "0.35")
     target_ratio = float(data.get("target_length_ratio") or default_ratio)
+    rewrite_mode = str(data.get("rewrite_mode") or data.get("mode") or data.get("repair_mode") or "").lower()
+    style = str(data.get("style") or "").lower()
+    fast_requested = any(x in rewrite_mode for x in ["fast", "repair", "emergency", "full_story", "full-story", "narrative"]) or bool(data.get("fast_rewrite"))
+    if fast_requested:
+        compact_source = build_v18_fast_full_story_source(cleaned, int(os.getenv("FAST_REWRITE_SOURCE_CHARS", "7200")))
+        explicit_target = data.get("target_chars") or data.get("target_characters") or data.get("desired_chars")
+        try:
+            target_chars = int(explicit_target) if explicit_target else int(max(1800, min(6200, len(compact_source) * float(data.get("target_length_ratio") or 0.82))))
+        except Exception:
+            target_chars = int(max(1800, min(6200, len(compact_source) * 0.82)))
+        option_title = "Emotional Storytelling" if ("emotion" in style or "story" in style) else "Movie Recap / Documentary"
+        option_id = "emotional_storytelling" if ("emotion" in style or "story" in style) else "movie_recap_documentary"
+        fast_option = make_fast_narrative_option(compact_source, style, rewrite_mode or "fast_narrative_repair", option_title, option_id, target_chars)
+        return jsonify({
+            "success": True,
+            "ok": True,
+            "version": APP_VERSION,
+            "output_quality": quality_mode,
+            "rewrite_mode": rewrite_mode or "fast_narrative_repair",
+            "fast_rewrite": True,
+            "options": [fast_option],
+            "naturalScript": fast_option["script"],
+            "emotionalScript": fast_option["script"],
+            "naturalOption": fast_option,
+            "emotionalOption": fast_option,
+            "script": fast_option["script"],
+            "text": fast_option["script"],
+            "rewrittenScript": fast_option["script"],
+            "quality": fast_option["quality"],
+            "source": fast_option["source"],
+            "tts_safe": fast_option.get("tts_safe"),
+            "needs_retry": fast_option.get("needs_retry"),
+            "cleaned_input_chars": len(cleaned),
+            "compact_input_chars": len(compact_source),
+            "quality_gate": {
+                "fallback_is_preview_only": True,
+                "final_tts_requires_tts_safe": True,
+                "must_include_ending": True,
+                "fast_narrative_repair": True,
+            },
+        })
+
     natural = make_rewrite_option(cleaned, "natural_accurate", "Natural Accurate", target_ratio, quality_mode=quality_mode)
     emotional = make_rewrite_option(cleaned, "emotional_tts", "Emotional TTS", target_ratio, quality_mode=quality_mode)
     # If model returned duplicate scripts, mark for retry.
