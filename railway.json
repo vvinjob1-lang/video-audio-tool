@@ -4,7 +4,7 @@
     "buildCommand": "pip install --upgrade pip setuptools wheel && pip install -r requirements.txt"
   },
   "deploy": {
-    "startCommand": "python apply_gemini_tts_patch.py && gunicorn --timeout 600 --workers 1 app:app --bind 0.0.0.0:$PORT",
+    "startCommand": "gunicorn contract_app:app",
     "healthcheckPath": "/",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE"
