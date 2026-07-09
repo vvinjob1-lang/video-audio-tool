@@ -4,7 +4,7 @@
     "buildCommand": "pip install --upgrade pip setuptools wheel && pip install -r requirements.txt"
   },
   "deploy": {
-    "startCommand": "gunicorn contract_app:app",
+    "startCommand": "gunicorn --timeout 300 --workers 1 contract_app:app",
     "healthcheckPath": "/",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE"
