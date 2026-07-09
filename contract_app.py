@@ -1,5 +1,5 @@
 """
-VoiceCraft Myanmar — V22.8 Edge + Gemini TTS Backend Wrapper
+VoiceCraft Myanmar — V23.1 CORS + Edge/Gemini Truth Backend Wrapper
 
 Drop-in wrapper for an existing Flask backend app.py.
 It imports the existing Flask `app`, preserves all existing endpoints, and replaces
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import requests
-from flask import jsonify, request, send_from_directory
+from flask import jsonify, request, send_from_directory, make_response
 
 try:
     import app as legacy_app_module  # existing app.py
@@ -39,7 +39,7 @@ except Exception as exc:  # pragma: no cover
 
 app = legacy_app_module.app
 
-V22_CONTRACT_VERSION = "v22.8-edge-gemini-tts-speed-wrapper"
+V22_CONTRACT_VERSION = "v23.1-cors-edge-gemini-truth-wrapper"
 
 BASE_DIR = Path(getattr(legacy_app_module, "BASE_DIR", Path.cwd()))
 TTS_DIR = Path(getattr(legacy_app_module, "TTS_DIR", BASE_DIR / "tts"))
@@ -49,6 +49,74 @@ for _d in [TTS_DIR, SRT_DIR, SCRIPT_DIR]:
     _d.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://video-audio-tool-production.up.railway.app").rstrip("/")
+
+
+# -----------------------------------------------------------------------------
+# V23.1 Production CORS / browser preflight guard
+# -----------------------------------------------------------------------------
+# The frontend is now hosted on v15r.vercel.app and may also run on Lovable
+# preview domains or localhost during development. Railway curl tests can pass
+# while browser POST requests fail if OPTIONS/CORS is not handled here.
+
+_ALLOWED_EXACT_ORIGINS = {
+    "https://v15r.vercel.app",
+    "https://www.v15r.vercel.app",
+    "https://voicecraft-myanmar.vercel.app",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+}
+_ALLOWED_SUFFIXES = (
+    ".vercel.app",
+    ".lovable.app",
+    ".lovableproject.com",
+)
+_CORS_METHODS = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+_CORS_HEADERS = "Content-Type,Authorization,X-Requested-With,Accept,Origin"
+_CORS_EXPOSE = "Content-Disposition,Content-Length,Content-Type"
+
+
+def _is_allowed_origin(origin: str) -> bool:
+    origin = str(origin or "").strip().rstrip("/")
+    if not origin:
+        return False
+    if origin in _ALLOWED_EXACT_ORIGINS:
+        return True
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(origin).hostname or ""
+        return any(host.endswith(suffix) for suffix in _ALLOWED_SUFFIXES)
+    except Exception:
+        return False
+
+
+def _add_cors_headers(response):
+    origin = request.headers.get("Origin", "").strip()
+    if _is_allowed_origin(origin):
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+    else:
+        # Keep non-browser curl tests simple without opening credentials.
+        response.headers.setdefault("Access-Control-Allow-Origin", "*")
+    response.headers["Access-Control-Allow-Methods"] = _CORS_METHODS
+    response.headers["Access-Control-Allow-Headers"] = _CORS_HEADERS
+    response.headers["Access-Control-Expose-Headers"] = _CORS_EXPOSE
+    response.headers["Access-Control-Max-Age"] = "86400"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.before_request
+def v23_options_preflight_guard():
+    if request.method == "OPTIONS":
+        return _add_cors_headers(make_response(("", 204)))
+    return None
+
+
+@app.after_request
+def v23_after_request_cors(response):
+    return _add_cors_headers(response)
 
 
 def _safe_lower(value: Any) -> str:
@@ -672,7 +740,7 @@ def v22_capabilities():
                 "speed_applied",
             ],
             "notes": [
-                "V22.8 replaces /tts with Edge/Gemini-only generation.",
+                "V23.1 replaces /tts with Edge/Gemini-only generation and adds browser CORS/OPTIONS support.",
                 "Edge speed is applied with edge-tts rate control.",
                 "Gemini speed is requested through prompt direction; exact speed is not guaranteed.",
                 "It does not change /extract-srt, /translate-srt, or /rewrite-options.",
@@ -692,5 +760,71 @@ def v22_health():
             "tts_wrapped": True,
             "original_tts_endpoint": _ORIGINAL_TTS_ENDPOINT,
             "gemini_app_key_configured": bool(os.getenv("GEMINI_APP_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")),
+        }
+    )
+
+
+@app.get("/v23-health")
+def v23_health():
+    return jsonify(
+        {
+            "ok": True,
+            "success": True,
+            "contract_version": V22_CONTRACT_VERSION,
+            "cors_enabled": True,
+            "allowed_exact_origins": sorted(_ALLOWED_EXACT_ORIGINS),
+            "allowed_suffixes": list(_ALLOWED_SUFFIXES),
+            "legacy_app_imported": True,
+            "tts_wrapped": True,
+            "gemini_app_key_configured": bool(os.getenv("GEMINI_APP_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")),
+            "notes": [
+                "Browser OPTIONS preflight returns 204 with CORS headers.",
+                "Use this route to confirm V23.1 is deployed after Railway redeploy.",
+            ],
+        }
+    )
+
+
+@app.get("/v23-capabilities")
+def v23_capabilities():
+    return jsonify(
+        {
+            "ok": True,
+            "success": True,
+            "contract_version": V22_CONTRACT_VERSION,
+            "frontend_domain_supported": "v15r.vercel.app",
+            "cors_enabled": True,
+            "preflight_supported": True,
+            "tts_truth_contract": True,
+            "providers_allowed": ["edge_tts", "gemini_tts"],
+            "providers_removed_from_product_ui": [
+                "iamhc",
+                "openrouter",
+                "qwen",
+                "deepseek",
+                "stepaudio",
+                "voice_clone",
+                "ollama",
+            ],
+            "endpoints_preserved": [
+                "/extract-srt",
+                "/translate-srt",
+                "/rewrite-options",
+                "/tts",
+            ],
+            "recommended_frontend_version": "V23.2",
+        }
+    )
+
+
+@app.get("/v23-cors-test")
+def v23_cors_test():
+    return jsonify(
+        {
+            "ok": True,
+            "success": True,
+            "contract_version": V22_CONTRACT_VERSION,
+            "origin_received": request.headers.get("Origin"),
+            "message": "CORS headers are attached by after_request.",
         }
     )
