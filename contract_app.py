@@ -1,830 +1,834 @@
+"""VoiceCraft Myanmar V25 production wrapper.
+
+Drop-in wrapper around the existing Flask backend. It preserves all existing
+routes, replaces only the public status responses and /tts dispatch behavior,
+and adds direct Gemini 2.5 Pro TTS support with explicit paid-tier errors.
+
+Expected Procfile:
+    web: gunicorn production_app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 600
+
+The wrapper imports VC_BASE_MODULE when set, otherwise tries contract_app and
+then app. The imported module must expose a Flask object named ``app``.
 """
-VoiceCraft Myanmar — V23.1 CORS + Edge/Gemini Truth Backend Wrapper
-
-Drop-in wrapper for an existing Flask backend app.py.
-It imports the existing Flask `app`, preserves all existing endpoints, and replaces
-POST /tts with a clean Edge/Gemini-only TTS implementation + truthful response contract.
-
-Deploy:
-1) Keep existing app.py unchanged.
-2) Add this file as contract_app.py beside app.py.
-3) Procfile: web: gunicorn contract_app:app
-"""
-
 from __future__ import annotations
 
-import asyncio
 import base64
+import importlib
+import io
+import sys
+from array import array
 import json
-import mimetypes
+import logging
 import os
 import re
-import subprocess
-import traceback
+import time
 import uuid
 import wave
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
-from flask import jsonify, request, send_from_directory, make_response
+from flask import Flask, Response, jsonify, request, send_from_directory
 
-try:
-    import app as legacy_app_module  # existing app.py
-except Exception as exc:  # pragma: no cover
-    raise RuntimeError(
-        "Could not import existing app.py. Keep contract_app.py beside app.py. "
-        f"Original import error: {exc}"
-    ) from exc
-
-app = legacy_app_module.app
-
-V22_CONTRACT_VERSION = "v23.1-cors-edge-gemini-truth-wrapper"
-
-BASE_DIR = Path(getattr(legacy_app_module, "BASE_DIR", Path.cwd()))
-TTS_DIR = Path(getattr(legacy_app_module, "TTS_DIR", BASE_DIR / "tts"))
-SRT_DIR = Path(getattr(legacy_app_module, "SRT_DIR", BASE_DIR / "srt"))
-SCRIPT_DIR = Path(getattr(legacy_app_module, "SCRIPT_DIR", BASE_DIR / "script"))
-for _d in [TTS_DIR, SRT_DIR, SCRIPT_DIR]:
-    _d.mkdir(parents=True, exist_ok=True)
-
-DEFAULT_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://video-audio-tool-production.up.railway.app").rstrip("/")
-
-
-# -----------------------------------------------------------------------------
-# V23.1 Production CORS / browser preflight guard
-# -----------------------------------------------------------------------------
-# The frontend is now hosted on v15r.vercel.app and may also run on Lovable
-# preview domains or localhost during development. Railway curl tests can pass
-# while browser POST requests fail if OPTIONS/CORS is not handled here.
-
-_ALLOWED_EXACT_ORIGINS = {
-    "https://v15r.vercel.app",
-    "https://www.v15r.vercel.app",
-    "https://voicecraft-myanmar.vercel.app",
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:5173",
+CONTRACT_VERSION = "v25.0-production-pro-tts-lock"
+PRO_MODEL = os.getenv("GEMINI_PRO_TTS_MODEL", "gemini-2.5-pro-preview-tts")
+FLASH_MODEL = os.getenv("GEMINI_FLASH_TTS_MODEL", "gemini-2.5-flash-preview-tts")
+OUTPUT_ROOT = Path(os.getenv("VOICECRAFT_OUTPUT_ROOT", "/tmp/voicecraft_v25"))
+AUDIO_DIR = OUTPUT_ROOT / "audio"
+SRT_DIR = OUTPUT_ROOT / "srt"
+SCRIPT_DIR = OUTPUT_ROOT / "script"
+MAX_SCRIPT_CHARS = int(os.getenv("VOICECRAFT_MAX_SCRIPT_CHARS", "30000"))
+MAX_CHUNK_CHARS = int(os.getenv("GEMINI_TTS_MAX_CHUNK_CHARS", "3500"))
+GOOGLE_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TTS_TIMEOUT_SECONDS", "240"))
+OUTPUT_TTL_SECONDS = int(os.getenv("VOICECRAFT_OUTPUT_TTL_SECONDS", "86400"))
+CHUNK_GAP_MS = int(os.getenv("GEMINI_TTS_CHUNK_GAP_MS", "180"))
+TARGET_PEAK_DBFS = float(os.getenv("VOICECRAFT_TARGET_PEAK_DBFS", "-3.0"))
+ALLOWED_ORIGINS = {
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ALLOWED_ORIGINS",
+        "https://v15r.vercel.app,http://localhost:3000,http://localhost:5173",
+    ).split(",")
+    if origin.strip()
 }
-_ALLOWED_SUFFIXES = (
-    ".vercel.app",
-    ".lovable.app",
-    ".lovableproject.com",
-)
-_CORS_METHODS = "GET,POST,PUT,PATCH,DELETE,OPTIONS"
-_CORS_HEADERS = "Content-Type,Authorization,X-Requested-With,Accept,Origin"
-_CORS_EXPOSE = "Content-Disposition,Content-Length,Content-Type"
+
+for directory in (AUDIO_DIR, SRT_DIR, SCRIPT_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
+
+LOGGER = logging.getLogger("voicecraft_v25")
+
+MODEL_ALIASES = {
+    "gemini-2.5-pro-tts": PRO_MODEL,
+    "gemini-2.5-pro-preview-tts": PRO_MODEL,
+    "gemini-2.5-flash-tts": FLASH_MODEL,
+    "gemini-2.5-flash-preview-tts": FLASH_MODEL,
+}
+
+VALID_GEMINI_VOICES = {
+    "Achernar", "Achird", "Algenib", "Algieba", "Alnilam", "Aoede",
+    "Autonoe", "Callirrhoe", "Charon", "Despina", "Enceladus", "Erinome",
+    "Fenrir", "Gacrux", "Iapetus", "Kore", "Laomedeia", "Leda", "Orus",
+    "Puck", "Pulcherrima", "Rasalgethi", "Sadachbia", "Sadaltager", "Schedar",
+    "Sulafat", "Umbriel", "Vindemiatrix", "Zephyr", "Zubenelgenubi",
+}
 
 
-def _is_allowed_origin(origin: str) -> bool:
-    origin = str(origin or "").strip().rstrip("/")
-    if not origin:
-        return False
-    if origin in _ALLOWED_EXACT_ORIGINS:
-        return True
-    try:
-        from urllib.parse import urlparse
-        host = urlparse(origin).hostname or ""
-        return any(host.endswith(suffix) for suffix in _ALLOWED_SUFFIXES)
-    except Exception:
-        return False
+class GeminiTtsError(RuntimeError):
+    def __init__(self, *, status: int, code: str, message: str, details: Any = None):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.details = details
 
 
-def _add_cors_headers(response):
-    origin = request.headers.get("Origin", "").strip()
-    if _is_allowed_origin(origin):
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Vary"] = "Origin"
-    else:
-        # Keep non-browser curl tests simple without opening credentials.
-        response.headers.setdefault("Access-Control-Allow-Origin", "*")
-    response.headers["Access-Control-Allow-Methods"] = _CORS_METHODS
-    response.headers["Access-Control-Allow-Headers"] = _CORS_HEADERS
-    response.headers["Access-Control-Expose-Headers"] = _CORS_EXPOSE
-    response.headers["Access-Control-Max-Age"] = "86400"
-    response.headers["Cache-Control"] = "no-store"
-    return response
+def _import_base_module():
+    candidates: List[str] = []
+    configured = os.getenv("VC_BASE_MODULE", "").strip()
+    if configured:
+        candidates.append(configured)
+    candidates.extend(["contract_app", "app"])
 
-
-@app.before_request
-def v23_options_preflight_guard():
-    if request.method == "OPTIONS":
-        return _add_cors_headers(make_response(("", 204)))
-    return None
-
-
-@app.after_request
-def v23_after_request_cors(response):
-    return _add_cors_headers(response)
-
-
-def _safe_lower(value: Any) -> str:
-    return str(value or "").strip().lower()
-
-
-def _public_url(path: str) -> str:
-    try:
-        build_public_url = getattr(legacy_app_module, "build_public_url", None)
-        if callable(build_public_url):
-            return build_public_url(path)
-    except Exception:
-        pass
-    if not path.startswith("/"):
-        path = "/" + path
-    return f"{DEFAULT_BASE_URL}{path}"
-
-
-def _sanitize_filename(name: str, fallback: str) -> str:
-    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name or "")).strip("._")
-    return name or fallback
-
-
-def _srt_timestamp(seconds: float) -> str:
-    seconds = max(0.0, float(seconds or 0.0))
-    ms_total = int(round(seconds * 1000))
-    ms = ms_total % 1000
-    total_seconds = ms_total // 1000
-    s = total_seconds % 60
-    total_minutes = total_seconds // 60
-    m = total_minutes % 60
-    h = total_minutes // 60
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def _clean_script_for_srt(text: str) -> str:
-    text = str(text or "").replace("\ufeff", "")
-    text = re.sub(r"```[\s\S]*?```", "", text)
-    text = re.sub(r"\r\n?", "\n", text)
-    text = re.sub(r"(?im)^\s*(WEBVTT|NOTE|STYLE)\s*$", "", text)
-    text = re.sub(r"(?m)^\s*\d+\s*$", "", text)
-    text = re.sub(r"(?m)^\s*\d{1,2}:\d{2}:\d{2}[,.]\d{3}\s*-->.*$", "", text)
-    text = re.sub(r"(?im)^\s*(ORIGINAL SOURCE TEXT|ROUGH MYANMAR TRANSLATION|IMPORTANT|BEGINNING|MIDDLE|ENDING)\s*[:：-].*$", "", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def _split_script_into_lines(script: str) -> list[str]:
-    text = _clean_script_for_srt(script)
-    if not text:
-        return []
-    build_lines = getattr(legacy_app_module, "split_script_into_srt_cues", None)
-    if callable(build_lines):
-        try:
-            lines = build_lines(text)
-            if isinstance(lines, list) and lines:
-                return [str(x).strip() for x in lines if str(x).strip()]
-        except Exception:
-            pass
-    pieces = [p.strip() for p in re.split(r"(?<=[။.!?])\s+|\n+", text) if p.strip()]
-    lines: list[str] = []
-    for piece in pieces:
-        if len(piece) <= 95:
-            lines.append(piece)
+    last_error: Optional[Exception] = None
+    for module_name in candidates:
+        if module_name == __name__:
             continue
-        words = piece.split()
-        cur = ""
-        for word in words:
-            if cur and len(cur) + 1 + len(word) > 85:
-                lines.append(cur.strip())
-                cur = word
-            else:
-                cur = f"{cur} {word}".strip()
-        if cur:
-            lines.append(cur.strip())
-    return lines
-
-
-def _build_final_srt(script: str, total_duration: Optional[float]) -> str:
-    legacy_builder = getattr(legacy_app_module, "build_final_srt_from_script", None)
-    if callable(legacy_builder):
         try:
-            srt_text = legacy_builder(script, total_duration=total_duration)
-            if isinstance(srt_text, str) and srt_text.strip():
-                return srt_text
-        except Exception:
-            pass
-
-    lines = _split_script_into_lines(script)
-    if not lines:
-        return ""
-    weights = [max(18, len(line)) for line in lines]
-    total_weight = sum(weights) or len(lines)
-    if not total_duration or total_duration <= 0:
-        durations = [max(2.0, min(7.0, len(line) / 18.0)) for line in lines]
-        total_duration = sum(durations)
-    else:
-        raw = [float(total_duration) * (w / total_weight) for w in weights]
-        durations = [max(1.4, min(8.0, x)) for x in raw]
-        scale = float(total_duration) / max(0.001, sum(durations))
-        durations = [d * scale for d in durations]
-    blocks = []
-    start = 0.0
-    for idx, (line, duration) in enumerate(zip(lines, durations), start=1):
-        end = start + duration
-        if idx == len(lines) and total_duration and total_duration > 0:
-            end = total_duration
-        blocks.append(f"{idx}\n{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n{line}\n")
-        start = end
-    return "\n".join(blocks).strip() + "\n"
+            module = importlib.import_module(module_name)
+            candidate_app = getattr(module, "app", None)
+            if isinstance(candidate_app, Flask):
+                return module_name, module, candidate_app
+        except Exception as exc:  # pragma: no cover - deployment diagnostics
+            last_error = exc
+            LOGGER.warning("Could not import base module %s: %s", module_name, exc)
+    raise RuntimeError(
+        "Could not import the existing Flask backend. Set VC_BASE_MODULE to the "
+        "module that exposes app. Last error: %r" % (last_error,)
+    )
 
 
-def _duration_seconds(path: Path) -> Optional[float]:
-    legacy_duration = getattr(legacy_app_module, "get_audio_duration_seconds", None)
-    if callable(legacy_duration):
-        try:
-            val = legacy_duration(path)
-            if val and float(val) > 0:
-                return float(val)
-        except Exception:
-            pass
-    try:
-        if path.suffix.lower() == ".wav":
-            with wave.open(str(path), "rb") as wf:
-                frames = wf.getnframes()
-                rate = wf.getframerate() or 24000
-                return frames / float(rate)
-    except Exception:
-        pass
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        if result.returncode == 0:
-            val = float((result.stdout or "").strip())
-            return val if val > 0 else None
-    except Exception:
-        pass
+BASE_MODULE_NAME, BASE_MODULE, app = _import_base_module()
+
+
+def _find_endpoint(path: str, method: str = "GET") -> Optional[str]:
+    for rule in app.url_map.iter_rules():
+        if rule.rule == path and method.upper() in rule.methods:
+            return rule.endpoint
     return None
 
 
-def _requested_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    output_quality = _safe_lower(payload.get("output_quality") or payload.get("quality") or payload.get("voice_tier"))
-    engine = _safe_lower(payload.get("engine") or payload.get("voice_engine"))
-    model = str(payload.get("model") or payload.get("tts_model") or "").strip()
+def _replace_view(path: str, method: str, view: Callable[..., Any]) -> Optional[Callable[..., Any]]:
+    endpoint = _find_endpoint(path, method)
+    if not endpoint:
+        return None
+    original = app.view_functions.get(endpoint)
+    app.view_functions[endpoint] = view
+    return original
 
-    if not output_quality:
-        if "pro" in model.lower():
-            output_quality = "pro"
-        elif "gemini" in model.lower() or engine == "gemini_tts":
-            output_quality = "premium"
-        else:
-            output_quality = "basic"
 
-    if not engine:
-        engine = "gemini_tts" if output_quality in {"premium", "pro"} or "gemini" in model.lower() else "edge_tts"
+ORIGINAL_TTS_ENDPOINT = _find_endpoint("/tts", "POST")
+if not ORIGINAL_TTS_ENDPOINT:
+    raise RuntimeError("Existing backend does not expose POST /tts")
+ORIGINAL_TTS_VIEW = app.view_functions[ORIGINAL_TTS_ENDPOINT]
 
-    if not model:
-        if engine == "edge_tts" or output_quality == "basic":
-            model = "edge_tts"
-        elif output_quality == "pro":
-            model = "gemini-2.5-pro-preview-tts"
-        else:
-            model = "gemini-2.5-flash-preview-tts"
 
-    speed = _safe_lower(payload.get("speed") or payload.get("voice_speed") or payload.get("voiceSpeed") or payload.get("rate") or "normal")
-    if speed not in {"slow", "normal", "fast"}:
-        speed = "normal"
+def _bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "allow"}
 
-    return {
-        "voice_tier_requested": output_quality,
-        "engine_requested": engine,
-        "model_requested": model,
-        "speed_requested": speed,
-        "api_source_requested": _safe_lower(payload.get("api_source") or payload.get("apiSource")) or None,
-        "voice_name_requested": payload.get("voice_name") or payload.get("voice") or payload.get("gender"),
+
+def _canonical_model(value: Any, tier: str) -> str:
+    raw = str(value or "").strip()
+    if raw in MODEL_ALIASES:
+        return MODEL_ALIASES[raw]
+    if raw:
+        return raw
+    return PRO_MODEL if tier == "pro" else FLASH_MODEL
+
+
+def _resolve_api_source(payload: Dict[str, Any]) -> str:
+    source = str(payload.get("api_source") or payload.get("api_mode") or "app").lower()
+    return "user" if source in {"user", "user_api", "my_gemini_api", "byok"} else "app"
+
+
+def _resolve_api_key(payload: Dict[str, Any], source: str) -> Optional[str]:
+    if source == "user":
+        for field in ("user_api_key", "gemini_api_key", "api_key"):
+            value = payload.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_APP_API_KEY"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return None
+
+
+def _resolve_voice(payload: Dict[str, Any]) -> str:
+    candidate = str(payload.get("voice_name") or payload.get("voice") or "Kore").strip()
+    if candidate in VALID_GEMINI_VOICES:
+        return candidate
+    # Common typo seen in QA recordings.
+    if candidate.lower() == "koge":
+        return "Kore"
+    return "Kore"
+
+
+def _is_pro_request(payload: Dict[str, Any]) -> bool:
+    tier = str(payload.get("output_quality") or payload.get("quality_tier") or "").lower()
+    model = _canonical_model(payload.get("model") or payload.get("voice_model"), tier)
+    engine = str(payload.get("engine") or payload.get("voice_engine") or "").lower()
+    return tier == "pro" or model == PRO_MODEL or ("pro" in model and engine == "gemini_tts")
+
+
+def _fallback_policy(payload: Dict[str, Any]) -> str:
+    policy = str(payload.get("fallback_policy") or "none").strip().lower()
+    if policy in {"premium", "edge", "none"}:
+        return policy
+    if _bool(payload.get("allow_fallback"), False):
+        return "premium"
+    return "none"
+
+
+def _style_instruction(speed: str, tone: str) -> str:
+    speed_map = {
+        "slow": "Read at a deliberately slow pace with clear pauses.",
+        "fast": "Read at a brisk but intelligible narration pace.",
+        "normal": "Read at a balanced natural narration pace.",
     }
-
-
-def _select_edge_voice(payload: Dict[str, Any]) -> str:
-    requested_voice = str(payload.get("voice") or payload.get("voice_name") or "").strip()
-    if requested_voice.startswith("my-MM-"):
-        return requested_voice
-    gender = _safe_lower(payload.get("gender") or requested_voice or "male")
-    if gender == "female":
-        return "my-MM-NilarNeural"
-    return "my-MM-ThihaNeural"
-
-
-def _edge_rate_for_speed(speed: str) -> str:
-    return {"slow": "-15%", "normal": "+0%", "fast": "+15%"}.get(speed, "+0%")
-
-
-async def _edge_tts_generate(text: str, voice: str, output_path: Path, rate: str) -> None:
-    import edge_tts
-    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch="+0Hz", volume="+0%")
-    await communicate.save(str(output_path))
-
-
-def _save_text_file(text: str, prefix: str, suffix: str, directory: Path) -> Tuple[str, str]:
-    filename = f"{_sanitize_filename(prefix, 'file')}_{uuid.uuid4().hex[:10]}{suffix}"
-    path = directory / filename
-    path.write_text(text or "", encoding="utf-8")
-    route = "script" if suffix == ".txt" else "srt"
-    return filename, _public_url(f"/{route}/{filename}")
-
-
-def _write_pcm_wav(path: Path, pcm_data: bytes, sample_rate: int = 24000) -> None:
-    with wave.open(str(path), "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm_data)
-
-
-def _extract_inline_audio(response_json: Dict[str, Any]) -> Tuple[bytes, str]:
-    stack = [response_json]
-    while stack:
-        item = stack.pop()
-        if isinstance(item, dict):
-            inline = item.get("inlineData") or item.get("inline_data")
-            if isinstance(inline, dict) and inline.get("data"):
-                return base64.b64decode(inline["data"]), str(inline.get("mimeType") or inline.get("mime_type") or "")
-            stack.extend(item.values())
-        elif isinstance(item, list):
-            stack.extend(item)
-    raise RuntimeError("Gemini TTS response did not contain inline audio data")
-
-
-def _normalize_gemini_model(model: str, quality: str) -> str:
-    m = (model or "").strip()
-    alias_map = {
-        "gemini-2.5-flash-tts": "gemini-2.5-flash-preview-tts",
-        "gemini-2.5-pro-tts": "gemini-2.5-pro-preview-tts",
+    tone_map = {
+        "documentary": "Use a calm, mature documentary narrator tone.",
+        "warm": "Use a warm, approachable storytelling tone.",
+        "cinematic": "Use a cinematic, suspenseful tone without exaggeration.",
+        "neutral": "Use a clear neutral narration tone.",
     }
-    if m in alias_map:
-        return alias_map[m]
-    if m:
-        return m
-    return "gemini-2.5-pro-preview-tts" if quality == "pro" else "gemini-2.5-flash-preview-tts"
+    return f"{tone_map.get(tone, tone_map['documentary'])} {speed_map.get(speed, speed_map['normal'])}"
 
 
-def _gemini_api_key(payload: Dict[str, Any]) -> Optional[str]:
-    api_source = _safe_lower(payload.get("api_source") or payload.get("apiSource"))
-    if api_source == "user":
-        return str(payload.get("user_api_key") or payload.get("gemini_api_key") or "").strip() or None
-    return (
-        os.getenv("GEMINI_APP_API_KEY")
-        or os.getenv("GEMINI_API_KEY")
-        or os.getenv("GOOGLE_API_KEY")
-        or None
+def _clean_script(text: str) -> str:
+    value = str(text or "").strip()
+    value = re.sub(r"```(?:\w+)?", "", value)
+    value = re.sub(r"WEBVTT", "", value, flags=re.I)
+    value = re.sub(r"^\s*\d+\s*$", "", value, flags=re.M)
+    value = re.sub(
+        r"\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}",
+        "",
+        value,
+    )
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
+
+
+def _split_long_text(text: str, max_chars: int) -> List[str]:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text]
+
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    chunks: List[str] = []
+    current = ""
+
+    def flush() -> None:
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+            current = ""
+
+    for paragraph in paragraphs:
+        if len(paragraph) > max_chars:
+            # Myanmar full stop and common punctuation aware sentence split.
+            sentences = [s.strip() for s in re.split(r"(?<=[။.!?])\s*", paragraph) if s.strip()]
+        else:
+            sentences = [paragraph]
+        for sentence in sentences:
+            if len(sentence) > max_chars:
+                flush()
+                for start in range(0, len(sentence), max_chars):
+                    chunks.append(sentence[start : start + max_chars].strip())
+                continue
+            candidate = f"{current}\n\n{sentence}".strip() if current else sentence
+            if len(candidate) > max_chars:
+                flush()
+                current = sentence
+            else:
+                current = candidate
+    flush()
+    return chunks or [text]
+
+
+def _google_error(response: requests.Response, model: str) -> GeminiTtsError:
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text[:1000]}
+    error = data.get("error") if isinstance(data, dict) else None
+    message = "Gemini TTS request failed."
+    google_status = ""
+    if isinstance(error, dict):
+        message = str(error.get("message") or message)
+        google_status = str(error.get("status") or "")
+
+    status = response.status_code
+    lowered = message.lower()
+    detail_blob = json.dumps(data, ensure_ascii=False).lower()
+    is_pro = model == PRO_MODEL
+
+    if status in {400, 401} and any(token in lowered for token in ("api key", "key not valid", "invalid key")):
+        code = "GEMINI_API_KEY_INVALID"
+        user_message = "The Gemini API key is invalid or no longer active. Replace the key and retry."
+        mapped_status = 401
+    elif status == 429 and is_pro:
+        code = "PRO_TTS_PAID_TIER_OR_QUOTA_REQUIRED"
+        user_message = (
+            "Gemini 2.5 Pro TTS has no free tier. Use a billed Gemini API project "
+            "with available Pro TTS quota, or explicitly choose Premium Flash TTS."
+        )
+        mapped_status = 402
+    elif status == 429 or "quota" in lowered or "rate limit" in lowered:
+        code = "GEMINI_TTS_QUOTA_EXCEEDED"
+        user_message = "Gemini TTS quota is unavailable or exhausted for this API project."
+        mapped_status = 429
+    elif status == 403 and is_pro:
+        code = "PRO_TTS_PAID_TIER_OR_PERMISSION_REQUIRED"
+        user_message = (
+            "Gemini 2.5 Pro TTS requires a billed project with permission for this model. "
+            "Enable billing or explicitly choose Premium Flash TTS."
+        )
+        mapped_status = 402
+    elif status == 403 or "permission" in lowered or "service_disabled" in detail_blob:
+        code = "GEMINI_TTS_PERMISSION_DENIED"
+        user_message = "This Gemini API project does not have permission to use the selected TTS model."
+        mapped_status = 403
+    elif status == 404 or "not found" in lowered:
+        code = "GEMINI_TTS_MODEL_NOT_AVAILABLE"
+        user_message = "The selected Gemini TTS model is not available to this API project or region."
+        mapped_status = 404
+    elif status == 400:
+        code = "GEMINI_TTS_BAD_REQUEST"
+        user_message = "Gemini TTS rejected the request. Check the model, voice, and script length."
+        mapped_status = 400
+    else:
+        code = "GEMINI_TTS_UPSTREAM_ERROR"
+        user_message = "Gemini TTS could not generate audio. Please retry later."
+        mapped_status = status
+    return GeminiTtsError(
+        status=mapped_status,
+        code=code,
+        message=user_message,
+        details={"google_status": google_status, "upstream_message": message},
     )
 
 
-def _gemini_speed_instruction(speed: str) -> str:
-    if speed == "slow":
-        return "Read at a slower, clear documentary pace with gentle pauses."
-    if speed == "fast":
-        return "Read at a slightly faster recap pace while keeping the Myanmar pronunciation clear."
-    return "Read at a balanced natural narration speed."
+def _extract_audio_bytes(data: Dict[str, Any]) -> Tuple[bytes, str]:
+    candidates = data.get("candidates") if isinstance(data, dict) else None
+    if not isinstance(candidates, list) or not candidates:
+        raise GeminiTtsError(
+            status=502,
+            code="PRO_TTS_NO_CANDIDATE",
+            message="Gemini Pro TTS returned no audio candidate.",
+            details=data,
+        )
+    for candidate in candidates:
+        content = candidate.get("content") if isinstance(candidate, dict) else None
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            inline = part.get("inlineData") or part.get("inline_data")
+            if not isinstance(inline, dict):
+                continue
+            encoded = inline.get("data")
+            if isinstance(encoded, str) and encoded:
+                try:
+                    return base64.b64decode(encoded), str(inline.get("mimeType") or inline.get("mime_type") or "")
+                except Exception as exc:
+                    raise GeminiTtsError(
+                        status=502,
+                        code="PRO_TTS_INVALID_AUDIO",
+                        message="Gemini Pro TTS returned invalid audio data.",
+                        details=str(exc),
+                    ) from exc
+    raise GeminiTtsError(
+        status=502,
+        code="PRO_TTS_NO_AUDIO",
+        message="Gemini Pro TTS returned a response without audio.",
+        details=data,
+    )
 
 
-def _generate_gemini_tts(text: str, payload: Dict[str, Any], requested: Dict[str, Any]) -> Tuple[Path, Dict[str, Any]]:
-    api_key = _gemini_api_key(payload)
-    if not api_key:
-        raise RuntimeError("Gemini API key is not configured. Set GEMINI_APP_API_KEY or use User API key mode.")
-
-    quality = requested["voice_tier_requested"]
-    model_requested = requested["model_requested"]
-    model_used = _normalize_gemini_model(model_requested, quality)
-    voice_name = str(payload.get("voice_name") or payload.get("voice") or "Kore").strip() or "Kore"
-    speed = requested["speed_requested"]
-
+def _call_gemini_tts(*, model: str, key: str, text: str, voice: str, speed: str, tone: str) -> Tuple[bytes, str]:
+    instruction = _style_instruction(speed, tone)
     prompt = (
-        "You are generating Myanmar narrative voice-over audio. "
-        f"Voice direction: {_gemini_speed_instruction(speed)} "
-        "Use a polished movie recap/documentary narration tone. "
-        "Speak only the provided Myanmar narration text; do not add introductions or extra words.\n\n"
-        f"Narration text:\n{text}"
+        f"{instruction}\n"
+        "Read the Myanmar narration below exactly as written. Do not add, translate, summarize, "
+        "or omit words. Preserve Myanmar punctuation and natural paragraph pauses.\n\n"
+        f"{text}"
     )
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_used}:generateContent"
-    body = {
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {
                 "voiceConfig": {
-                    "prebuiltVoiceConfig": {"voiceName": voice_name}
+                    "prebuiltVoiceConfig": {"voiceName": voice}
                 }
             },
         },
     }
-    timeout = int(os.getenv("GEMINI_TTS_TIMEOUT", "300"))
-    resp = requests.post(url, params={"key": api_key}, json=body, timeout=timeout)
-    if resp.status_code >= 400:
-        detail = resp.text[:500]
-        raise RuntimeError(f"Gemini TTS API error {resp.status_code}: {detail}")
-    data = resp.json()
-    audio_bytes, mime_type = _extract_inline_audio(data)
-
-    ext = ".wav"
-    if "mpeg" in mime_type or "mp3" in mime_type:
-        ext = ".mp3"
-    elif "wav" in mime_type or audio_bytes[:4] == b"RIFF":
-        ext = ".wav"
-    elif "l16" in mime_type.lower() or "pcm" in mime_type.lower() or not mime_type:
-        ext = ".wav"
-
-    filename = f"gemini_tts_{uuid.uuid4().hex[:12]}{ext}"
-    output_path = TTS_DIR / filename
-    if ext == ".wav" and audio_bytes[:4] != b"RIFF":
-        _write_pcm_wav(output_path, audio_bytes, sample_rate=24000)
-    else:
-        output_path.write_bytes(audio_bytes)
-
-    meta = {
-        "model_used": model_used,
-        "voice_used": voice_name,
-        "audio_format": ext.lstrip("."),
-        "gemini_mime_type": mime_type,
-        "speed_prompted": True,
-        "speed_applied": False,
-        "speed_note": "Gemini speed is requested through the narration prompt; exact speed is not guaranteed by the backend.",
-    }
-    return output_path, meta
-
-
-def _generate_edge_tts(text: str, payload: Dict[str, Any], requested: Dict[str, Any]) -> Tuple[Path, Dict[str, Any]]:
-    voice = _select_edge_voice(payload)
-    speed = requested["speed_requested"]
-    rate = _edge_rate_for_speed(speed)
-    filename = f"edge_tts_{uuid.uuid4().hex[:12]}.mp3"
-    output_path = TTS_DIR / filename
     try:
-        asyncio.run(_edge_tts_generate(text, voice, output_path, rate=rate))
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(_edge_tts_generate(text, voice, output_path, rate=rate))
-        finally:
-            loop.close()
-    if not output_path.exists() or output_path.stat().st_size <= 0:
-        raise RuntimeError("Edge TTS audio file was not created")
-    return output_path, {
-        "model_used": "edge_tts",
-        "voice_used": voice,
-        "audio_format": "mp3",
-        "edge_rate": rate,
-        "speed_applied": True,
-        "speed_applied_value": speed,
-        "speed_note": f"Edge TTS rate applied: {rate}",
-    }
+        response = requests.post(
+            url,
+            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+            json=payload,
+            timeout=GOOGLE_TIMEOUT_SECONDS,
+        )
+    except requests.Timeout as exc:
+        raise GeminiTtsError(
+            status=504,
+            code="PRO_TTS_TIMEOUT",
+            message="Gemini Pro TTS timed out. Retry with a shorter script or Premium Flash TTS.",
+            details=str(exc),
+        ) from exc
+    except requests.RequestException as exc:
+        raise GeminiTtsError(
+            status=502,
+            code="PRO_TTS_NETWORK_ERROR",
+            message="The backend could not reach Gemini Pro TTS.",
+            details=str(exc),
+        ) from exc
+
+    if not response.ok:
+        raise _google_error(response, model)
+    try:
+        data = response.json()
+    except Exception as exc:
+        raise GeminiTtsError(
+            status=502,
+            code="PRO_TTS_INVALID_RESPONSE",
+            message="Gemini Pro TTS returned a non-JSON response.",
+            details=response.text[:1000],
+        ) from exc
+    return _extract_audio_bytes(data)
 
 
-def _build_tts_response(
-    *,
-    payload: Dict[str, Any],
-    requested: Dict[str, Any],
-    output_path: Path,
-    text: str,
-    engine_used: str,
-    model_used: str,
-    voice_used: Optional[str],
-    audio_format: str,
-    fallback_used: bool = False,
-    fallback_reason: Optional[str] = None,
-    speed_applied: bool = False,
-    speed_applied_value: Optional[str] = None,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    duration = _duration_seconds(output_path)
-    final_srt_text = _build_final_srt(text, total_duration=duration)
-    srt_filename, srt_url = _save_text_file(final_srt_text, "final", ".srt", SRT_DIR)
-    script_filename, script_url = _save_text_file(text, "final_script", ".txt", SCRIPT_DIR)
-    audio_url = _public_url(f"/tts/{output_path.name}")
+def _audio_to_pcm(audio_bytes: bytes, mime_type: str) -> Tuple[bytes, int, int, int]:
+    # Some SDK/API versions return a WAV container; REST commonly returns raw PCM.
+    if audio_bytes[:4] == b"RIFF" or "wav" in mime_type.lower():
+        with wave.open(io.BytesIO(audio_bytes), "rb") as source:
+            channels = source.getnchannels()
+            rate = source.getframerate()
+            width = source.getsampwidth()
+            frames = source.readframes(source.getnframes())
+        if channels != 1 or rate != 24000 or width != 2:
+            raise GeminiTtsError(
+                status=502,
+                code="PRO_TTS_UNEXPECTED_AUDIO_FORMAT",
+                message="Gemini Pro TTS returned an unsupported WAV format.",
+                details={"channels": channels, "rate": rate, "sample_width": width},
+            )
+        return frames, channels, rate, width
+    # Official REST examples describe 16-bit, mono, 24 kHz PCM output.
+    return audio_bytes, 1, 24000, 2
 
-    contract = {
-        "success": True,
+
+def _write_wav(path: Path, pcm: bytes, channels: int = 1, rate: int = 24000, width: int = 2) -> None:
+    with wave.open(str(path), "wb") as target:
+        target.setnchannels(channels)
+        target.setsampwidth(width)
+        target.setframerate(rate)
+        target.writeframes(pcm)
+
+
+def _normalize_pcm16(pcm: bytes, target_dbfs: float = -3.0) -> Tuple[bytes, float]:
+    if not pcm:
+        return pcm, 1.0
+    samples = array("h")
+    samples.frombytes(pcm)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    peak = max((abs(value) for value in samples), default=0)
+    if peak <= 0:
+        return pcm, 1.0
+    target_peak = max(1, int(32767 * (10 ** (target_dbfs / 20.0))))
+    gain = max(0.25, min(4.0, target_peak / float(peak)))
+    if abs(gain - 1.0) < 0.01:
+        return pcm, 1.0
+    for index, value in enumerate(samples):
+        scaled = int(round(value * gain))
+        samples[index] = max(-32768, min(32767, scaled))
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples.tobytes(), round(gain, 4)
+
+
+def _srt_time(seconds: float) -> str:
+    milliseconds = max(0, int(round(seconds * 1000)))
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, millis = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _script_cues(text: str) -> List[str]:
+    pieces = [piece.strip() for piece in re.split(r"(?<=[။.!?])\s+|\n+", text) if piece.strip()]
+    cues: List[str] = []
+    current = ""
+    for piece in pieces:
+        candidate = f"{current} {piece}".strip() if current else piece
+        if len(candidate) > 140 and current:
+            cues.append(current)
+            current = piece
+        else:
+            current = candidate
+    if current:
+        cues.append(current)
+    return cues or [text.strip()]
+
+
+def _build_estimated_srt(text: str, duration: float) -> str:
+    cues = _script_cues(text)
+    weights = [max(1, len(re.sub(r"\s+", "", cue))) for cue in cues]
+    total_weight = sum(weights)
+    current = 0.0
+    lines: List[str] = []
+    for index, (cue, weight) in enumerate(zip(cues, weights), start=1):
+        if index == len(cues):
+            end = duration
+        else:
+            end = current + duration * (weight / total_weight)
+        lines.extend([str(index), f"{_srt_time(current)} --> {_srt_time(end)}", cue, ""])
+        current = end
+    return "\n".join(lines).strip() + "\n"
+
+
+def _cleanup_old_outputs() -> None:
+    cutoff = time.time() - OUTPUT_TTL_SECONDS
+    for directory in (AUDIO_DIR, SRT_DIR, SCRIPT_DIR):
+        for path in directory.iterdir():
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _generate_gemini_output(payload: Dict[str, Any], *, model: str, fallback_used: bool = False, fallback_reason: Optional[str] = None) -> Dict[str, Any]:
+    raw_text = payload.get("text") or payload.get("final_script") or ""
+    text = _clean_script(str(raw_text))
+    if len(text) < 20:
+        raise GeminiTtsError(status=400, code="TEXT_REQUIRED", message="A final script of at least 20 characters is required.")
+    if len(text) > MAX_SCRIPT_CHARS:
+        raise GeminiTtsError(
+            status=413,
+            code="SCRIPT_TOO_LONG",
+            message=f"Script is too long. Maximum supported length is {MAX_SCRIPT_CHARS} characters.",
+        )
+
+    source = _resolve_api_source(payload)
+    key = _resolve_api_key(payload, source)
+    if not key:
+        code = "USER_GEMINI_KEY_REQUIRED" if source == "user" else "APP_GEMINI_KEY_MISSING"
+        message = "A Gemini API key is required for this request."
+        raise GeminiTtsError(status=400, code=code, message=message)
+
+    voice = _resolve_voice(payload)
+    speed = str(payload.get("speed") or "normal").lower()
+    tone = str(payload.get("tone") or "documentary").lower()
+    chunks = _split_long_text(text, MAX_CHUNK_CHARS)
+    all_pcm = bytearray()
+    chunk_gap = b"\x00\x00" * max(0, int(24000 * CHUNK_GAP_MS / 1000.0))
+    for chunk_index, chunk in enumerate(chunks):
+        raw_audio, mime = _call_gemini_tts(
+            model=model,
+            key=key,
+            text=chunk,
+            voice=voice,
+            speed=speed,
+            tone=tone,
+        )
+        pcm, channels, rate, width = _audio_to_pcm(raw_audio, mime)
+        if (channels, rate, width) != (1, 24000, 2):
+            raise GeminiTtsError(
+                status=502,
+                code="PRO_TTS_UNEXPECTED_AUDIO_FORMAT",
+                message="Gemini TTS returned incompatible audio chunks.",
+            )
+        if chunk_index > 0 and chunk_gap:
+            all_pcm.extend(chunk_gap)
+        all_pcm.extend(pcm)
+
+    normalized_pcm, normalization_gain = _normalize_pcm16(bytes(all_pcm), TARGET_PEAK_DBFS)
+
+    identifier = uuid.uuid4().hex[:16]
+    audio_name = f"final_audio_{identifier}.wav"
+    srt_name = f"final_{identifier}.srt"
+    script_name = f"final_script_{identifier}.txt"
+    audio_path = AUDIO_DIR / audio_name
+    srt_path = SRT_DIR / srt_name
+    script_path = SCRIPT_DIR / script_name
+
+    _write_wav(audio_path, normalized_pcm)
+    duration = len(normalized_pcm) / float(24000 * 2)
+    srt_text = _build_estimated_srt(text, duration)
+    srt_path.write_text(srt_text, encoding="utf-8")
+    script_path.write_text(text, encoding="utf-8")
+    _cleanup_old_outputs()
+
+    requested_model = _canonical_model(payload.get("model") or payload.get("voice_model"), str(payload.get("output_quality") or "pro"))
+    return {
         "ok": True,
-        "contract_version": V22_CONTRACT_VERSION,
-        **requested,
-        "engine_used": engine_used,
-        "actual_engine": engine_used,
-        "model_used": model_used,
-        "actual_model": model_used,
-        "voice_used": voice_used,
-        "actual_voice": voice_used,
+        "success": True,
+        "contract_version": CONTRACT_VERSION,
+        "engine_requested": "gemini_tts",
+        "engine_used": "gemini_tts",
+        "model_requested": requested_model,
+        "model_used": model,
+        "voice_requested": str(payload.get("voice_name") or payload.get("voice") or "Kore"),
+        "voice_used": voice,
         "fallback_used": fallback_used,
         "fallback_reason": fallback_reason,
-        "speed_applied": speed_applied,
-        "speed_applied_value": speed_applied_value,
-        "speed_note": (extra or {}).get("speed_note") or (
-            "Speed/rate was applied by the backend."
-            if speed_applied else
-            "Speed is currently recorded as a UI preference unless the backend explicitly reports speed_applied=true."
-        ),
-        "frontend_truth_hint": {
-            "show_requested_engine": requested["engine_requested"],
-            "show_actual_engine": engine_used,
-            "show_fallback_badge": fallback_used,
-            "show_speed_applied": speed_applied,
-        },
-        "engine": engine_used,
-        "source": engine_used,
-        "model": model_used,
-        "voice": voice_used,
-        "voice_name": voice_used,
-        "audio_url": audio_url,
-        "tts_audio_url": audio_url,
-        "download_url": f"{audio_url}?download_name=final-audio.{audio_format}",
-        "audio_filename": output_path.name,
-        "filename": output_path.name,
-        "audio_format": audio_format,
-        "audio_duration_seconds": duration,
-        "final_srt_text": final_srt_text,
-        "final_srt_url": srt_url,
-        "final_srt_filename": srt_filename,
-        "final_script_text": text,
-        "final_script_url": script_url,
-        "final_script_filename": script_filename,
-    }
-    if extra:
-        contract.update(extra)
-    return contract
-
-
-def _error_contract(payload: Dict[str, Any], requested: Dict[str, Any], message: str, status_code: int = 500) -> Tuple[Dict[str, Any], int]:
-    return {
-        "success": False,
-        "ok": False,
-        "error": message,
-        "message": message,
-        "contract_version": V22_CONTRACT_VERSION,
-        **requested,
-        "engine_used": "unknown",
-        "actual_engine": "unknown",
-        "model_used": None,
-        "actual_model": None,
-        "voice_used": None,
-        "actual_voice": None,
-        "fallback_used": False,
-        "fallback_reason": None,
+        "speed_requested": speed,
         "speed_applied": False,
-        "speed_applied_value": None,
-        "frontend_truth_hint": {
-            "show_requested_engine": requested.get("engine_requested"),
-            "show_actual_engine": "unknown",
-            "show_fallback_badge": False,
-            "show_speed_applied": False,
-        },
-    }, status_code
+        "speed_applied_value": "prompt-directed",
+        "speed_note": "Gemini TTS pace is prompt-directed; exact speed is not guaranteed.",
+        "tone_requested": tone,
+        "audio_format": "wav",
+        "audio_duration_seconds": round(duration, 3),
+        "audio_url": f"/v25-audio/{audio_name}",
+        "download_url": f"/v25-audio/{audio_name}",
+        "final_srt_url": f"/v25-srt/{srt_name}",
+        "final_script_url": f"/v25-script/{script_name}",
+        "final_srt_text": srt_text,
+        "final_script_text": text,
+        "chunk_count": len(chunks),
+        "chunk_gap_ms": CHUNK_GAP_MS,
+        "audio_normalized": True,
+        "normalization_gain": normalization_gain,
+        "target_peak_dbfs": TARGET_PEAK_DBFS,
+        "api_source_used": source,
+        "pro_paid_tier_required": model == PRO_MODEL,
+    }
 
 
-def _v22_tts_handler() -> Tuple[Dict[str, Any], int]:
-    payload = request.get_json(silent=True) or {}
-    text = _clean_script_for_srt(payload.get("text") or payload.get("script") or payload.get("finalScript") or "")
-    requested = _requested_from_payload(payload)
-
-    if not text:
-        return _error_contract(payload, requested, "Text is required for TTS.", 400)
-    if len(text) < 5:
-        return _error_contract(payload, requested, "Text is too short for TTS.", 400)
-
-    requested_engine = requested["engine_requested"]
+def _call_original_with_payload(payload: Dict[str, Any]):
+    old_json = getattr(request, "_cached_json", None)
+    old_data = getattr(request, "_cached_data", None)
     try:
-        if requested_engine == "gemini_tts":
+        request._cached_json = (payload, payload)  # Flask caches normal/silent get_json separately.
+        request._cached_data = json.dumps(payload).encode("utf-8")
+        return ORIGINAL_TTS_VIEW()
+    finally:
+        request._cached_json = old_json
+        request._cached_data = old_data
+
+
+def _explicit_edge_fallback(payload: Dict[str, Any], reason: str):
+    edge_payload = dict(payload)
+    edge_payload.update({
+        "engine": "edge_tts",
+        "voice_engine": "edge_tts",
+        "output_quality": "basic",
+        "quality_tier": "basic",
+        "model": None,
+        "voice_model": None,
+    })
+    raw_result = _call_original_with_payload(edge_payload)
+    response = app.make_response(raw_result)
+    data = response.get_json(silent=True)
+    if response.status_code < 400 and isinstance(data, dict):
+        data.update({
+            "contract_version": CONTRACT_VERSION,
+            "engine_requested": "gemini_tts",
+            "model_requested": PRO_MODEL,
+            "engine_used": data.get("engine_used") or data.get("engine") or "edge_tts",
+            "model_used": data.get("model_used") or data.get("model"),
+            "fallback_used": True,
+            "fallback_reason": reason,
+            "fallback_confirmed_by_user": True,
+        })
+        return jsonify(data), response.status_code
+    return raw_result
+
+
+def production_tts():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "success": False, "error_code": "INVALID_JSON", "error": "JSON object required."}), 400
+
+    if not _is_pro_request(payload):
+        return ORIGINAL_TTS_VIEW()
+
+    policy = _fallback_policy(payload)
+    try:
+        result = _generate_gemini_output(payload, model=PRO_MODEL)
+        return jsonify(result), 200
+    except GeminiTtsError as pro_error:
+        if policy == "premium":
             try:
-                output_path, meta = _generate_gemini_tts(text, payload, requested)
-                return _build_tts_response(
-                    payload=payload,
-                    requested=requested,
-                    output_path=output_path,
-                    text=text,
-                    engine_used="gemini_tts",
-                    model_used=meta.get("model_used") or requested["model_requested"],
-                    voice_used=meta.get("voice_used"),
-                    audio_format=meta.get("audio_format") or output_path.suffix.lstrip(".") or "wav",
-                    fallback_used=False,
-                    fallback_reason=None,
-                    speed_applied=bool(meta.get("speed_applied")),
-                    speed_applied_value=meta.get("speed_applied_value"),
-                    extra=meta,
-                ), 200
-            except Exception as gemini_exc:
-                # Production-safe fallback: generate usable Edge audio and truthfully report fallback.
-                output_path, meta = _generate_edge_tts(text, {**payload, "gender": payload.get("gender") or "male"}, requested)
-                fallback_reason = f"Gemini TTS failed, so Edge TTS fallback was used. Reason: {str(gemini_exc)[:240]}"
-                return _build_tts_response(
-                    payload=payload,
-                    requested=requested,
-                    output_path=output_path,
-                    text=text,
-                    engine_used="edge_tts",
-                    model_used=meta.get("model_used") or "edge_tts",
-                    voice_used=meta.get("voice_used"),
-                    audio_format=meta.get("audio_format") or "mp3",
+                result = _generate_gemini_output(
+                    payload,
+                    model=FLASH_MODEL,
                     fallback_used=True,
-                    fallback_reason=fallback_reason,
-                    speed_applied=bool(meta.get("speed_applied")),
-                    speed_applied_value=meta.get("speed_applied_value"),
-                    extra=meta,
-                ), 200
+                    fallback_reason=pro_error.code,
+                )
+                return jsonify(result), 200
+            except GeminiTtsError as flash_error:
+                return jsonify({
+                    "ok": False,
+                    "success": False,
+                    "contract_version": CONTRACT_VERSION,
+                    "error_code": flash_error.code,
+                    "error": flash_error.message,
+                    "details": flash_error.details,
+                    "engine_requested": "gemini_tts",
+                    "model_requested": PRO_MODEL,
+                    "fallback_attempted": "premium",
+                    "fallback_used": False,
+                }), flash_error.status
+        if policy == "edge":
+            return _explicit_edge_fallback(payload, pro_error.code)
 
-        # Basic / default Edge path.
-        output_path, meta = _generate_edge_tts(text, payload, requested)
-        return _build_tts_response(
-            payload=payload,
-            requested=requested,
-            output_path=output_path,
-            text=text,
-            engine_used="edge_tts",
-            model_used=meta.get("model_used") or "edge_tts",
-            voice_used=meta.get("voice_used"),
-            audio_format=meta.get("audio_format") or "mp3",
-            fallback_used=False,
-            fallback_reason=None,
-            speed_applied=bool(meta.get("speed_applied")),
-            speed_applied_value=meta.get("speed_applied_value"),
-            extra=meta,
-        ), 200
-    except Exception as exc:
-        result, code = _error_contract(payload, requested, "The backend failed while generating voice-over audio.", 500)
-        result["detail"] = str(exc)
-        result["debug_trace"] = traceback.format_exc() if os.getenv("V22_DEBUG_TRACE") == "true" else None
-        return result, code
-
-
-def _find_original_tts_view():
-    for rule in list(app.url_map.iter_rules()):
-        if rule.rule == "/tts" and "POST" in rule.methods:
-            endpoint = rule.endpoint
-            original = app.view_functions.get(endpoint)
-            return endpoint, original
-    return None, None
+        status = pro_error.status
+        return jsonify({
+            "ok": False,
+            "success": False,
+            "contract_version": CONTRACT_VERSION,
+            "error_code": pro_error.code,
+            "error": pro_error.message,
+            "details": pro_error.details,
+            "engine_requested": "gemini_tts",
+            "model_requested": PRO_MODEL,
+            "fallback_used": False,
+            "fallback_allowed": ["premium", "edge"],
+            "requires_user_confirmation": True,
+            "suggested_action": "Enable billing for the selected Gemini API project, retry Pro, or explicitly choose Premium/Edge fallback.",
+        }), status
 
 
-_ORIGINAL_TTS_ENDPOINT, _ORIGINAL_TTS_VIEW = _find_original_tts_view()
+# Replace existing POST /tts implementation.
+app.view_functions[ORIGINAL_TTS_ENDPOINT] = production_tts
 
 
-def v22_tts_route(*args, **kwargs):  # type: ignore[no-untyped-def]
-    data, status_code = _v22_tts_handler()
-    return jsonify(data), status_code
+@app.get("/v25-health")
+def v25_health():
+    return jsonify({
+        "ok": True,
+        "success": True,
+        "name": "VoiceCraft Myanmar Backend",
+        "version": CONTRACT_VERSION,
+        "base_module": BASE_MODULE_NAME,
+        "tts_wrapped": True,
+        "pro_model": PRO_MODEL,
+        "flash_model": FLASH_MODEL,
+        "app_key_configured": bool(_resolve_api_key({}, "app")),
+        "silent_fallback": False,
+    })
 
 
-if _ORIGINAL_TTS_ENDPOINT:
-    app.view_functions[_ORIGINAL_TTS_ENDPOINT] = v22_tts_route
-else:
-    app.add_url_rule("/tts", "v22_tts_route", v22_tts_route, methods=["POST"])
-
-
-# Add safe static routes only when legacy app lacks them.
-def _has_route(rule_path: str) -> bool:
-    return any(rule.rule == rule_path for rule in app.url_map.iter_rules())
-
-
-if not _has_route("/tts/<path:filename>"):
-    @app.get("/tts/<path:filename>")
-    def v22_serve_tts(filename: str):
-        safe_filename = Path(filename).name
-        mime = mimetypes.guess_type(safe_filename)[0] or "audio/mpeg"
-        return send_from_directory(TTS_DIR, safe_filename, mimetype=mime, as_attachment=True, download_name=safe_filename, max_age=0)
-
-if not _has_route("/srt/<path:filename>"):
-    @app.get("/srt/<path:filename>")
-    def v22_serve_srt(filename: str):
-        safe_filename = Path(filename).name
-        return send_from_directory(SRT_DIR, safe_filename, mimetype="text/plain; charset=utf-8", as_attachment=True, download_name=safe_filename, max_age=0)
-
-if not _has_route("/script/<path:filename>"):
-    @app.get("/script/<path:filename>")
-    def v22_serve_script(filename: str):
-        safe_filename = Path(filename).name
-        return send_from_directory(SCRIPT_DIR, safe_filename, mimetype="text/plain; charset=utf-8", as_attachment=True, download_name=safe_filename, max_age=0)
-
-
-@app.get("/v22-capabilities")
-def v22_capabilities():
-    return jsonify(
-        {
-            "ok": True,
-            "success": True,
-            "contract_version": V22_CONTRACT_VERSION,
-            "backend_wrapper": "contract_app.py",
-            "legacy_app_imported": True,
-            "tts_wrapped": True,
-            "providers_allowed": ["edge_tts", "gemini_tts"],
-            "providers_removed_from_product_ui": [
-                "iamhc",
-                "openrouter",
-                "qwen",
-                "deepseek",
-                "stepaudio",
-                "voice_clone",
-                "ollama",
-            ],
-            "voice_tiers": {
-                "basic": {"engine": "edge_tts", "speed_supported": True, "speed_mode": "edge_rate"},
-                "premium": {"engine": "gemini_tts", "fallback": "edge_tts", "speed_supported": "prompt_only"},
-                "pro": {"engine": "gemini_tts", "fallback": "edge_tts", "speed_supported": "prompt_only"},
+@app.get("/v25-capabilities")
+def v25_capabilities():
+    return jsonify({
+        "ok": True,
+        "version": CONTRACT_VERSION,
+        "engines": {
+            "basic": {"engine": "edge_tts", "format": "mp3", "status": "stable"},
+            "premium": {"engine": "gemini_tts", "model": FLASH_MODEL, "format": "wav", "free_tier_possible": True},
+            "pro": {
+                "engine": "gemini_tts",
+                "model": PRO_MODEL,
+                "format": "wav",
+                "paid_tier_required": True,
+                "free_tier_available": False,
+                "status": "requires_billed_project",
             },
-            "gemini": {
-                "app_key_configured": bool(os.getenv("GEMINI_APP_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")),
-                "flash_model_default": os.getenv("GEMINI_TTS_FLASH_MODEL", "gemini-2.5-flash-preview-tts"),
-                "pro_model_default": os.getenv("GEMINI_TTS_PRO_MODEL", "gemini-2.5-pro-preview-tts"),
-                "voice_default": os.getenv("GEMINI_TTS_VOICE_NAME", "Kore"),
-            },
-            "truth_contract_fields": [
-                "engine_requested",
-                "engine_used",
-                "model_requested",
-                "model_used",
-                "voice_used",
-                "fallback_used",
-                "fallback_reason",
-                "speed_requested",
-                "speed_applied",
-            ],
-            "notes": [
-                "V23.1 replaces /tts with Edge/Gemini-only generation and adds browser CORS/OPTIONS support.",
-                "Edge speed is applied with edge-tts rate control.",
-                "Gemini speed is requested through prompt direction; exact speed is not guaranteed.",
-                "It does not change /extract-srt, /translate-srt, or /rewrite-options.",
-            ],
-        }
-    )
+        },
+        "fallback": {
+            "default": "none",
+            "requires_user_confirmation": True,
+            "supported_policies": ["none", "premium", "edge"],
+        },
+        "voices": sorted(VALID_GEMINI_VOICES),
+        "byok_supported": True,
+        "audio_processing": {
+            "chunk_gap_ms": CHUNK_GAP_MS,
+            "normalization": True,
+            "target_peak_dbfs": TARGET_PEAK_DBFS,
+        },
+    })
 
 
-@app.get("/v22-health")
-def v22_health():
-    return jsonify(
-        {
-            "ok": True,
-            "success": True,
-            "contract_version": V22_CONTRACT_VERSION,
-            "legacy_app_imported": True,
-            "tts_wrapped": True,
-            "original_tts_endpoint": _ORIGINAL_TTS_ENDPOINT,
-            "gemini_app_key_configured": bool(os.getenv("GEMINI_APP_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")),
-        }
-    )
+@app.get("/v25-audio/<path:filename>")
+def v25_audio(filename: str):
+    return send_from_directory(AUDIO_DIR, filename, mimetype="audio/wav", as_attachment=False, max_age=0)
 
 
-@app.get("/v23-health")
-def v23_health():
-    return jsonify(
-        {
-            "ok": True,
-            "success": True,
-            "contract_version": V22_CONTRACT_VERSION,
-            "cors_enabled": True,
-            "allowed_exact_origins": sorted(_ALLOWED_EXACT_ORIGINS),
-            "allowed_suffixes": list(_ALLOWED_SUFFIXES),
-            "legacy_app_imported": True,
-            "tts_wrapped": True,
-            "gemini_app_key_configured": bool(os.getenv("GEMINI_APP_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")),
-            "notes": [
-                "Browser OPTIONS preflight returns 204 with CORS headers.",
-                "Use this route to confirm V23.1 is deployed after Railway redeploy.",
-            ],
-        }
-    )
+@app.get("/v25-srt/<path:filename>")
+def v25_srt(filename: str):
+    return send_from_directory(SRT_DIR, filename, mimetype="application/x-subrip", as_attachment=False, max_age=0)
 
 
-@app.get("/v23-capabilities")
-def v23_capabilities():
-    return jsonify(
-        {
-            "ok": True,
-            "success": True,
-            "contract_version": V22_CONTRACT_VERSION,
-            "frontend_domain_supported": "v15r.vercel.app",
-            "cors_enabled": True,
-            "preflight_supported": True,
-            "tts_truth_contract": True,
-            "providers_allowed": ["edge_tts", "gemini_tts"],
-            "providers_removed_from_product_ui": [
-                "iamhc",
-                "openrouter",
-                "qwen",
-                "deepseek",
-                "stepaudio",
-                "voice_clone",
-                "ollama",
-            ],
-            "endpoints_preserved": [
-                "/extract-srt",
-                "/translate-srt",
-                "/rewrite-options",
-                "/tts",
-            ],
-            "recommended_frontend_version": "V23.2",
-        }
-    )
+@app.get("/v25-script/<path:filename>")
+def v25_script(filename: str):
+    return send_from_directory(SCRIPT_DIR, filename, mimetype="text/plain; charset=utf-8", as_attachment=False, max_age=0)
 
 
-@app.get("/v23-cors-test")
-def v23_cors_test():
-    return jsonify(
-        {
-            "ok": True,
-            "success": True,
-            "contract_version": V22_CONTRACT_VERSION,
-            "origin_received": request.headers.get("Origin"),
-            "message": "CORS headers are attached by after_request.",
-        }
-    )
+def production_root():
+    return jsonify({
+        "ok": True,
+        "success": True,
+        "name": "VoiceCraft Myanmar Backend",
+        "version": CONTRACT_VERSION,
+        "status": "production-candidate",
+        "endpoints": [
+            "GET /health",
+            "GET /v25-health",
+            "GET /v25-capabilities",
+            "POST /extract-srt",
+            "POST /translate-srt",
+            "POST /rewrite-options",
+            "POST /tts",
+        ],
+    })
+
+
+def production_health():
+    return v25_health()
+
+
+_replace_view("/", "GET", production_root)
+_replace_view("/health", "GET", production_health)
+
+
+if not _bool(os.getenv("ENABLE_DEBUG_ENDPOINTS"), False):
+    def disabled_debug_endpoint(*_args: Any, **_kwargs: Any):
+        return jsonify({"ok": False, "error": "Debug endpoints are disabled in production."}), 404
+
+    _replace_view("/debug-iamhc-model-test", "POST", disabled_debug_endpoint)
+
+
+@app.after_request
+def production_headers(response: Response):
+    origin = request.headers.get("Origin", "")
+    if origin and origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+        response.headers.setdefault("Access-Control-Allow-Headers", "Content-Type")
+        response.headers.setdefault("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    if request.path.startswith("/v25-"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
+if __name__ == "__main__":  # pragma: no cover
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
