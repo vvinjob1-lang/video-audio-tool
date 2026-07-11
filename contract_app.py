@@ -34,7 +34,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import requests
 from flask import Flask, Response, jsonify, request, send_from_directory
 
-CONTRACT_VERSION = "v25.2-edge-local-normalization-fix"
+CONTRACT_VERSION = "v25.3-edge-speed-truth-finalization"
 PRO_MODEL = os.getenv("GEMINI_PRO_TTS_MODEL", "gemini-2.5-pro-preview-tts")
 FLASH_MODEL = os.getenv("GEMINI_FLASH_TTS_MODEL", "gemini-2.5-flash-preview-tts")
 OUTPUT_ROOT = Path(os.getenv("VOICECRAFT_OUTPUT_ROOT", "/tmp/voicecraft_v25"))
@@ -50,6 +50,11 @@ TARGET_PEAK_DBFS = float(os.getenv("VOICECRAFT_TARGET_PEAK_DBFS", "-3.0"))
 NORMALIZE_EDGE_AUDIO = _EDGE_NORMALIZE_DEFAULT = os.getenv("VOICECRAFT_NORMALIZE_EDGE_AUDIO", "true").strip().lower() in {"1", "true", "yes", "on"}
 EDGE_TARGET_LUFS = float(os.getenv("VOICECRAFT_EDGE_TARGET_LUFS", "-17.0"))
 EDGE_TARGET_TRUE_PEAK = float(os.getenv("VOICECRAFT_EDGE_TARGET_TRUE_PEAK", "-2.0"))
+EDGE_SPEED_PERCENT = {
+    "slow": float(os.getenv("VOICECRAFT_EDGE_SLOW_PERCENT", "-15")),
+    "normal": float(os.getenv("VOICECRAFT_EDGE_NORMAL_PERCENT", "0")),
+    "fast": float(os.getenv("VOICECRAFT_EDGE_FAST_PERCENT", "15")),
+}
 ALLOWED_ORIGINS = {
     origin.strip()
     for origin in os.getenv(
@@ -708,6 +713,78 @@ def _fetch_generated_audio(url: str) -> Tuple[bytes, str]:
     return response.content, str(response.headers.get("Content-Type") or "audio/mpeg")
 
 
+
+def _parse_rate_percent(value: Any) -> float:
+    """Parse Edge rate values such as '+15%', '-10%', '15', or None."""
+    if value is None:
+        return 0.0
+    match = re.search(r"([+-]?\d+(?:\.\d+)?)", str(value))
+    if not match:
+        return 0.0
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return 0.0
+
+
+def _resolve_requested_edge_speed(payload: Dict[str, Any]) -> Tuple[str, float]:
+    raw = str(payload.get("speed") or "normal").strip().lower()
+    if raw in EDGE_SPEED_PERCENT:
+        return raw, EDGE_SPEED_PERCENT[raw]
+
+    # Optional custom multiplier support (for example 1.10x).
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)x", raw)
+    if match:
+        multiplier = max(0.8, min(1.2, float(match.group(1))))
+        return raw, (multiplier - 1.0) * 100.0
+
+    try:
+        multiplier = float(payload.get("speed_multiplier"))
+        multiplier = max(0.8, min(1.2, multiplier))
+        return f"{multiplier:.2f}x", (multiplier - 1.0) * 100.0
+    except (TypeError, ValueError):
+        return "normal", EDGE_SPEED_PERCENT["normal"]
+
+
+def _probe_audio_duration(path: Path) -> Optional[float]:
+    ffprobe_path = shutil.which("ffprobe")
+    if not ffprobe_path:
+        return None
+    completed = subprocess.run(
+        [
+            ffprobe_path,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        return None
+    try:
+        return float(completed.stdout.strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _edge_speed_adjustment(data: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    speed_name, desired_percent = _resolve_requested_edge_speed(payload)
+    base_percent = _parse_rate_percent(data.get("rate"))
+    base_multiplier = max(0.1, 1.0 + base_percent / 100.0)
+    desired_multiplier = max(0.1, 1.0 + desired_percent / 100.0)
+    atempo_factor = max(0.5, min(2.0, desired_multiplier / base_multiplier))
+    data.update({
+        "speed_requested": speed_name,
+        "edge_base_rate_percent": round(base_percent, 3),
+        "edge_target_rate_percent": round(desired_percent, 3),
+        "edge_atempo_factor": round(atempo_factor, 6),
+    })
+    return data
+
+
 def _normalize_edge_result(raw_result: Any, payload: Dict[str, Any]):
     response = app.make_response(raw_result)
     data = response.get_json(silent=True)
@@ -715,16 +792,37 @@ def _normalize_edge_result(raw_result: Any, payload: Dict[str, Any]):
         return raw_result
 
     data = _edge_truth_contract(data, payload)
-    if not NORMALIZE_EDGE_AUDIO:
-        data["audio_normalized"] = False
-        data["normalization_note"] = "Edge normalization disabled by configuration."
-        return jsonify(data), response.status_code
+    data = _edge_speed_adjustment(data, payload)
+
+    desired_percent = float(data["edge_target_rate_percent"])
+    base_percent = float(data["edge_base_rate_percent"])
+    atempo_factor = float(data["edge_atempo_factor"])
+    base_speed_matches = abs(desired_percent - base_percent) < 0.5
+    needs_speed_adjustment = not base_speed_matches
 
     ffmpeg_path = shutil.which("ffmpeg")
     audio_url = str(data.get("audio_url") or data.get("download_url") or "")
+
     if not ffmpeg_path or not audio_url:
         data["audio_normalized"] = False
+        data["speed_applied"] = base_speed_matches
+        data["speed_applied_value"] = (
+            data["speed_requested"] if base_speed_matches else "not-applied"
+        )
+        data["speed_note"] = (
+            "Edge speed already matched the requested rate."
+            if base_speed_matches
+            else "ffmpeg or generated audio URL unavailable; requested Edge speed could not be corrected."
+        )
         data["normalization_note"] = "ffmpeg or generated audio URL unavailable; original Edge audio returned."
+        return jsonify(data), response.status_code
+
+    if not NORMALIZE_EDGE_AUDIO and not needs_speed_adjustment:
+        data["audio_normalized"] = False
+        data["speed_applied"] = True
+        data["speed_applied_value"] = data["speed_requested"]
+        data["speed_note"] = f"Edge TTS rate applied: {desired_percent:+.0f}%."
+        data["normalization_note"] = "Edge normalization disabled by configuration."
         return jsonify(data), response.status_code
 
     try:
@@ -732,35 +830,88 @@ def _normalize_edge_result(raw_result: Any, payload: Dict[str, Any]):
         identifier = uuid.uuid4().hex[:16]
         output_name = f"final_audio_{identifier}.mp3"
         output_path = AUDIO_DIR / output_name
+
+        filters: List[str] = []
+        if needs_speed_adjustment:
+            filters.append(f"atempo={atempo_factor:.6f}")
+        if NORMALIZE_EDGE_AUDIO:
+            filters.append(
+                f"loudnorm=I={EDGE_TARGET_LUFS}:TP={EDGE_TARGET_TRUE_PEAK}:LRA=7"
+            )
+
         with tempfile.TemporaryDirectory(prefix="voicecraft_edge_") as temp_dir:
             source_path = Path(temp_dir) / "source_audio"
             source_path.write_bytes(audio_bytes)
             command = [
                 ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
                 "-i", str(source_path),
-                "-af", f"loudnorm=I={EDGE_TARGET_LUFS}:TP={EDGE_TARGET_TRUE_PEAK}:LRA=7",
+            ]
+            if filters:
+                command.extend(["-af", ",".join(filters)])
+            command.extend([
                 "-ar", "24000", "-ac", "1", "-b:a", "64k",
                 str(output_path),
-            ]
+            ])
             completed = subprocess.run(command, capture_output=True, text=True, timeout=180)
             if completed.returncode != 0 or not output_path.exists():
-                raise RuntimeError((completed.stderr or "ffmpeg normalization failed")[-1000:])
+                raise RuntimeError((completed.stderr or "ffmpeg Edge processing failed")[-1000:])
+
+        duration = _probe_audio_duration(output_path)
+        if duration is None:
+            original_duration = float(data.get("audio_duration_seconds") or 0.0)
+            duration = original_duration / atempo_factor if original_duration > 0 else None
+
+        script_text = _clean_script(
+            str(data.get("final_script_text") or payload.get("text") or payload.get("final_script") or "")
+        )
+        if duration and script_text:
+            srt_name = f"final_{identifier}.srt"
+            srt_path = SRT_DIR / srt_name
+            srt_text = _build_estimated_srt(script_text, duration)
+            srt_path.write_text(srt_text, encoding="utf-8")
+            data.update({
+                "final_srt_url": f"/v25-srt/{srt_name}",
+                "final_srt_text": srt_text,
+            })
 
         data.update({
             "audio_url": f"/v25-audio/{output_name}",
             "download_url": f"/v25-audio/{output_name}",
             "audio_format": "mp3",
             "actual_format": "mp3",
-            "audio_normalized": True,
-            "normalization_note": f"Edge audio normalized to approximately {EDGE_TARGET_LUFS} LUFS.",
-            "normalization_target_lufs": EDGE_TARGET_LUFS,
-            "normalization_true_peak_dbfs": EDGE_TARGET_TRUE_PEAK,
+            "audio_normalized": bool(NORMALIZE_EDGE_AUDIO),
+            "normalization_note": (
+                f"Edge audio normalized to approximately {EDGE_TARGET_LUFS} LUFS."
+                if NORMALIZE_EDGE_AUDIO
+                else "Edge normalization disabled by configuration."
+            ),
+            "normalization_target_lufs": EDGE_TARGET_LUFS if NORMALIZE_EDGE_AUDIO else None,
+            "normalization_true_peak_dbfs": EDGE_TARGET_TRUE_PEAK if NORMALIZE_EDGE_AUDIO else None,
+            "speed_applied": True,
+            "speed_applied_value": data["speed_requested"],
+            "speed_note": (
+                f"Edge speed corrected from {base_percent:+.0f}% to {desired_percent:+.0f}%."
+                if needs_speed_adjustment
+                else f"Edge TTS rate already matched {desired_percent:+.0f}%."
+            ),
+            "rate": f"{desired_percent:+.0f}%",
         })
+        if duration is not None:
+            data["audio_duration_seconds"] = round(duration, 3)
     except Exception as exc:
-        LOGGER.warning("Edge normalization skipped: %s", exc)
+        LOGGER.warning("Edge processing skipped: %s", exc)
         data["audio_normalized"] = False
-        data["normalization_note"] = "Edge normalization failed; original generated audio returned."
+        data["normalization_note"] = "Edge processing failed; original generated audio returned."
         data["normalization_error"] = str(exc)[:300]
+        data["speed_applied"] = base_speed_matches
+        data["speed_applied_value"] = (
+            data["speed_requested"] if base_speed_matches else "not-applied"
+        )
+        data["speed_note"] = (
+            f"Original Edge rate matched {desired_percent:+.0f}%."
+            if base_speed_matches
+            else f"Requested {desired_percent:+.0f}% but original Edge rate was {base_percent:+.0f}%."
+        )
     return jsonify(data), response.status_code
 
 
@@ -880,6 +1031,7 @@ def v25_health():
         "edge_normalization_enabled": NORMALIZE_EDGE_AUDIO,
         "ffmpeg_found": bool(shutil.which("ffmpeg")),
         "edge_internal_audio_fetch_fix": True,
+        "edge_speed_truth_fix": True,
     })
 
 
@@ -914,6 +1066,8 @@ def v25_capabilities():
             "edge_normalization_enabled": NORMALIZE_EDGE_AUDIO,
             "edge_target_lufs": EDGE_TARGET_LUFS,
             "edge_true_peak_dbfs": EDGE_TARGET_TRUE_PEAK,
+            "edge_speed_presets_percent": EDGE_SPEED_PERCENT,
+            "edge_speed_truth_fix": True,
         },
     })
 
