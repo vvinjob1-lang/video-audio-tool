@@ -21,6 +21,9 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 import uuid
 import wave
@@ -30,7 +33,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import requests
 from flask import Flask, Response, jsonify, request, send_from_directory
 
-CONTRACT_VERSION = "v25.0-production-pro-tts-lock"
+CONTRACT_VERSION = "v25.1-premium-pro-tts-edge-normalization"
 PRO_MODEL = os.getenv("GEMINI_PRO_TTS_MODEL", "gemini-2.5-pro-preview-tts")
 FLASH_MODEL = os.getenv("GEMINI_FLASH_TTS_MODEL", "gemini-2.5-flash-preview-tts")
 OUTPUT_ROOT = Path(os.getenv("VOICECRAFT_OUTPUT_ROOT", "/tmp/voicecraft_v25"))
@@ -43,6 +46,9 @@ GOOGLE_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TTS_TIMEOUT_SECONDS", "240"))
 OUTPUT_TTL_SECONDS = int(os.getenv("VOICECRAFT_OUTPUT_TTL_SECONDS", "86400"))
 CHUNK_GAP_MS = int(os.getenv("GEMINI_TTS_CHUNK_GAP_MS", "180"))
 TARGET_PEAK_DBFS = float(os.getenv("VOICECRAFT_TARGET_PEAK_DBFS", "-3.0"))
+NORMALIZE_EDGE_AUDIO = _EDGE_NORMALIZE_DEFAULT = os.getenv("VOICECRAFT_NORMALIZE_EDGE_AUDIO", "true").strip().lower() in {"1", "true", "yes", "on"}
+EDGE_TARGET_LUFS = float(os.getenv("VOICECRAFT_EDGE_TARGET_LUFS", "-17.0"))
+EDGE_TARGET_TRUE_PEAK = float(os.getenv("VOICECRAFT_EDGE_TARGET_TRUE_PEAK", "-2.0"))
 ALLOWED_ORIGINS = {
     origin.strip()
     for origin in os.getenv(
@@ -183,6 +189,13 @@ def _is_pro_request(payload: Dict[str, Any]) -> bool:
     model = _canonical_model(payload.get("model") or payload.get("voice_model"), tier)
     engine = str(payload.get("engine") or payload.get("voice_engine") or "").lower()
     return tier == "pro" or model == PRO_MODEL or ("pro" in model and engine == "gemini_tts")
+
+
+def _is_gemini_request(payload: Dict[str, Any]) -> bool:
+    tier = str(payload.get("output_quality") or payload.get("quality_tier") or "").lower()
+    engine = str(payload.get("engine") or payload.get("voice_engine") or "").lower()
+    model = str(payload.get("model") or payload.get("voice_model") or "").lower()
+    return engine in {"gemini_tts", "gemini", "gemini_tts_app"} or "gemini" in model or tier == "pro"
 
 
 def _fallback_policy(payload: Dict[str, Any]) -> str:
@@ -629,7 +642,96 @@ def _call_original_with_payload(payload: Dict[str, Any]):
         request._cached_data = old_data
 
 
-def _explicit_edge_fallback(payload: Dict[str, Any], reason: str):
+def _edge_truth_contract(data: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    requested_engine = str(payload.get("engine") or payload.get("voice_engine") or "edge_tts")
+    requested_model = payload.get("model") or payload.get("voice_model")
+    actual_engine = data.get("engine_used") or data.get("engine") or "edge_tts"
+    actual_model = data.get("model_used") or data.get("model")
+    actual_format = str(data.get("audio_format") or "mp3").lower()
+    data.update({
+        "contract_version": CONTRACT_VERSION,
+        "engine_requested": requested_engine,
+        "model_requested": requested_model,
+        "engine_used": actual_engine,
+        "model_used": actual_model,
+        "audio_format": actual_format,
+        "actual_format": actual_format,
+        "fallback_used": bool(data.get("fallback_used", False)),
+    })
+    return data
+
+
+def _fetch_generated_audio(url: str) -> Tuple[bytes, str]:
+    if not url:
+        raise RuntimeError("Missing generated audio URL")
+    if url.startswith("/"):
+        with app.test_client() as client:
+            response = client.get(url)
+            if response.status_code >= 400:
+                raise RuntimeError(f"Could not read generated audio: HTTP {response.status_code}")
+            return bytes(response.data), str(response.mimetype or "audio/mpeg")
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    return response.content, str(response.headers.get("Content-Type") or "audio/mpeg")
+
+
+def _normalize_edge_result(raw_result: Any, payload: Dict[str, Any]):
+    response = app.make_response(raw_result)
+    data = response.get_json(silent=True)
+    if response.status_code >= 400 or not isinstance(data, dict):
+        return raw_result
+
+    data = _edge_truth_contract(data, payload)
+    if not NORMALIZE_EDGE_AUDIO:
+        data["audio_normalized"] = False
+        data["normalization_note"] = "Edge normalization disabled by configuration."
+        return jsonify(data), response.status_code
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    audio_url = str(data.get("audio_url") or data.get("download_url") or "")
+    if not ffmpeg_path or not audio_url:
+        data["audio_normalized"] = False
+        data["normalization_note"] = "ffmpeg or generated audio URL unavailable; original Edge audio returned."
+        return jsonify(data), response.status_code
+
+    try:
+        audio_bytes, _mime = _fetch_generated_audio(audio_url)
+        identifier = uuid.uuid4().hex[:16]
+        output_name = f"final_audio_{identifier}.mp3"
+        output_path = AUDIO_DIR / output_name
+        with tempfile.TemporaryDirectory(prefix="voicecraft_edge_") as temp_dir:
+            source_path = Path(temp_dir) / "source_audio"
+            source_path.write_bytes(audio_bytes)
+            command = [
+                ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(source_path),
+                "-af", f"loudnorm=I={EDGE_TARGET_LUFS}:TP={EDGE_TARGET_TRUE_PEAK}:LRA=7",
+                "-ar", "24000", "-ac", "1", "-b:a", "64k",
+                str(output_path),
+            ]
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=180)
+            if completed.returncode != 0 or not output_path.exists():
+                raise RuntimeError((completed.stderr or "ffmpeg normalization failed")[-1000:])
+
+        data.update({
+            "audio_url": f"/v25-audio/{output_name}",
+            "download_url": f"/v25-audio/{output_name}",
+            "audio_format": "mp3",
+            "actual_format": "mp3",
+            "audio_normalized": True,
+            "normalization_note": f"Edge audio normalized to approximately {EDGE_TARGET_LUFS} LUFS.",
+            "normalization_target_lufs": EDGE_TARGET_LUFS,
+            "normalization_true_peak_dbfs": EDGE_TARGET_TRUE_PEAK,
+        })
+    except Exception as exc:
+        LOGGER.warning("Edge normalization skipped: %s", exc)
+        data["audio_normalized"] = False
+        data["normalization_note"] = "Edge normalization failed; original generated audio returned."
+        data["normalization_error"] = str(exc)[:300]
+    return jsonify(data), response.status_code
+
+
+def _explicit_edge_fallback(payload: Dict[str, Any], reason: str, requested_model: str):
     edge_payload = dict(payload)
     edge_payload.update({
         "engine": "edge_tts",
@@ -639,14 +741,14 @@ def _explicit_edge_fallback(payload: Dict[str, Any], reason: str):
         "model": None,
         "voice_model": None,
     })
-    raw_result = _call_original_with_payload(edge_payload)
-    response = app.make_response(raw_result)
+    normalized = _normalize_edge_result(_call_original_with_payload(edge_payload), edge_payload)
+    response = app.make_response(normalized)
     data = response.get_json(silent=True)
     if response.status_code < 400 and isinstance(data, dict):
         data.update({
             "contract_version": CONTRACT_VERSION,
             "engine_requested": "gemini_tts",
-            "model_requested": PRO_MODEL,
+            "model_requested": requested_model,
             "engine_used": data.get("engine_used") or data.get("engine") or "edge_tts",
             "model_used": data.get("model_used") or data.get("model"),
             "fallback_used": True,
@@ -654,7 +756,7 @@ def _explicit_edge_fallback(payload: Dict[str, Any], reason: str):
             "fallback_confirmed_by_user": True,
         })
         return jsonify(data), response.status_code
-    return raw_result
+    return normalized
 
 
 def production_tts():
@@ -662,21 +764,27 @@ def production_tts():
     if not isinstance(payload, dict):
         return jsonify({"ok": False, "success": False, "error_code": "INVALID_JSON", "error": "JSON object required."}), 400
 
-    if not _is_pro_request(payload):
-        return ORIGINAL_TTS_VIEW()
+    # Edge remains the stable base-engine path, but V25.1 normalizes its output.
+    if not _is_gemini_request(payload):
+        return _normalize_edge_result(ORIGINAL_TTS_VIEW(), payload)
 
+    tier = str(payload.get("output_quality") or payload.get("quality_tier") or "premium").lower()
+    requested_model = _canonical_model(payload.get("model") or payload.get("voice_model"), tier)
+    primary_model = PRO_MODEL if _is_pro_request(payload) else FLASH_MODEL
     policy = _fallback_policy(payload)
+
     try:
-        result = _generate_gemini_output(payload, model=PRO_MODEL)
+        result = _generate_gemini_output(payload, model=primary_model)
         return jsonify(result), 200
-    except GeminiTtsError as pro_error:
-        if policy == "premium":
+    except GeminiTtsError as primary_error:
+        # Pro may explicitly fall back to Premium Flash. Premium has no same-tier retry fallback.
+        if primary_model == PRO_MODEL and policy == "premium":
             try:
                 result = _generate_gemini_output(
                     payload,
                     model=FLASH_MODEL,
                     fallback_used=True,
-                    fallback_reason=pro_error.code,
+                    fallback_reason=primary_error.code,
                 )
                 return jsonify(result), 200
             except GeminiTtsError as flash_error:
@@ -688,28 +796,33 @@ def production_tts():
                     "error": flash_error.message,
                     "details": flash_error.details,
                     "engine_requested": "gemini_tts",
-                    "model_requested": PRO_MODEL,
+                    "model_requested": requested_model,
                     "fallback_attempted": "premium",
                     "fallback_used": False,
                 }), flash_error.status
-        if policy == "edge":
-            return _explicit_edge_fallback(payload, pro_error.code)
 
-        status = pro_error.status
+        if policy == "edge":
+            return _explicit_edge_fallback(payload, primary_error.code, requested_model)
+
+        allowed = ["edge"] if primary_model == FLASH_MODEL else ["premium", "edge"]
         return jsonify({
             "ok": False,
             "success": False,
             "contract_version": CONTRACT_VERSION,
-            "error_code": pro_error.code,
-            "error": pro_error.message,
-            "details": pro_error.details,
+            "error_code": primary_error.code,
+            "error": primary_error.message,
+            "details": primary_error.details,
             "engine_requested": "gemini_tts",
-            "model_requested": PRO_MODEL,
+            "model_requested": requested_model,
             "fallback_used": False,
-            "fallback_allowed": ["premium", "edge"],
+            "fallback_allowed": allowed,
             "requires_user_confirmation": True,
-            "suggested_action": "Enable billing for the selected Gemini API project, retry Pro, or explicitly choose Premium/Edge fallback.",
-        }), status
+            "suggested_action": (
+                "Retry Gemini, or explicitly choose Edge fallback."
+                if primary_model == FLASH_MODEL
+                else "Enable billing, retry Pro, or explicitly choose Premium/Edge fallback."
+            ),
+        }), primary_error.status
 
 
 # Replace existing POST /tts implementation.
@@ -729,6 +842,10 @@ def v25_health():
         "flash_model": FLASH_MODEL,
         "app_key_configured": bool(_resolve_api_key({}, "app")),
         "silent_fallback": False,
+        "premium_flash_wrapped": True,
+        "pro_tts_wrapped": True,
+        "edge_normalization_enabled": NORMALIZE_EDGE_AUDIO,
+        "ffmpeg_found": bool(shutil.which("ffmpeg")),
     })
 
 
@@ -760,13 +877,17 @@ def v25_capabilities():
             "chunk_gap_ms": CHUNK_GAP_MS,
             "normalization": True,
             "target_peak_dbfs": TARGET_PEAK_DBFS,
+            "edge_normalization_enabled": NORMALIZE_EDGE_AUDIO,
+            "edge_target_lufs": EDGE_TARGET_LUFS,
+            "edge_true_peak_dbfs": EDGE_TARGET_TRUE_PEAK,
         },
     })
 
 
 @app.get("/v25-audio/<path:filename>")
 def v25_audio(filename: str):
-    return send_from_directory(AUDIO_DIR, filename, mimetype="audio/wav", as_attachment=False, max_age=0)
+    mimetype = "audio/mpeg" if filename.lower().endswith(".mp3") else "audio/wav"
+    return send_from_directory(AUDIO_DIR, filename, mimetype=mimetype, as_attachment=False, max_age=0)
 
 
 @app.get("/v25-srt/<path:filename>")
