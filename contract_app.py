@@ -27,13 +27,14 @@ import tempfile
 import time
 import uuid
 import wave
+from urllib.parse import urlparse, urlunparse
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import requests
 from flask import Flask, Response, jsonify, request, send_from_directory
 
-CONTRACT_VERSION = "v25.1-premium-pro-tts-edge-normalization"
+CONTRACT_VERSION = "v25.2-edge-local-normalization-fix"
 PRO_MODEL = os.getenv("GEMINI_PRO_TTS_MODEL", "gemini-2.5-pro-preview-tts")
 FLASH_MODEL = os.getenv("GEMINI_FLASH_TTS_MODEL", "gemini-2.5-flash-preview-tts")
 OUTPUT_ROOT = Path(os.getenv("VOICECRAFT_OUTPUT_ROOT", "/tmp/voicecraft_v25"))
@@ -662,14 +663,46 @@ def _edge_truth_contract(data: Dict[str, Any], payload: Dict[str, Any]) -> Dict[
 
 
 def _fetch_generated_audio(url: str) -> Tuple[bytes, str]:
+    """Read generated audio without making a public self-request.
+
+    Existing Edge routes may return either a relative URL or an absolute URL
+    pointing back to this same Railway service. Calling the public Railway URL
+    from inside the same request can deadlock a single-worker deployment and
+    previously caused a 60-second read timeout. Same-service URLs are now
+    resolved through Flask's internal test client; only truly external URLs use
+    requests.get().
+    """
     if not url:
         raise RuntimeError("Missing generated audio URL")
+
+    parsed = urlparse(url)
+    internal_path = ""
+
     if url.startswith("/"):
+        internal_path = url
+    elif parsed.scheme in {"http", "https"} and parsed.netloc:
+        request_host = (request.host or "").lower()
+        forwarded_host = str(request.headers.get("X-Forwarded-Host") or "").lower()
+        public_host = str(os.getenv("RAILWAY_PUBLIC_DOMAIN") or "").lower()
+        candidate_host = parsed.netloc.lower()
+
+        same_service_hosts = {host for host in (request_host, forwarded_host, public_host) if host}
+        # Railway may expose RAILWAY_PUBLIC_DOMAIN without a scheme. Also
+        # accept the exact current request host to cover custom domains.
+        if candidate_host in same_service_hosts:
+            internal_path = parsed.path or "/"
+            if parsed.query:
+                internal_path += "?" + parsed.query
+
+    if internal_path:
         with app.test_client() as client:
-            response = client.get(url)
+            response = client.get(internal_path)
             if response.status_code >= 400:
-                raise RuntimeError(f"Could not read generated audio: HTTP {response.status_code}")
+                raise RuntimeError(
+                    f"Could not read generated audio internally: HTTP {response.status_code}"
+                )
             return bytes(response.data), str(response.mimetype or "audio/mpeg")
+
     response = requests.get(url, timeout=60)
     response.raise_for_status()
     return response.content, str(response.headers.get("Content-Type") or "audio/mpeg")
@@ -764,7 +797,7 @@ def production_tts():
     if not isinstance(payload, dict):
         return jsonify({"ok": False, "success": False, "error_code": "INVALID_JSON", "error": "JSON object required."}), 400
 
-    # Edge remains the stable base-engine path, but V25.1 normalizes its output.
+    # Edge remains the stable base-engine path; V25.2 normalizes via internal file routing.
     if not _is_gemini_request(payload):
         return _normalize_edge_result(ORIGINAL_TTS_VIEW(), payload)
 
@@ -846,6 +879,7 @@ def v25_health():
         "pro_tts_wrapped": True,
         "edge_normalization_enabled": NORMALIZE_EDGE_AUDIO,
         "ffmpeg_found": bool(shutil.which("ffmpeg")),
+        "edge_internal_audio_fetch_fix": True,
     })
 
 
