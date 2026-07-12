@@ -4,7 +4,7 @@
     "buildCommand": "pip install --upgrade pip setuptools wheel && pip install -r requirements.txt"
   },
   "deploy": {
-    "startCommand": "gunicorn --timeout 300 --workers 1 contract_app:app",
+    "startCommand": "gunicorn style12_app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 650",
     "healthcheckPath": "/",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE"
