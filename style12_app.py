@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
-from flask import jsonify, request
+from flask import jsonify, request, make_response
 
 # Preserve the currently deployed backend wrapper when it exists.
 # VoiceCraft deployments commonly start with contract_app:app, which adds
@@ -33,6 +33,47 @@ from style12_rewrite_engine import (
 
 
 app = legacy.app
+
+
+# Explicit browser CORS protection for the dynamically replaced rewrite routes.
+# Some legacy deployments applied CORS as a decorator on the original view
+# function. Replacing app.view_functions then removes that decorator even
+# though Railway curl tests still pass. These hooks guarantee that browser
+# OPTIONS preflight and the final POST response both carry CORS headers.
+_STYLE12_CORS_PATHS = {
+    "/rewrite",
+    "/rewrite-options",
+    "/rewrite-capabilities",
+    "/style12-health",
+}
+
+
+def _configured_cors_origins() -> set[str]:
+    raw = (
+        os.getenv("STYLE12_CORS_ORIGINS")
+        or os.getenv("CORS_ALLOWED_ORIGINS")
+        or "https://v15r.vercel.app,http://localhost:5173,http://localhost:3000"
+    )
+    return {item.strip().rstrip("/") for item in raw.split(",") if item.strip()}
+
+
+def _origin_is_allowed(origin: str) -> bool:
+    if not origin:
+        return False
+    normalized = origin.strip().rstrip("/")
+    allowed = _configured_cors_origins()
+    if "*" in allowed or normalized in allowed:
+        return True
+    # Local development ports are allowed without requiring every port in env.
+    return normalized.startswith("http://localhost:") or normalized.startswith("http://127.0.0.1:")
+
+
+@app.before_request
+def style12_explicit_preflight():
+    if request.method == "OPTIONS" and request.path in _STYLE12_CORS_PATHS:
+        return make_response("", 204)
+    return None
+
 
 
 def _json_error(message: str, status: int = 400, **extra: Any):
@@ -297,6 +338,21 @@ if not any(rule.rule == "/style12-health" for rule in app.url_map.iter_rules()):
 
 
 @app.after_request
-def add_style12_version_header(response):
-    response.headers.setdefault("X-Rewrite-Engine-Version", ENGINE_VERSION)
+def add_style12_version_and_cors_headers(response):
+    response.headers["X-Rewrite-Engine-Version"] = ENGINE_VERSION
+
+    if request.path in _STYLE12_CORS_PATHS:
+        origin = request.headers.get("Origin", "").strip()
+        if _origin_is_allowed(origin):
+            response.headers["Access-Control-Allow-Origin"] = origin.rstrip("/")
+            response.headers["Vary"] = "Origin"
+            response.headers["Access-Control-Allow-Credentials"] = "false"
+
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization, X-Requested-With, X-Gemini-Key, X-API-Key"
+        )
+        response.headers["Access-Control-Expose-Headers"] = "X-Rewrite-Engine-Version"
+        response.headers["Access-Control-Max-Age"] = "86400"
+
     return response
