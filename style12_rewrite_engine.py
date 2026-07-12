@@ -18,7 +18,7 @@ from typing import Any
 import requests
 
 
-ENGINE_VERSION = "v25.2-style12-gemini3-model-fallback"
+ENGINE_VERSION = "v25.4-style12-cors-preflight-fix"
 GEMINI_API_ROOT = os.getenv(
     "GEMINI_API_ROOT",
     "https://generativelanguage.googleapis.com/v1beta",
